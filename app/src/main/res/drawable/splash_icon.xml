@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Splash screen icon for Android SplashScreen API.
+  Required: 240×240dp drawable; all content MUST fit within the
+  160dp-diameter safe-zone circle centered at (120,120).
+  Content zone: x 40–200, y 40–200.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="240dp"
+    android:height="240dp"
+    android:viewportWidth="240"
+    android:viewportHeight="240">
+
+    <!-- ── Book shadow ── -->
+    <path
+        android:fillColor="#1A000000"
+        android:pathData="M68,196 a52,6 0 1,0 104,0 a52,6 0 1,0 -104,0 Z" />
+
+    <!-- ── Left page ── -->
+    <path
+        android:fillColor="#FBF7F0"
+        android:pathData="M114,142 C98,137 62,141 52,150 L54,190 C64,194 100,190 114,187 Z" />
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#C9B898"
+        android:strokeWidth="1.8"
+        android:pathData="M114,142 C98,137 62,141 52,150 L54,190 C64,194 100,190 114,187 Z" />
+
+    <!-- ── Right page ── -->
+    <path
+        android:fillColor="#FBF7F0"
+        android:pathData="M126,142 C142,137 178,141 188,150 L186,190 C176,194 140,190 126,187 Z" />
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#C9B898"
+        android:strokeWidth="1.8"
+        android:pathData="M126,142 C142,137 178,141 188,150 L186,190 C176,194 140,190 126,187 Z" />
+
+    <!-- ── Spine ── -->
+    <path
+        android:fillColor="#BCA98C"
+        android:pathData="M114,142 C116,141 124,141 126,142 L126,187 C124,188 116,188 114,187 Z" />
+
+    <!-- ── Text lines — left page ── -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#D5C8B0"
+        android:strokeWidth="1.4"
+        android:pathData="M62,157 L110,156 M62,164 L110,163 M62,171 L110,170 M62,178 L110,177 M62,185 L110,184" />
+
+    <!-- ── Text lines — right page ── -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#D5C8B0"
+        android:strokeWidth="1.4"
+        android:pathData="M130,157 L178,156 M130,164 L178,163 M130,171 L178,170 M130,178 L178,177 M130,185 L178,184" />
+
+    <!-- ── Sapling trunk ── -->
+    <path
+        android:fillColor="#8D6540"
+        android:pathData="M116,142 C115,126 115,108 120,72 C125,108 125,126 124,142 Z" />
+
+    <!-- ── Left branch ── -->
+    <path
+        android:fillColor="#8D6540"
+        android:pathData="M118,110 C112,103 100,101 96,91 C100,100 113,103 118,110 Z" />
+
+    <!-- ── Right branch ── -->
+    <path
+        android:fillColor="#8D6540"
+        android:pathData="M122,120 C128,113 140,111 144,101 C140,110 128,113 122,120 Z" />
+
+    <!-- ── Leaf cluster — back/dark (top canopy shadow) ── -->
+    <path
+        android:fillColor="#52A34F"
+        android:pathData="M98,65 a22,22 0 1,0 44,0 a22,22 0 1,0 -44,0 Z" />
+
+    <!-- ── Leaf cluster — front center ── -->
+    <path
+        android:fillColor="#6DB36A"
+        android:pathData="M104,72 a16,16 0 1,0 32,0 a16,16 0 1,0 -32,0 Z" />
+
+    <!-- ── Top highlight dot ── -->
+    <path
+        android:fillColor="#A0D89D"
+        android:pathData="M112,57 a8,8 0 1,0 16,0 a8,8 0 1,0 -16,0 Z" />
+
+    <!-- ── Left branch leaves ── -->
+    <path
+        android:fillColor="#6DB36A"
+        android:pathData="M84,86 a14,14 0 1,0 28,0 a14,14 0 1,0 -28,0 Z" />
+    <path
+        android:fillColor="#52A34F"
+        android:pathData="M80,79 a10,10 0 1,0 20,0 a10,10 0 1,0 -20,0 Z" />
+
+    <!-- ── Right branch leaves ── -->
+    <path
+        android:fillColor="#6DB36A"
+        android:pathData="M132,96 a12,12 0 1,0 24,0 a12,12 0 1,0 -24,0 Z" />
+    <path
+        android:fillColor="#52A34F"
+        android:pathData="M136,88 a9,9 0 1,0 18,0 a9,9 0 1,0 -18,0 Z" />
+
+</vector>

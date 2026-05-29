@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell($result = Get-ChildItem \"C:\\\\Program Files\" -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.Name }; Write-Output \\($result -join \"`n\"\\))",
+      "PowerShell(Test-Path *)",
+      "PowerShell(Get-ChildItem *)",
+      "WebFetch(domain:enter.pollinations.ai)",
+      "WebFetch(domain:deepwiki.com)",
+      "Read(//mnt/e/Lumi/**)",
+      "Bash(sed -n '917,921p' app/src/main/java/com/example/novelseek_ultra/ui/screens/LongNovelScreen.kt)",
+      "PowerShell($path = \"E:\\\\Lumi\\\\NovelSeek-Ultra\\\\app\\\\src\\\\main\\\\java\\\\com\\\\example\\\\novelseek_ultra\\\\ui\\\\screens\\\\LongNovelScreen.kt\"; $lines = Get-Content $path; Write-Output \"total lines: $\\($lines.Count\\)\"; Write-Output \"line 954: $\\($lines[953]\\)\"; Write-Output \"line 956: $\\($lines[955]\\)\")",
+      "PowerShell($path = \"E:\\\\Lumi\\\\NovelSeek-Ultra\\\\app\\\\src\\\\main\\\\java\\\\com\\\\example\\\\novelseek_ultra\\\\ui\\\\screens\\\\LongNovelScreen.kt\"; $lines = Get-Content $path; $kept = $lines[0..953]; Set-Content -Path $path -Value $kept -Encoding utf8; Write-Output \"new line count: $\\(\\(Get-Content $path\\).Count\\)\"; Write-Output \"last line: $\\(\\(Get-Content $path\\)[-1]\\)\")"
+    ]
+  }
+}

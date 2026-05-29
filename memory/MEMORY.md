@@ -1,0 +1,3 @@
+- [Project: NovelSeek-Ultra Android](project_novelseek_ultra.md) — Native Android Compose port of NovelSeek-Pro-PC; PC backup JSON is the interop format
+- [Feedback: Tech stack & security choices](feedback_tech_choices.md) — Native Compose chosen over WebView; API keys must go to EncryptedSharedPreferences
+- [Feedback: Never PowerShell-edit UTF-8 files](feedback_no_powershell_on_utf8.md) — Get-Content/Set-Content corrupts Chinese; use Edit/Write/Read instead

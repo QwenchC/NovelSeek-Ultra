@@ -133,4 +133,4 @@ app/src/main/java/com/example/novelseek_ultra/
 
 ## License
 
-MIT © 2025 QwenchC
+MIT © 2026 QwenchC

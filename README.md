@@ -2,10 +2,6 @@
 
 > 一款基于 AI 的 Android 小说创作助手，由桌面端项目 [NovelSeek-Pro-PC](https://github.com/QwenchC/NovelSeek-Pro-PC) 迁移而来。
 
-<p align="center">
-  <img src="app/src/main/res/drawable/splash_icon.xml" width="120" alt="NovelSeek Ultra Logo"/>
-</p>
-
 ---
 
 ## 功能概览

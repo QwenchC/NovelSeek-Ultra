@@ -175,6 +175,9 @@ fun SettingsScreen(vm: AppViewModel) {
             // ── Text model profiles ───────────────────────────────────
             TextModelProfilesSection(vm, lang)
 
+            // ── Image generation engine (Pollinations / ComfyUI) ──────
+            ImageEngineSection(vm, lang)
+
             // ── Pollinations image key ────────────────────────────────
             PollinationsKeySection(vm, lang)
 
@@ -580,6 +583,89 @@ private fun ProfileDialog(
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text(tx(lang, "取消", "Cancel")) } },
     )
+}
+
+@Composable
+private fun ImageEngineSection(vm: AppViewModel, lang: String) {
+    val state by vm.state.collectAsState()
+    var engine by remember(state) { mutableStateOf(vm.imageEngine()) }
+    var comfyUrl by remember(state) { mutableStateOf(vm.comfyUIUrl()) }
+    var testing by remember { mutableStateOf(false) }
+    var testResult by remember { mutableStateOf<Boolean?>(null) }
+    val scope = rememberCoroutineScope()
+
+    SectionCard {
+        Text(tx(lang, "图像生成引擎", "Image Generation Engine"),
+            style = MaterialTheme.typography.titleMedium)
+        Spacer(Modifier.height(4.dp))
+        Text(
+            tx(lang,
+                "选择图像生成后端，作用于角色立绘、封面图、章节插图与章节推文。\n" +
+                    "Pollinations 走云端，无需本地环境；ComfyUI 连接你本地/局域网运行的 ComfyUI，使用固定的 z-image-turbo 工作流（不带 LoRA）。",
+                "Pick the backend for character portraits, covers, chapter illustrations and promos.\n" +
+                    "Pollinations is cloud-based (no local setup); ComfyUI connects to your local/LAN ComfyUI instance using a fixed z-image-turbo workflow (no LoRA)."),
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(8.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            FilterChip(
+                selected = engine == "pollinations",
+                onClick = { engine = "pollinations"; vm.setImageEngine("pollinations") },
+                label = { Text("Pollinations") },
+            )
+            FilterChip(
+                selected = engine == "comfyui",
+                onClick = { engine = "comfyui"; vm.setImageEngine("comfyui") },
+                label = { Text("ComfyUI") },
+            )
+        }
+
+        if (engine == "comfyui") {
+            Spacer(Modifier.height(10.dp))
+            OutlinedTextField(
+                value = comfyUrl,
+                onValueChange = { comfyUrl = it; vm.setComfyUIUrl(it); testResult = null },
+                label = { Text(tx(lang, "ComfyUI 地址", "ComfyUI URL")) },
+                placeholder = { Text("http://192.168.1.100:8188") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                tx(lang,
+                    "手机需与运行 ComfyUI 的电脑在同一局域网。请填电脑的局域网 IP（例如 http://192.168.1.100:8188），不要用 localhost——那指向手机自己。",
+                    "Your phone must be on the same LAN as the ComfyUI machine. Use that PC's LAN IP (e.g. http://192.168.1.100:8188), not localhost — localhost points at the phone itself."),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(10.dp))
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(
+                    enabled = !testing && comfyUrl.isNotBlank(),
+                    onClick = {
+                        testing = true; testResult = null
+                        scope.launch {
+                            testResult = vm.testComfyUIConnection()
+                            testing = false
+                        }
+                    },
+                ) {
+                    if (testing) CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                    else Text(tx(lang, "测试 ComfyUI 连接", "Test ComfyUI"))
+                }
+                when (testResult) {
+                    true -> Text(tx(lang, "✓ 连接成功", "✓ Connected"),
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.primary)
+                    false -> Text(tx(lang, "✕ 连接失败", "✕ Failed"),
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.error)
+                    null -> {}
+                }
+            }
+        }
+    }
 }
 
 @Composable

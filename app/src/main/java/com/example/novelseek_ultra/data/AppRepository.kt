@@ -529,6 +529,17 @@ class AppRepository(context: Context) {
     fun pollinationsKey(): String = secureStore.get(SecureStore.POLLINATIONS_KEY)
     fun setPollinationsKey(key: String) = secureStore.put(SecureStore.POLLINATIONS_KEY, key)
 
+    // Image generation engine: "pollinations" (default) or "comfyui". Stored in plain state (no
+    // secret) so it round-trips with PC backups — mirrors PC store `imageEngine` / `comfyUIUrl`.
+    fun imageEngine(): String =
+        _state.value["imageEngine"]?.jsonPrimitive?.contentOrNull ?: "pollinations"
+    fun setImageEngine(engine: String) = mutateState { it.with("imageEngine", JsonPrimitive(engine)) }
+
+    fun comfyUIUrl(): String =
+        _state.value["comfyUIUrl"]?.jsonPrimitive?.contentOrNull?.ifBlank { null }
+            ?: "http://localhost:8188"
+    fun setComfyUIUrl(url: String) = mutateState { it.with("comfyUIUrl", JsonPrimitive(url)) }
+
     fun embeddingConfig(): EmbeddingConfig {
         val state = _state.value
         val cfg = (state["embeddingConfig"] as? JsonObject)?.let {

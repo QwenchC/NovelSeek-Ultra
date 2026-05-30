@@ -20,7 +20,10 @@ import com.example.novelseek_ultra.data.model.CultivationRealm
 import com.example.novelseek_ultra.data.model.EmbeddingConfig
 import com.example.novelseek_ultra.data.model.EntityPayload
 import com.example.novelseek_ultra.data.model.Illustration
+import com.example.novelseek_ultra.data.model.NovelChatMessage
 import com.example.novelseek_ultra.data.model.PlotArc
+import com.example.novelseek_ultra.data.model.RestoreResult
+import com.example.novelseek_ultra.data.model.SnapshotMeta
 import com.example.novelseek_ultra.data.model.SummaryPayload
 import com.example.novelseek_ultra.data.model.Project
 import com.example.novelseek_ultra.data.model.TextModelConfig
@@ -81,6 +84,13 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private val _isAiFilling = MutableStateFlow(false)
     val isAiFilling: StateFlow<Boolean> = _isAiFilling.asStateFlow()
     private var aiFillJob: Job? = null
+
+    /** Live streaming answer for the "ask the novel" Q&A agent (per-project chat). */
+    private val _qaStreamingText = MutableStateFlow("")
+    val qaStreamingText: StateFlow<String> = _qaStreamingText.asStateFlow()
+    private val _qaGenerating = MutableStateFlow(false)
+    val qaGenerating: StateFlow<Boolean> = _qaGenerating.asStateFlow()
+    private var qaJob: Job? = null
 
     init {
         viewModelScope.launch {
@@ -200,6 +210,29 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         )
         repo.upsertChapter(projectId, ch)
         return ch
+    }
+
+    /**
+     * Insert a new (empty) chapter immediately before or after [referenceChapterId], shifting the
+     * order_index of all following chapters by +1 so the sequence stays contiguous. Returns the new
+     * chapter (caller typically navigates to it), or null if the reference chapter is missing.
+     */
+    fun insertChapter(projectId: String, referenceChapterId: String, before: Boolean, title: String): Chapter? {
+        val list = repo.chapters(projectId).sortedBy { it.order_index }
+        val ref = list.firstOrNull { it.id == referenceChapterId } ?: return null
+        val targetOrder = if (before) ref.order_index else ref.order_index + 1
+        val now = nowIso()
+        val shifted = list.map { if (it.order_index >= targetOrder) it.copy(order_index = it.order_index + 1) else it }
+        val newCh = Chapter(
+            id = "c-${System.currentTimeMillis()}",
+            project_id = projectId,
+            title = title,
+            order_index = targetOrder,
+            created_at = now,
+            updated_at = now,
+        )
+        repo.setChapters(projectId, shifted + newCh)
+        return newCh
     }
 
     // ── per-project metadata ───────────────────────────────────────────────
@@ -379,7 +412,14 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 val final = _streamingText.value
                 if (final.isNotEmpty()) {
-                    val body = repo.chapterBody(chapter.id).copy(final = final)
+                    val prior = repo.chapterBody(chapter.id)
+                    // Safety snapshot before AI overwrites real existing work (skip empty chapters).
+                    if (prior.final.isNotBlank() || prior.draft.isNotBlank()) {
+                        runCatching {
+                            repo.createSnapshot(projectId, "AI写作前：${chapter.title}", SnapshotMeta.TRIGGER_PRE_AI)
+                        }
+                    }
+                    val body = prior.copy(final = final)
                     repo.saveChapterBody(chapter.id, body)
                     repo.upsertChapter(
                         projectId,
@@ -605,6 +645,87 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         } ?: return null
         return parseAppearanceJson(reply)
     }
+
+    /**
+     * Quick-generate one full character from a free-form user brief. The brief is grounded in the
+     * project's outline + cultivation-realm system so the AI returns a character that fits the
+     * novel (not a generic one). Returns a [Character] with fields filled and a blank id (the caller
+     * merges it into the in-progress character, preserving id/portrait). Null on failure.
+     */
+    suspend fun generateCharacterFromBrief(projectId: String, brief: String): Character? {
+        val cfg = repo.activeTextModelConfig()
+        if (!cfg.isValid() || brief.isBlank()) return null
+        val lang = _uiLanguage.value
+        val realms = repo.cultivationRealms(projectId)
+        val context = buildString {
+            val outline = repo.outline(projectId)
+            if (outline.isNotBlank()) {
+                append(if (lang == "en") "[Outline]\n" else "【大纲】\n"); append(outline)
+            }
+            val world = repo.worldSetting(projectId)
+            if (world.isNotBlank()) {
+                if (isNotEmpty()) append("\n\n")
+                append(if (lang == "en") "[World setting]\n" else "【世界观】\n"); append(world)
+            }
+            val realmCtx = buildRealmSystemContext(realms, lang)
+            if (realmCtx.isNotEmpty()) { if (isNotEmpty()) append("\n\n"); append(realmCtx) }
+        }
+        val reply = withContext(Dispatchers.IO) {
+            runCatching {
+                ai.chat(
+                    cfg,
+                    listOf(
+                        ChatMessage("system", Prompts.characterFromBriefSystem(lang)),
+                        ChatMessage("user", Prompts.characterFromBriefUser(brief.trim(), context, lang)),
+                    ),
+                )
+            }.getOrNull()
+        } ?: return null
+        return parseCharacterObject(reply, realms)
+    }
+
+    /** Parse a single JSON character object from AI text, mapping the realm name back to an id. */
+    private fun parseCharacterObject(text: String, realms: List<CultivationRealm>): Character? = runCatching {
+        val stripped = text.replace(Regex("```(?:json)?\\s*"), "").replace("```", "").trim()
+        val start = stripped.indexOf('{')
+        val end = stripped.lastIndexOf('}')
+        if (start < 0 || end <= start) return null
+        val obj = Json { ignoreUnknownKeys = true }.parseToJsonElement(stripped.substring(start, end + 1)).jsonObject
+        fun str(key: String) = obj[key]?.let { it.toString().trim('"') }
+            ?.takeIf { it.isNotBlank() && it != "null" } ?: ""
+        val name = str("name")
+        if (name.isBlank()) return null
+        val isProta = obj["isProtagonist"]?.toString()?.trim('"')?.equals("true", ignoreCase = true) ?: false
+
+        // Map the AI's realm name back onto a realm/sub-realm id (best-effort exact match).
+        var realmId: String? = null
+        var subId: String? = null
+        val realmName = str("currentRealm")
+        if (realmName.isNotBlank()) {
+            realms.firstOrNull { it.name == realmName }?.let { realmId = it.id }
+            if (realmId == null) {
+                realms.forEach { r ->
+                    r.subRealms?.firstOrNull { it.name == realmName }?.let { sub ->
+                        realmId = r.id; subId = sub.id
+                    }
+                }
+            }
+        }
+
+        Character(
+            id = "",
+            name = name,
+            gender = str("gender"),
+            role = str("role"),
+            personality = str("personality"),
+            motivation = str("motivation"),
+            background = str("background"),
+            appearance = str("appearance"),
+            isProtagonist = isProta,
+            currentRealmId = realmId,
+            currentSubRealmId = subId,
+        )
+    }.getOrNull()
 
     suspend fun generatePortraitImage(prompt: String, width: Int = 768, height: Int = 1024): ByteArray? =
         withContext(Dispatchers.IO) {
@@ -1267,6 +1388,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 runCatching { kb.indexChapter(cid, title, text, cfg) }
                     .onSuccess { chunks ->
                         repo.appendChunks(projectId, chunks)
+                        repo.setKbIndexHash(projectId, cid, com.example.novelseek_ultra.data.SnapshotStore.sha1(text))
+                        repo.clearKbStaleChapter(projectId, cid)
                         totalChunks += chunks.size
                     }
                     .onFailure { err ->
@@ -1304,6 +1427,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             runCatching {
                 val chunks = kb.indexChapter(chapterId, title, text, cfg)
                 repo.appendChunks(projectId, chunks)
+                repo.setKbIndexHash(projectId, chapterId, com.example.novelseek_ultra.data.SnapshotStore.sha1(text))
+                repo.clearKbStaleChapter(projectId, chapterId)
             }.onFailure { _statusMessage.value = "KB 索引失败：${it.message}" }
         }
     }
@@ -1512,6 +1637,284 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         repo.forgetKbSource(projectId, "chapter", chapterId)
         repo.forgetSummary(projectId, "chapter", chapterId)
         repo.forgetEntitiesForChapter(projectId, chapterId)
+        repo.removeKbIndexHash(projectId, chapterId)
+        repo.clearKbStaleChapter(projectId, chapterId)
+    }
+
+    // ── Project snapshots (version history) ──────────────────────────────────
+
+    /** Observable so the version-history screen recomposes after create/delete/restore. */
+    val snapshotRevision: StateFlow<Int> = repo.snapshotRevision
+
+    fun listSnapshots(projectId: String): List<SnapshotMeta> = repo.listSnapshots(projectId)
+
+    /** Number of chapters whose KB vectors are stale for [projectId] (drives the rebuild banner). */
+    fun kbStaleCount(projectId: String): Int = repo.kbStaleChapters(projectId).size
+
+    fun saveSnapshot(projectId: String, label: String, onDone: (Boolean) -> Unit = {}) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val meta = runCatching {
+                repo.createSnapshot(projectId, label, SnapshotMeta.TRIGGER_MANUAL)
+            }.getOrNull()
+            withContext(Dispatchers.Main) {
+                _statusMessage.value = if (meta != null) "已保存版本" else "保存版本失败"
+                onDone(meta != null)
+            }
+        }
+    }
+
+    fun renameSnapshot(projectId: String, snapshotId: String, label: String) =
+        repo.renameSnapshot(projectId, snapshotId, label)
+
+    fun deleteSnapshot(projectId: String, snapshotId: String) =
+        repo.deleteSnapshot(projectId, snapshotId)
+
+    fun restoreSnapshot(projectId: String, snapshotId: String, onDone: (RestoreResult) -> Unit = {}) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val result = runCatching { repo.restoreSnapshot(projectId, snapshotId) }
+                .getOrDefault(RestoreResult())
+            withContext(Dispatchers.Main) {
+                _statusMessage.value = buildString {
+                    append("已回退到该版本")
+                    if (result.staleChapterIds.isNotEmpty()) append("，知识库有 ${result.staleChapterIds.size} 章待重建")
+                }
+                onDone(result)
+            }
+        }
+    }
+
+    /**
+     * Targeted KB rebuild: re-embed only the chapters flagged stale (e.g. after a restore), then
+     * clear the stale flags. Cost scales with how much actually changed, not the whole book.
+     */
+    fun rebuildStaleKb(projectId: String, onProgress: (done: Int, total: Int) -> Unit = { _, _ -> }, onDone: (Int) -> Unit = {}) {
+        val cfg = repo.embeddingConfig()
+        if (cfg.apiKey.isBlank() || cfg.apiUrl.isBlank() || cfg.model.isBlank()) {
+            _statusMessage.value = "请先在「本地知识库」中填写 Embedding 配置"
+            onDone(0); return
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            val stale = repo.kbStaleChapters(projectId)
+            val chapters = repo.chapters(projectId).associateBy { it.id }
+            var rebuilt = 0
+            stale.forEachIndexed { idx, cid ->
+                onProgress(idx + 1, stale.size)
+                val ch = chapters[cid] ?: run { repo.clearKbStaleChapter(projectId, cid); return@forEachIndexed }
+                val body = repo.chapterBody(cid)
+                val text = body.final.ifBlank { body.draft }
+                if (text.trim().length < 200) {
+                    // Nothing worth indexing — drop any stale vectors and clear the flag.
+                    repo.forgetKbSource(projectId, "chapter", cid)
+                    repo.setKbIndexHash(projectId, cid, com.example.novelseek_ultra.data.SnapshotStore.sha1(text))
+                    repo.clearKbStaleChapter(projectId, cid)
+                    return@forEachIndexed
+                }
+                runCatching { kb.indexChapter(cid, ch.title, text, cfg) }
+                    .onSuccess { chunks ->
+                        repo.appendChunks(projectId, chunks)
+                        repo.setKbIndexHash(projectId, cid, com.example.novelseek_ultra.data.SnapshotStore.sha1(text))
+                        repo.clearKbStaleChapter(projectId, cid)
+                        rebuilt += 1
+                    }
+                    .onFailure { _statusMessage.value = "KB 重建失败「${ch.title}」：${it.message}" }
+            }
+            withContext(Dispatchers.Main) {
+                _statusMessage.value = "知识库重建完成（$rebuilt 章）"
+                onDone(rebuilt)
+            }
+        }
+    }
+
+    // ── "Ask the novel" Q&A agent ────────────────────────────────────────────
+
+    val novelChatRevision: StateFlow<Int> = repo.novelChatRevision
+
+    fun novelChatHistory(projectId: String): List<NovelChatMessage> = repo.novelChatHistory(projectId)
+
+    fun clearNovelChat(projectId: String) {
+        stopAskNovel()
+        repo.clearNovelChat(projectId)
+    }
+
+    fun stopAskNovel() {
+        qaJob?.cancel()
+        _qaGenerating.value = false
+        _qaStreamingText.value = ""
+    }
+
+    /**
+     * Answer a free-form question about the CURRENT version of the project. Hybrid retrieval:
+     * structured data (characters/realms/relationships/events/entities/summaries/chapter list) is
+     * always assembled; vector RAG over chapter chunks is added when embeddings are configured.
+     * The answer streams into [qaStreamingText] and, on completion, is appended to the saved chat.
+     */
+    fun askNovel(projectId: String, question: String) {
+        val q = question.trim()
+        if (q.isEmpty() || _qaGenerating.value) return
+        val cfg = repo.activeTextModelConfig()
+        val lang = repo.uiLanguage()
+
+        repo.appendNovelChat(
+            projectId,
+            NovelChatMessage(id = "qa-${System.currentTimeMillis()}", role = "user", content = q, createdAt = nowIso()),
+        )
+        _qaStreamingText.value = ""
+        _qaGenerating.value = true
+        qaJob?.cancel()
+        qaJob = viewModelScope.launch(Dispatchers.IO) {
+            val context = runCatching { buildNovelQaContext(projectId, q, lang) }.getOrDefault("")
+            // Prior turns (drop the question we just appended) give the agent follow-up memory.
+            val history = repo.novelChatHistory(projectId).dropLast(1).takeLast(8)
+            val messages = buildList {
+                add(ChatMessage("system", novelQaSystemPrompt(lang)))
+                history.forEach { add(ChatMessage(it.role, it.content)) }
+                add(ChatMessage("user", buildString {
+                    appendLine(if (lang == "en") "[Novel Material]" else "【小说资料】")
+                    appendLine(context.ifBlank { if (lang == "en") "(no material available)" else "（暂无资料）" })
+                    appendLine()
+                    appendLine(if (lang == "en") "[Question]" else "【问题】")
+                    append(q)
+                }))
+            }
+            try {
+                ai.streamChat(cfg, messages).collect { ev ->
+                    when (ev) {
+                        is AiService.StreamEvent.Delta -> _qaStreamingText.value = _qaStreamingText.value + ev.text
+                        AiService.StreamEvent.Done -> {}
+                        is AiService.StreamEvent.Error -> _statusMessage.value = "问答失败：${ev.message}"
+                    }
+                }
+                val answer = _qaStreamingText.value
+                if (answer.isNotBlank()) {
+                    repo.appendNovelChat(
+                        projectId,
+                        NovelChatMessage(id = "qa-${System.currentTimeMillis()}", role = "assistant", content = answer, createdAt = nowIso()),
+                    )
+                }
+            } catch (e: Exception) {
+                _statusMessage.value = "问答失败：${e.message}"
+            } finally {
+                _qaGenerating.value = false
+                _qaStreamingText.value = ""
+            }
+        }
+    }
+
+    private fun novelQaSystemPrompt(lang: String): String =
+        if (lang == "en")
+            "You are a knowledgeable assistant for THIS specific novel. Answer the user's question using ONLY the provided novel material (characters, cultivation realms, relationships, events, entities, summaries, and retrieved passages). Be specific and concise; cite chapter numbers when relevant. If the material does not contain the answer, say you cannot find it in the current version — never invent facts. Reply in English."
+        else
+            "你是这部小说的资料助手。只能依据提供的【小说资料】（角色、修炼境界、角色关系、事件、知识条目、摘要、检索到的正文片段）来回答用户的问题。回答要具体、简洁，涉及情节时尽量标注章节号。如果资料中没有相关信息，请直接说明“当前版本资料中未找到”，绝不要编造。请用中文回答。"
+
+    /** Assemble the hybrid retrieval context for one Q&A question. */
+    private suspend fun buildNovelQaContext(projectId: String, question: String, lang: String): String {
+        val en = lang == "en"
+        val parts = mutableListOf<String>()
+
+        repo.project(projectId)?.let { p ->
+            parts += buildString {
+                append(if (en) "[Novel]" else "【小说】")
+                append("\n"); append(if (en) "Title: " else "书名："); append(p.title)
+                p.genre?.takeIf { it.isNotBlank() }?.let { append("\n"); append(if (en) "Genre: " else "题材："); append(it) }
+                p.description?.takeIf { it.isNotBlank() }?.let { append("\n"); append(if (en) "Synopsis: " else "简介："); append(it) }
+            }
+        }
+
+        val realms = repo.cultivationRealms(projectId)
+        if (realms.isNotEmpty()) parts += buildRealmSystemContext(realms, lang)
+
+        val chars = repo.characters(projectId)
+        val nameById = chars.associate { it.id to it.name }
+        if (chars.isNotEmpty()) {
+            val realmById = realms.associateBy { it.id }
+            val subById = realms.flatMap { it.subRealms ?: emptyList() }.associateBy { it.id }
+            parts += (if (en) "[Characters]" else "【角色】") + "\n" + chars.joinToString("\n\n") { c ->
+                buildString {
+                    append("【${c.name}】")
+                    if (c.isProtagonist) append(if (en) " (protagonist)" else "（主角）")
+                    if (c.role.isNotBlank()) { append("\n"); append(if (en) "Role: " else "身份："); append(c.role) }
+                    if (c.gender.isNotBlank()) { append("\n"); append(if (en) "Gender: " else "性别："); append(c.gender) }
+                    val realmName = c.currentRealmId?.let { realmById[it]?.name }
+                    if (realmName != null) {
+                        val subName = c.currentSubRealmId?.let { subById[it]?.name }
+                        append("\n"); append(if (en) "Current realm: " else "当前境界：")
+                        append(realmName); subName?.let { append(" · "); append(it) }
+                    }
+                    if (c.personality.isNotBlank()) { append("\n"); append(if (en) "Personality: " else "性格："); append(c.personality) }
+                    if (c.background.isNotBlank()) { append("\n"); append(if (en) "Background: " else "背景："); append(c.background) }
+                    if (c.motivation.isNotBlank()) { append("\n"); append(if (en) "Motivation: " else "动机："); append(c.motivation) }
+                }
+            }
+        }
+
+        repo.characterRelationships(projectId).takeIf { it.isNotEmpty() }?.let { rels ->
+            parts += (if (en) "[Relationships]" else "【角色关系】") + "\n" + rels.joinToString("\n") { r ->
+                val from = nameById[r.fromCharId] ?: r.fromCharId
+                val to = nameById[r.toCharId] ?: r.toCharId
+                "- $from → $to（${r.type}）：${r.description}"
+            }
+        }
+
+        repo.characterEvents(projectId).takeIf { it.isNotEmpty() }?.let { events ->
+            parts += (if (en) "[Character Events]" else "【角色事件】") + "\n" +
+                events.sortedBy { it.chapterIndex }.joinToString("\n") { e ->
+                    val who = nameById[e.characterId] ?: e.characterId
+                    "- 第${e.chapterIndex}章《${e.chapterTitle}》$who：${e.title} — ${e.description}"
+                }
+        }
+
+        repo.characterRealmEvents(projectId).takeIf { it.isNotEmpty() }?.let { revs ->
+            val realmById = realms.associateBy { it.id }
+            parts += (if (en) "[Realm Progression]" else "【境界变化】") + "\n" +
+                revs.sortedBy { it.chapterOrderIndex }.joinToString("\n") { ev ->
+                    val who = nameById[ev.characterId] ?: ev.characterId
+                    val realmName = realmById[ev.realmId]?.name ?: ev.realmId
+                    "- 第${ev.chapterOrderIndex}章 $who → $realmName${ev.note?.let { "（$it）" } ?: ""}"
+                }
+        }
+
+        repo.entities(projectId).takeIf { it.isNotEmpty() }?.let { entities ->
+            parts += (if (en) "[Knowledge Entities]" else "【知识条目】") + "\n" + entities.joinToString("\n") { e ->
+                val alias = if (e.aliases.isNotEmpty()) "（${e.aliases.joinToString("、")}）" else ""
+                "- [${e.entityType}] ${e.canonicalName}$alias：${e.summary}"
+            }
+        }
+
+        val summaries = repo.summaries(projectId)
+        summaries.firstOrNull { it.scopeType == "book" && it.scopeId == projectId }
+            ?.takeIf { it.summaryText.isNotBlank() }
+            ?.let { parts += (if (en) "[Book Synopsis]" else "【全书梗概】") + "\n" + it.summaryText }
+
+        repo.plotArcs(projectId).takeIf { it.isNotEmpty() }?.let { arcs ->
+            parts += (if (en) "[Plot Arcs]" else "【剧情弧线】") + "\n" +
+                arcs.sortedBy { it.order }.joinToString("\n") { arc ->
+                    val arcSum = summaries.firstOrNull { it.scopeType == "arc" && it.scopeId == arc.id }
+                        ?.summaryText?.takeIf { it.isNotBlank() } ?: arc.summary
+                    "- ${arc.title}（${arc.status}）：$arcSum"
+                }
+        }
+
+        repo.chapters(projectId).sortedBy { it.order_index }.takeIf { it.isNotEmpty() }?.let { chapters ->
+            parts += (if (en) "[Chapters]" else "【章节列表】") + "\n" +
+                chapters.joinToString("\n") { "第${it.order_index}章 ${it.title}" }
+        }
+
+        // Vector RAG over chapter passages (only when embeddings are configured + indexed).
+        if (repo.knowledgeBaseEnabled()) {
+            val cfg = repo.embeddingConfig()
+            if (cfg.apiKey.isNotBlank() && cfg.apiUrl.isNotBlank() && cfg.model.isNotBlank()) {
+                val pool = repo.chunks(projectId)
+                if (pool.isNotEmpty()) {
+                    runCatching {
+                        kb.retrieveTopK(query = question, pool = pool, topK = 6, excludeSourceIds = emptySet(), cfg = cfg)
+                    }.getOrNull()?.takeIf { it.isNotEmpty() }?.let { hits ->
+                        parts += hits.toPromptContext(lang)
+                    }
+                }
+            }
+        }
+
+        return parts.joinToString("\n\n")
     }
 
     data class ImportPreview(

@@ -31,6 +31,7 @@ import androidx.compose.material.icons.outlined.DriveFileRenameOutline
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.FileDownload
 import androidx.compose.material.icons.outlined.Group
+import androidx.compose.material.icons.outlined.History
 import androidx.compose.material.icons.outlined.Image
 import androidx.compose.material.icons.outlined.LibraryAdd
 import androidx.compose.material.icons.outlined.Menu
@@ -78,6 +79,7 @@ fun ProjectScreen(
     onOpenOutline: () -> Unit,
     onOpenCharacters: () -> Unit,
     onOpenExport: () -> Unit,
+    onOpenHistory: () -> Unit,
 ) {
     val lang by vm.uiLanguage.collectAsState()
     val state by vm.state.collectAsState()
@@ -207,6 +209,11 @@ fun ProjectScreen(
                         Icon(Icons.Outlined.FileDownload, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(4.dp))
                         Text(tx(lang, "导出", "Export"), maxLines = 1, softWrap = false)
+                    }
+                    FilledTonalButton(onClick = onOpenHistory) {
+                        Icon(Icons.Outlined.History, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text(tx(lang, "版本", "Versions"), maxLines = 1, softWrap = false)
                     }
                     FilledTonalButton(
                         onClick = { showCoverDialog = true },

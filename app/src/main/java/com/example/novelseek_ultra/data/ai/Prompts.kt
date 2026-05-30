@@ -324,6 +324,78 @@ Output ONLY a valid JSON array with no markdown, no code fences, no explanation 
         "小说大纲：\n\n$outline\n\n请现在输出完整的 JSON 角色数组。每个字段都要详尽，不能只写简短的词语或短语。"
     }
 
+    /**
+     * Quick single-character generation from a free-form user brief, grounded in the novel's
+     * outline + cultivation-realm system so the result fits the story instead of being generic.
+     */
+    fun characterFromBriefSystem(language: String) = if (language == "en") {
+        """You are a professional novel character designer. Given a short user brief, design ONE character that fits THIS novel — its outline, world building, and cultivation-realm system are provided as reference.
+
+Hard rules:
+- The character's role, background, motivation, and realm MUST be consistent with the provided setting. Do NOT invent elements that contradict or are unrelated to the novel.
+- "currentRealm" MUST be chosen from the provided realm system (use an exact realm or sub-realm name). If no realm system is provided, leave it empty.
+- Honor the user's brief, but adapt it to fit the world.
+
+Output ONLY a single valid JSON object — no markdown, no code fences, no explanation:
+{
+  "name": "Full name",
+  "gender": "male / female / unknown",
+  "isProtagonist": true or false,
+  "role": "Role/title in the story",
+  "personality": "Detailed personality traits, strengths and flaws",
+  "motivation": "Core desires, goals, fears",
+  "background": "Detailed backstory consistent with the outline",
+  "appearance": "Physical description: build, features, clothing, marks",
+  "currentRealm": "An exact realm/sub-realm name from the provided system, or empty"
+}"""
+    } else {
+        """你是专业的小说角色设计师。请根据用户的简短描述，设计一个与本小说契合的角色——下方会提供小说大纲、世界观与修炼境界体系作为参考。
+
+【硬性规则】
+- 角色的身份、背景、动机、境界必须与提供的设定保持一致，不要创造与小说矛盾或无关的元素。
+- "currentRealm" 必须从提供的境界体系中选取（填写一个准确的境界或子境界名称）；若未提供境界体系，则留空。
+- 尊重用户的描述，但要将其融入本小说的世界观。
+
+请只输出一个合法 JSON 对象，不要加任何 markdown、代码块标记或说明：
+{
+  "name": "角色全名",
+  "gender": "男 / 女 / 未知",
+  "isProtagonist": true 或 false,
+  "role": "角色在故事中的身份定位",
+  "personality": "详细的性格特点、优点与缺陷",
+  "motivation": "核心欲望、目标、恐惧",
+  "background": "与大纲设定契合的详细背景故事",
+  "appearance": "外貌描述：体型、五官、着装、显著标志",
+  "currentRealm": "从提供的境界体系中选取的准确境界/子境界名称，没有则留空"
+}"""
+    }
+
+    fun characterFromBriefUser(brief: String, context: String, language: String) = if (language == "en") {
+        buildString {
+            if (context.isNotBlank()) {
+                appendLine("[Novel setting reference]")
+                appendLine(context)
+                appendLine()
+            }
+            appendLine("[Character the user wants]")
+            appendLine(brief)
+            appendLine()
+            append("Now output the single JSON character object that fits this novel. Every field must be detailed and consistent with the setting above.")
+        }
+    } else {
+        buildString {
+            if (context.isNotBlank()) {
+                appendLine("【小说设定参考】")
+                appendLine(context)
+                appendLine()
+            }
+            appendLine("【用户想要的角色】")
+            appendLine(brief)
+            appendLine()
+            append("请现在输出契合本小说的单个 JSON 角色对象。每个字段都要详尽，并确保与上面的设定一致。")
+        }
+    }
+
     fun chapterSystem(language: String) = if (language == "en") {
         """You are a skilled fiction writer.
 

@@ -40,6 +40,8 @@ import androidx.compose.material.icons.outlined.Image
 import androidx.compose.material.icons.outlined.KeyboardArrowDown
 import androidx.compose.material.icons.outlined.KeyboardArrowUp
 import androidx.compose.material.icons.outlined.PlayArrow
+import androidx.compose.material.icons.outlined.PlaylistAdd
+import androidx.compose.material.icons.outlined.QuestionAnswer
 import androidx.compose.material.icons.outlined.Save
 import androidx.compose.material.icons.outlined.Stop
 import androidx.compose.material.icons.outlined.SwapVert
@@ -108,6 +110,7 @@ fun EditorScreen(
     projectId: String,
     chapterId: String,
     onBack: () -> Unit,
+    onOpenQa: () -> Unit = {},
     onNavigateToChapter: (chapterId: String) -> Unit = {},
 ) {
     val lang by vm.uiLanguage.collectAsState()
@@ -164,6 +167,7 @@ fun EditorScreen(
 
     var planExpanded by remember(chapterId) { mutableStateOf(finalText.isBlank() && draftText.isBlank()) }
     var showRevise by remember { mutableStateOf(false) }
+    var showInsertDialog by remember { mutableStateOf(false) }
     var reviseSelection by remember { mutableStateOf("") }
     var reviseInProgress by remember { mutableStateOf(false) }
     var showAiFill by remember { mutableStateOf(false) }
@@ -306,6 +310,10 @@ fun EditorScreen(
                             Icon(Icons.Outlined.ChevronRight,
                                 contentDescription = tx(lang, "下一章", "Next chapter"))
                         }
+                    }
+                    IconButton(onClick = onOpenQa) {
+                        Icon(Icons.Outlined.QuestionAnswer,
+                            contentDescription = tx(lang, "小说问答", "Ask the novel"))
                     }
                     IconButton(onClick = { showRealmDialog = true }) {
                         Icon(Icons.Outlined.Explore, contentDescription = null)
@@ -451,6 +459,14 @@ fun EditorScreen(
                             }
                             Spacer(Modifier.width(4.dp))
                             Text(tx(lang, "推文", "Promo"), style = MaterialTheme.typography.labelMedium)
+                        }
+                        FilledTonalButton(
+                            onClick = { showInsertDialog = true },
+                            enabled = !isGenerating,
+                        ) {
+                            Icon(Icons.Outlined.PlaylistAdd, null, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text(tx(lang, "插入章节", "Insert"), style = MaterialTheme.typography.labelMedium)
                         }
                     }
 
@@ -698,6 +714,34 @@ fun EditorScreen(
                 if (picked != chapterId) gotoChapter(picked)
             },
             onDismiss = { showChapterSwitcher = false },
+        )
+    }
+
+    // ── Insert new chapter dialog (before / after current) ───────────────────────
+    if (showInsertDialog) {
+        val defaultTitle = tx(lang, "新章节", "New Chapter")
+        val insert: (Boolean) -> Unit = { before ->
+            showInsertDialog = false
+            val created = vm.insertChapter(projectId, chapterId, before, defaultTitle)
+            if (created != null) gotoChapter(created.id)
+        }
+        AlertDialog(
+            onDismissRequest = { showInsertDialog = false },
+            title = { Text(tx(lang, "插入新章节", "Insert New Chapter")) },
+            text = {
+                Text(tx(lang,
+                    "在本章「${chapter.title}」的哪个位置插入新章节？",
+                    "Where should the new chapter go relative to \"${chapter.title}\"?"))
+            },
+            confirmButton = {
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    TextButton(onClick = { insert(true) }) { Text(tx(lang, "插入到前面", "Before")) }
+                    TextButton(onClick = { insert(false) }) { Text(tx(lang, "插入到后面", "After")) }
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showInsertDialog = false }) { Text(tx(lang, "取消", "Cancel")) }
+            },
         )
     }
 

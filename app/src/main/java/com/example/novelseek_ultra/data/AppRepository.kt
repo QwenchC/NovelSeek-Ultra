@@ -7,16 +7,23 @@ import com.example.novelseek_ultra.data.model.BackupSummary
 import com.example.novelseek_ultra.data.model.Chapter
 import com.example.novelseek_ultra.data.model.ChapterPromo
 import com.example.novelseek_ultra.data.model.Character
+import com.example.novelseek_ultra.data.model.CharacterEvent
+import com.example.novelseek_ultra.data.model.CharacterRealmEvent
+import com.example.novelseek_ultra.data.model.CharacterRelationship
 import com.example.novelseek_ultra.data.model.CoverImageItem
 import com.example.novelseek_ultra.data.model.CultivationRealm
 import com.example.novelseek_ultra.data.model.EmbeddingConfig
 import com.example.novelseek_ultra.data.model.EntityPayload
 import com.example.novelseek_ultra.data.model.Illustration
+import com.example.novelseek_ultra.data.model.NovelChatMessage
 import com.example.novelseek_ultra.data.model.KbChunk
 import com.example.novelseek_ultra.data.model.KbStats
 import com.example.novelseek_ultra.data.model.PROJECT_MAP_FIELDS
 import com.example.novelseek_ultra.data.model.PlotArc
 import com.example.novelseek_ultra.data.model.Project
+import com.example.novelseek_ultra.data.model.ProjectSnapshot
+import com.example.novelseek_ultra.data.model.RestoreResult
+import com.example.novelseek_ultra.data.model.SnapshotMeta
 import com.example.novelseek_ultra.data.model.SummaryPayload
 import com.example.novelseek_ultra.data.model.TextModelConfig
 import com.example.novelseek_ultra.data.model.TextModelProfile
@@ -62,6 +69,16 @@ class AppRepository(context: Context) {
     // to indexing (e.g. the Settings KB stats) observes this counter instead.
     private val _kbRevision = MutableStateFlow(0)
     val kbRevision: StateFlow<Int> = _kbRevision.asStateFlow()
+
+    // Bumped whenever a project's snapshot index changes (create / delete / restore). Snapshots
+    // live in their own files (NOT in `_state`), so the version-history UI observes this counter.
+    private val _snapshotRevision = MutableStateFlow(0)
+    val snapshotRevision: StateFlow<Int> = _snapshotRevision.asStateFlow()
+
+    // Bumped whenever a project's "ask the novel" chat history changes. The history lives in its
+    // own per-project file (NOT in `_state`), so the Q&A UI observes this counter.
+    private val _novelChatRevision = MutableStateFlow(0)
+    val novelChatRevision: StateFlow<Int> = _novelChatRevision.asStateFlow()
 
     /** On first launch (no profiles yet), seed the 4 built-in profiles PC ships with. */
     private fun seedIfNeeded(state: JsonObject): JsonObject {
@@ -141,8 +158,13 @@ class AppRepository(context: Context) {
     fun deleteProject(projectId: String) {
         mutateState { current ->
             val list = readProjects(current).filterNot { it.id == projectId }
-            current.with("projects", JSON.encodeToJsonElement(ListSerializer(Project.serializer()), list) as JsonArray)
+            val next = current.with("projects", JSON.encodeToJsonElement(ListSerializer(Project.serializer()), list) as JsonArray)
+            // Drop the project's KB caches so they don't linger in app_state.json.
+            val withoutHashes = (next["kbIndexHashByProject"] as? JsonObject)?.let { next.with("kbIndexHashByProject", JsonObject(it.minus(projectId))) } ?: next
+            (withoutHashes["kbStaleByProject"] as? JsonObject)?.let { withoutHashes.with("kbStaleByProject", JsonObject(it.minus(projectId))) } ?: withoutHashes
         }
+        deleteSnapshotsForProject(projectId)
+        clearNovelChat(projectId)
     }
 
     // ── chapters (Android-only, stored as chaptersByProject in JSON) ──────
@@ -284,6 +306,15 @@ class AppRepository(context: Context) {
 
     fun setCultivationRealms(projectId: String, realms: List<CultivationRealm>) =
         writeListMap("cultivationRealmsByProject", projectId, realms.sortedBy { it.order }, CultivationRealm.serializer())
+
+    fun characterRelationships(projectId: String): List<CharacterRelationship> =
+        readListMap("characterRelationshipsByProject", projectId, CharacterRelationship.serializer())
+
+    fun characterEvents(projectId: String): List<CharacterEvent> =
+        readListMap("characterEventsByProject", projectId, CharacterEvent.serializer())
+
+    fun characterRealmEvents(projectId: String): List<CharacterRealmEvent> =
+        readListMap("characterRealmEventsByProject", projectId, CharacterRealmEvent.serializer())
 
     // ── KB summaries (chapter / arc / book) ────────────────────────────────
 
@@ -683,6 +714,304 @@ class AppRepository(context: Context) {
             sanitized["pollinationsKey"] = JsonPrimitive("")
         }
         return JsonObject(sanitized) to sensitives
+    }
+
+    // ── KB index hashes & stale tracking (support for snapshot restore) ──────
+    //
+    // `kbIndexHashByProject[pid][chapterId]` = sha1 of the chapter text that is CURRENTLY embedded
+    // in the vector store. `kbStaleByProject[pid]` lists chapters whose embedded vectors no longer
+    // match the live content (e.g. after a snapshot restore) and need re-indexing. Both are local
+    // caches kept out of the backup/PROJECT_MAP_FIELDS plumbing on purpose.
+
+    private fun nestedPut(field: String, outerKey: String, innerKey: String, value: kotlinx.serialization.json.JsonElement?) {
+        mutateState { current ->
+            val outer = (current[field] as? JsonObject ?: JsonObject(emptyMap())).toMutableMap()
+            val inner = (outer[outerKey] as? JsonObject ?: JsonObject(emptyMap())).toMutableMap()
+            if (value == null) inner.remove(innerKey) else inner[innerKey] = value
+            outer[outerKey] = JsonObject(inner)
+            current.with(field, JsonObject(outer))
+        }
+    }
+
+    fun kbIndexHashes(projectId: String): Map<String, String> {
+        val inner = (_state.value["kbIndexHashByProject"] as? JsonObject)?.get(projectId) as? JsonObject
+            ?: return emptyMap()
+        return inner.mapNotNull { (k, v) -> (v as? JsonPrimitive)?.contentOrNull?.let { k to it } }.toMap()
+    }
+
+    fun setKbIndexHash(projectId: String, chapterId: String, hash: String) =
+        nestedPut("kbIndexHashByProject", projectId, chapterId, JsonPrimitive(hash))
+
+    fun removeKbIndexHash(projectId: String, chapterId: String) =
+        nestedPut("kbIndexHashByProject", projectId, chapterId, null)
+
+    /** Drop hash entries for chapters no longer present (keepChapterIds). */
+    fun pruneKbIndexHashes(projectId: String, keepChapterIds: Set<String>) {
+        mutateState { current ->
+            val outer = (current["kbIndexHashByProject"] as? JsonObject) ?: return@mutateState current
+            val inner = (outer[projectId] as? JsonObject) ?: return@mutateState current
+            val filtered = inner.filterKeys { it in keepChapterIds }
+            current.with("kbIndexHashByProject", outer.with(projectId, JsonObject(filtered)))
+        }
+    }
+
+    fun kbStaleChapters(projectId: String): List<String> {
+        val arr = (_state.value["kbStaleByProject"] as? JsonObject)?.get(projectId) as? JsonArray
+            ?: return emptyList()
+        return arr.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }
+    }
+
+    fun setKbStaleChapters(projectId: String, chapterIds: List<String>) {
+        mutateState { current ->
+            val map = (current["kbStaleByProject"] as? JsonObject) ?: JsonObject(emptyMap())
+            current.with("kbStaleByProject", map.with(projectId, JsonArray(chapterIds.distinct().map { JsonPrimitive(it) })))
+        }
+    }
+
+    fun clearKbStaleChapter(projectId: String, chapterId: String) {
+        setKbStaleChapters(projectId, kbStaleChapters(projectId).filterNot { it == chapterId })
+    }
+
+    // ── "Ask the novel" Q&A chat history (per-project, own file) ─────────────
+
+    private fun novelChatFile(projectId: String): File =
+        File(appContext.filesDir, "novel_chat/${projectId}.json")
+
+    fun novelChatHistory(projectId: String): List<NovelChatMessage> {
+        val f = novelChatFile(projectId)
+        if (!f.exists()) return emptyList()
+        return runCatching {
+            JSON.decodeFromString(ListSerializer(NovelChatMessage.serializer()), f.readText())
+        }.getOrDefault(emptyList())
+    }
+
+    fun setNovelChatHistory(projectId: String, messages: List<NovelChatMessage>) {
+        val dir = File(appContext.filesDir, "novel_chat")
+        if (!dir.exists()) dir.mkdirs()
+        novelChatFile(projectId).writeText(
+            JSON.encodeToString(ListSerializer(NovelChatMessage.serializer()), messages)
+        )
+        _novelChatRevision.value += 1
+    }
+
+    fun appendNovelChat(projectId: String, message: NovelChatMessage) {
+        setNovelChatHistory(projectId, novelChatHistory(projectId) + message)
+    }
+
+    fun clearNovelChat(projectId: String) {
+        novelChatFile(projectId).delete()
+        _novelChatRevision.value += 1
+    }
+
+    // ── Project snapshots (version history) ──────────────────────────────────
+
+    private fun versionsDir(projectId: String): File = File(appContext.filesDir, "versions/$projectId")
+    private fun snapshotIndexFile(projectId: String): File = File(versionsDir(projectId), "index.json")
+    private fun snapshotFile(projectId: String, snapshotId: String): File =
+        File(versionsDir(projectId), "$snapshotId.json")
+
+    fun listSnapshots(projectId: String): List<SnapshotMeta> {
+        val f = snapshotIndexFile(projectId)
+        if (!f.exists()) return emptyList()
+        return runCatching {
+            JSON.decodeFromString(ListSerializer(SnapshotMeta.serializer()), f.readText())
+        }.getOrDefault(emptyList()).sortedByDescending { it.createdAt }
+    }
+
+    private fun writeSnapshotIndex(projectId: String, metas: List<SnapshotMeta>) {
+        val dir = versionsDir(projectId)
+        if (!dir.exists()) dir.mkdirs()
+        snapshotIndexFile(projectId).writeText(
+            JSON.encodeToString(ListSerializer(SnapshotMeta.serializer()), metas.sortedByDescending { it.createdAt })
+        )
+        _snapshotRevision.value += 1
+    }
+
+    private fun readSnapshot(projectId: String, snapshotId: String): ProjectSnapshot? {
+        val f = snapshotFile(projectId, snapshotId)
+        if (!f.exists()) return null
+        return runCatching { JSON.decodeFromString(ProjectSnapshot.serializer(), f.readText()) }.getOrNull()
+    }
+
+    /**
+     * Capture the whole project into a new snapshot. Returns null if the project does not exist, or
+     * if [trigger] is non-manual and the content is identical to the most recent snapshot (dedup).
+     */
+    fun createSnapshot(projectId: String, label: String, trigger: String): SnapshotMeta? {
+        val project = project(projectId) ?: return null
+        val chapterList = chapters(projectId)
+
+        val bodies = LinkedHashMap<String, JsonObject>()
+        val illus = LinkedHashMap<String, JsonArray>()
+        val promos = LinkedHashMap<String, JsonObject>()
+        val chapterHashes = LinkedHashMap<String, String>()
+        for (ch in chapterList) {
+            val body = chapterBody(ch.id)
+            bodies[ch.id] = JSON.encodeToJsonElement(ChapterBody.serializer(), body) as JsonObject
+            chapterHashes[ch.id] = SnapshotStore.sha1(SnapshotStore.canonicalChapterText(body.final, body.draft))
+            chapterIllustrations(ch.id).takeIf { it.isNotEmpty() }?.let {
+                illus[ch.id] = JSON.encodeToJsonElement(ListSerializer(Illustration.serializer()), it) as JsonArray
+            }
+            getChapterPromo(ch.id)?.let {
+                promos[ch.id] = JSON.encodeToJsonElement(ChapterPromo.serializer(), it) as JsonObject
+            }
+        }
+
+        val state = _state.value
+        val projectMaps = buildJsonObject {
+            for (field in SnapshotStore.PROJECT_KEYED_FIELDS) {
+                (state[field] as? JsonObject)?.get(projectId)?.let { put(field, it) }
+            }
+        }
+        val projectJson = JSON.encodeToJsonElement(Project.serializer(), project) as JsonObject
+        val chaptersJson = JSON.encodeToJsonElement(ListSerializer(Chapter.serializer()), chapterList) as JsonArray
+
+        val contentSig = SnapshotStore.sha1(
+            chaptersJson.toString() +
+                chapterHashes.entries.sortedBy { it.key }.joinToString("|") { "${it.key}=${it.value}" } +
+                projectMaps.toString()
+        )
+
+        val existing = listSnapshots(projectId)
+        if (trigger != SnapshotMeta.TRIGGER_MANUAL && existing.firstOrNull()?.contentSig == contentSig) {
+            return null  // dedup: nothing changed since the last snapshot
+        }
+
+        val id = "snap-${System.currentTimeMillis()}-${(0..99999).random()}"
+        val snapshot = ProjectSnapshot(
+            meta = SnapshotMeta(
+                id = id, projectId = projectId, createdAt = nowIso(), label = label, trigger = trigger,
+                wordCount = project.current_word_count, chapterCount = chapterList.size, contentSig = contentSig,
+            ),
+            project = projectJson,
+            chapters = chaptersJson,
+            chapterBodies = bodies,
+            illustrations = illus,
+            promos = promos,
+            projectMaps = projectMaps,
+            chapterHashes = chapterHashes,
+        )
+
+        val dir = versionsDir(projectId)
+        if (!dir.exists()) dir.mkdirs()
+        val file = snapshotFile(projectId, id)
+        file.writeText(JSON.encodeToString(ProjectSnapshot.serializer(), snapshot))
+        val meta = snapshot.meta.copy(sizeBytes = file.length())
+
+        writeSnapshotIndex(projectId, applyRetention(projectId, existing + meta))
+        return meta
+    }
+
+    /** Keep all manual snapshots; cap auto/pre_ai at [SnapshotStore.DEFAULT_RETENTION], deleting files. */
+    private fun applyRetention(projectId: String, all: List<SnapshotMeta>): List<SnapshotMeta> {
+        val sorted = all.sortedByDescending { it.createdAt }
+        val manual = sorted.filter { it.trigger == SnapshotMeta.TRIGGER_MANUAL }
+        val auto = sorted.filter { it.trigger != SnapshotMeta.TRIGGER_MANUAL }
+        auto.drop(SnapshotStore.DEFAULT_RETENTION).forEach { snapshotFile(projectId, it.id).delete() }
+        return manual + auto.take(SnapshotStore.DEFAULT_RETENTION)
+    }
+
+    fun renameSnapshot(projectId: String, snapshotId: String, label: String) {
+        val updated = listSnapshots(projectId).map { if (it.id == snapshotId) it.copy(label = label) else it }
+        writeSnapshotIndex(projectId, updated)
+    }
+
+    fun deleteSnapshot(projectId: String, snapshotId: String) {
+        snapshotFile(projectId, snapshotId).delete()
+        writeSnapshotIndex(projectId, listSnapshots(projectId).filterNot { it.id == snapshotId })
+    }
+
+    fun deleteSnapshotsForProject(projectId: String) {
+        versionsDir(projectId).deleteRecursively()
+        _snapshotRevision.value += 1
+    }
+
+    /**
+     * Restore the project to [snapshotId]. The current state is auto-snapshotted first so the
+     * restore itself is undoable. Returns which chapters' KB vectors went stale (for the rebuild
+     * banner) and how many orphan chunks were pruned.
+     */
+    fun restoreSnapshot(projectId: String, snapshotId: String): RestoreResult {
+        val snap = readSnapshot(projectId, snapshotId) ?: return RestoreResult()
+
+        // Safety net: capture current state before overwriting it.
+        createSnapshot(projectId, "回退前自动备份", SnapshotMeta.TRIGGER_AUTO)
+
+        val restoredChapterIds = snap.chapters.mapNotNull {
+            (it as? JsonObject)?.get("id")?.let { idEl -> (idEl as? JsonPrimitive)?.contentOrNull }
+        }.toSet()
+
+        // 1) per-chapter files (bodies / illustrations).
+        snap.chapterBodies.forEach { (cid, obj) ->
+            saveChapterBody(cid, JSON.decodeFromJsonElement(ChapterBody.serializer(), obj))
+        }
+        restoredChapterIds.forEach { cid ->
+            val arr = snap.illustrations[cid]
+            val list = if (arr != null) JSON.decodeFromJsonElement(ListSerializer(Illustration.serializer()), arr) else emptyList()
+            setChapterIllustrations(cid, list)
+        }
+
+        // 2) state: project record, chapter list, per-project maps, promos.
+        mutateState { current ->
+            val next = current.toMutableMap()
+
+            val proj = JSON.decodeFromJsonElement(Project.serializer(), snap.project)
+            val projList = readProjects(current).toMutableList()
+            val idx = projList.indexOfFirst { it.id == projectId }
+            if (idx >= 0) projList[idx] = proj else projList.add(proj)
+            next["projects"] = JSON.encodeToJsonElement(ListSerializer(Project.serializer()), projList) as JsonArray
+
+            val cbp = (current["chaptersByProject"] as? JsonObject ?: JsonObject(emptyMap())).toMutableMap()
+            cbp[projectId] = snap.chapters
+            next["chaptersByProject"] = JsonObject(cbp)
+
+            for (field in SnapshotStore.PROJECT_KEYED_FIELDS) {
+                val map = (current[field] as? JsonObject ?: JsonObject(emptyMap())).toMutableMap()
+                val slice = snap.projectMaps[field]
+                if (slice != null) map[projectId] = slice else map.remove(projectId)
+                next[field] = JsonObject(map)
+            }
+
+            val promoMap = (current["promoByChapter"] as? JsonObject ?: JsonObject(emptyMap())).toMutableMap()
+            restoredChapterIds.forEach { promoMap.remove(it) }
+            snap.promos.forEach { (cid, obj) -> promoMap[cid] = obj }
+            next["promoByChapter"] = JsonObject(promoMap)
+
+            JsonObject(next)
+        }
+
+        return reconcileKbAfterRestore(projectId, restoredChapterIds, snap.chapterHashes)
+    }
+
+    /**
+     * After a restore: prune KB chunks/hashes for chapters that no longer exist (kills "ghost from
+     * the future" + orphan citations for free), then flag chapters whose embedded vectors no longer
+     * match the restored content as stale (so the UI can offer a targeted, opt-in rebuild).
+     */
+    private fun reconcileKbAfterRestore(
+        projectId: String,
+        restoredChapterIds: Set<String>,
+        snapHashes: Map<String, String>,
+    ): RestoreResult {
+        val before = chunks(projectId)
+        val kept = before.filter { it.sourceId in restoredChapterIds }
+        val pruned = before.size - kept.size
+        if (pruned > 0) setChunks(projectId, kept)
+        pruneKbIndexHashes(projectId, restoredChapterIds)
+
+        if (!knowledgeBaseEnabled()) {
+            setKbStaleChapters(projectId, emptyList())
+            return RestoreResult(emptyList(), pruned)
+        }
+
+        val live = kbIndexHashes(projectId)
+        // Stale = chapters whose desired (restored) content hash differs from what is embedded now.
+        val stale = restoredChapterIds.filter { cid ->
+            val want = snapHashes[cid] ?: return@filter false
+            live[cid] != want
+        }
+        setKbStaleChapters(projectId, stale)
+        return RestoreResult(stale, pruned)
     }
 
     @kotlinx.serialization.Serializable

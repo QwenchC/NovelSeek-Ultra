@@ -13,3 +13,8 @@
 .externalNativeBuild
 .cxx
 local.properties
+# Build artifacts — never commit packaged binaries
+*.apk
+*.aab
+/app/release
+/app/debug

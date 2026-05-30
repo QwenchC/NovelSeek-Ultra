@@ -145,7 +145,7 @@ fun CharactersScreen(vm: AppViewModel, projectId: String, onBack: () -> Unit) {
 
     if (showCreate) {
         EditCharacterDialog(
-            vm = vm, lang = lang,
+            vm = vm, lang = lang, projectId = projectId,
             initial = Character(id = "char-${System.currentTimeMillis()}", name = ""),
             onDismiss = { showCreate = false },
             onSave = { saved ->
@@ -157,7 +157,7 @@ fun CharactersScreen(vm: AppViewModel, projectId: String, onBack: () -> Unit) {
     }
     editing?.let { c ->
         EditCharacterDialog(
-            vm = vm, lang = lang, initial = c,
+            vm = vm, lang = lang, projectId = projectId, initial = c,
             onDismiss = { editing = null },
             onSave = { saved ->
                 characters = characters.map { if (it.id == saved.id) saved else it }
@@ -379,6 +379,7 @@ private fun CharacterCard(c: Character, lang: String, onEdit: () -> Unit, onDele
 private fun EditCharacterDialog(
     vm: AppViewModel,
     lang: String,
+    projectId: String,
     initial: Character,
     onDismiss: () -> Unit,
     onSave: (Character) -> Unit,
@@ -389,11 +390,72 @@ private fun EditCharacterDialog(
     var isGeneratingPortrait by remember { mutableStateOf(false) }
     var portraitStyle by remember { mutableStateOf("") }   // 画风 input for portrait generation
 
+    // AI quick-generate: user types a brief, AI fills every field grounded in the novel's
+    // outline + realm system. Only offered when creating a new character.
+    val isCreating = initial.name.isBlank()
+    var brief by remember { mutableStateOf("") }
+    var isGeneratingChar by remember { mutableStateOf(false) }
+    var briefError by remember { mutableStateOf("") }
+
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text(if (initial.name.isBlank()) tx(lang, "新建角色", "New Character") else tx(lang, "编辑角色", "Edit Character")) },
+        title = { Text(if (isCreating) tx(lang, "新建角色", "New Character") else tx(lang, "编辑角色", "Edit Character")) },
         text = {
             LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.height(440.dp)) {
+                if (isCreating) {
+                    item {
+                        Column {
+                            OutlinedTextField(
+                                value = brief,
+                                onValueChange = { brief = it; briefError = "" },
+                                label = { Text(tx(lang, "描述你想要的角色，AI 自动填写", "Describe the character; AI auto-fills")) },
+                                placeholder = { Text(tx(lang, "如：一个隐居山林、亦正亦邪的炼丹宗师", "e.g. a reclusive, morally grey alchemy master")) },
+                                minLines = 2,
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                            if (briefError.isNotBlank()) {
+                                Text(briefError, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.error)
+                            }
+                            Spacer(Modifier.height(6.dp))
+                            FilledTonalButton(
+                                enabled = !isGeneratingChar && brief.isNotBlank(),
+                                onClick = {
+                                    isGeneratingChar = true
+                                    briefError = ""
+                                    scope.launch {
+                                        val res = vm.generateCharacterFromBrief(projectId, brief)
+                                        if (res != null) {
+                                            // Merge AI fields onto the in-progress character, preserving id + portrait.
+                                            c = c.copy(
+                                                name = res.name,
+                                                gender = res.gender,
+                                                role = res.role,
+                                                personality = res.personality,
+                                                background = res.background,
+                                                motivation = res.motivation,
+                                                appearance = res.appearance,
+                                                isProtagonist = res.isProtagonist,
+                                                currentRealmId = res.currentRealmId ?: c.currentRealmId,
+                                                currentSubRealmId = res.currentSubRealmId ?: c.currentSubRealmId,
+                                            )
+                                        } else {
+                                            briefError = tx(lang, "生成失败，请检查模型配置或重试", "Generation failed — check model config or retry")
+                                        }
+                                        isGeneratingChar = false
+                                    }
+                                },
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                if (isGeneratingChar) CircularProgressIndicator(modifier = Modifier.width(16.dp).height(16.dp))
+                                else Icon(Icons.Outlined.AutoAwesome, contentDescription = null)
+                                Spacer(Modifier.width(6.dp))
+                                Text(tx(lang, "AI 生成角色", "AI Generate Character"))
+                            }
+                            Spacer(Modifier.height(4.dp))
+                            HorizontalDivider()
+                        }
+                    }
+                }
                 item { OutlinedTextField(c.name, { c = c.copy(name = it) }, label = { Text(tx(lang, "姓名", "Name")) }, singleLine = true) }
                 item { OutlinedTextField(c.gender, { c = c.copy(gender = it) }, label = { Text(tx(lang, "性别", "Gender")) }, singleLine = true) }
                 item { OutlinedTextField(c.role, { c = c.copy(role = it) }, label = { Text(tx(lang, "身份", "Role")) }, singleLine = true) }

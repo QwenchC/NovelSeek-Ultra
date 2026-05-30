@@ -26,6 +26,7 @@ object SnapshotStore {
         "characterRealmEventsByProject",
         "summariesByProject",
         "entitiesByProject",
+        "containersByProject",
     )
 
     /** Default number of non-manual (auto / pre_ai) snapshots retained per project. */

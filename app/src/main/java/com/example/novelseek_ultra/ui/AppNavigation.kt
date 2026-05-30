@@ -4,6 +4,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.AutoStories
 import androidx.compose.material.icons.outlined.Book
+import androidx.compose.material.icons.outlined.Headphones
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.fillMaxSize
@@ -29,10 +30,12 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import com.example.novelseek_ultra.ui.screens.CharactersScreen
+import com.example.novelseek_ultra.ui.screens.ContainerScreen
 import com.example.novelseek_ultra.ui.screens.CultivationScreen
 import com.example.novelseek_ultra.ui.screens.EditorScreen
 import com.example.novelseek_ultra.ui.screens.ExportScreen
 import com.example.novelseek_ultra.ui.screens.HomeScreen
+import com.example.novelseek_ultra.ui.screens.ListenScreen
 import com.example.novelseek_ultra.ui.screens.LongNovelScreen
 import com.example.novelseek_ultra.ui.screens.LongNovelsHomeScreen
 import com.example.novelseek_ultra.ui.screens.OutlineScreen
@@ -44,10 +47,11 @@ import com.example.novelseek_ultra.ui.screens.VersionHistoryScreen
 private sealed class Tab(val route: String, val zh: String, val en: String, val icon: ImageVector) {
     data object Home : Tab("home", "短篇", "Short", Icons.Outlined.Book)
     data object LongHome : Tab("long_home", "长篇", "Long", Icons.Outlined.AutoStories)
+    data object Listen : Tab("listen", "听书", "Listen", Icons.Outlined.Headphones)
     data object Settings : Tab("settings", "设置", "Settings", Icons.Outlined.Settings)
 }
 
-private val TABS = listOf(Tab.Home, Tab.LongHome, Tab.Settings)
+private val TABS = listOf(Tab.Home, Tab.LongHome, Tab.Listen, Tab.Settings)
 
 object Routes {
     const val PROJECT = "project/{id}"
@@ -60,6 +64,7 @@ object Routes {
     const val CULTIVATION = "cultivation/{id}"
     const val VERSION_HISTORY = "version_history/{id}"
     const val NOVEL_QA = "novel_qa/{id}"
+    const val CONTAINER = "container/{id}"
 
     fun project(id: String) = "project/$id"
     fun outline(id: String) = "outline/$id"
@@ -71,6 +76,7 @@ object Routes {
     fun cultivation(id: String) = "cultivation/$id"
     fun versionHistory(id: String) = "version_history/$id"
     fun novelQa(id: String) = "novel_qa/$id"
+    fun container(id: String) = "container/$id"
 }
 
 @Composable
@@ -139,6 +145,7 @@ private fun NavGraphBuilder.tabRoutes(nav: NavHostController, vm: AppViewModel) 
     composable(Tab.LongHome.route) {
         LongNovelsHomeScreen(vm, onOpen = { id -> nav.navigate(Routes.longProject(id)) })
     }
+    composable(Tab.Listen.route) { ListenScreen(vm) }
     composable(Tab.Settings.route) { SettingsScreen(vm) }
 }
 
@@ -167,6 +174,7 @@ private fun NavGraphBuilder.detailRoutes(nav: NavHostController, vm: AppViewMode
             onOpenCultivation = { nav.navigate(Routes.cultivation(id)) },
             onOpenHistory = { nav.navigate(Routes.versionHistory(id)) },
             onOpenQa = { nav.navigate(Routes.novelQa(id)) },
+            onOpenContainer = { nav.navigate(Routes.container(id)) },
         )
     }
     composable(Routes.OUTLINE) { entry ->
@@ -192,6 +200,7 @@ private fun NavGraphBuilder.detailRoutes(nav: NavHostController, vm: AppViewMode
             vm = vm, projectId = pid, chapterId = cid,
             onBack = { nav.popBackStack() },
             onOpenQa = { nav.navigate(Routes.novelQa(pid)) },
+            onOpenContainer = { nav.navigate(Routes.container(pid)) },
             onNavigateToChapter = { targetCid ->
                 // Replace current editor entry so the back stack doesn't accumulate one entry per
                 // chapter when the user pages through prev/next.
@@ -213,5 +222,9 @@ private fun NavGraphBuilder.detailRoutes(nav: NavHostController, vm: AppViewMode
     composable(Routes.NOVEL_QA) { entry ->
         val id = entry.arguments?.getString("id") ?: return@composable
         NovelQaScreen(vm = vm, projectId = id, onBack = { nav.popBackStack() })
+    }
+    composable(Routes.CONTAINER) { entry ->
+        val id = entry.arguments?.getString("id") ?: return@composable
+        ContainerScreen(vm = vm, projectId = id, onBack = { nav.popBackStack() })
     }
 }

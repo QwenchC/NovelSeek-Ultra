@@ -14,6 +14,8 @@ import com.example.novelseek_ultra.data.model.BackupSummary
 import com.example.novelseek_ultra.data.model.Chapter
 import com.example.novelseek_ultra.data.model.ChapterPromo
 import com.example.novelseek_ultra.data.model.Character
+import com.example.novelseek_ultra.data.model.Container
+import com.example.novelseek_ultra.data.model.ContainerEntry
 import com.example.novelseek_ultra.data.model.CoverImageConfig
 import com.example.novelseek_ultra.data.model.CoverImageItem
 import com.example.novelseek_ultra.data.model.CultivationRealm
@@ -39,6 +41,7 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 
@@ -46,6 +49,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     private val repo: AppRepository = AppRepository.get(application)
     private val ai = AiService()
+
+    /** Audiobook (听书) playback engine — observed directly by the listen screen. */
+    val audiobook = com.example.novelseek_ultra.data.audio.AudiobookController(application, repo, viewModelScope)
 
     // ── observable state ───────────────────────────────────────────────────
 
@@ -99,6 +105,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 _theme.value = repo.themePref()
             }
         }
+    }
+
+    override fun onCleared() {
+        audiobook.release()
+        super.onCleared()
     }
 
     // ── settings ───────────────────────────────────────────────────────────
@@ -241,6 +252,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun setWorldSetting(projectId: String, value: String) = repo.setWorldSetting(projectId, value)
     fun timeline(projectId: String): String = repo.timeline(projectId)
     fun setTimeline(projectId: String, value: String) = repo.setTimeline(projectId, value)
+    fun lastListenProjectId(): String? = repo.lastListenProjectId()
+
     fun outlineText(projectId: String): String = repo.outline(projectId)
     fun setOutlineText(projectId: String, value: String) = repo.setOutline(projectId, value)
 
@@ -1282,7 +1295,48 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
+        // Container guidance — soft, "evolve from here" reference state for affectsGeneration containers.
+        buildContainerGuidance(projectId, lang)?.let { parts += it }
+
         return parts.takeIf { it.isNotEmpty() }?.joinToString("\n\n")
+    }
+
+    /** Inject the latest values of every affectsGeneration container as soft (non-forced) guidance. */
+    private fun buildContainerGuidance(projectId: String, lang: String): String? {
+        val containers = repo.containers(projectId).filter { it.affectsGeneration }
+        if (containers.isEmpty()) return null
+        val blocks = mutableListOf<String>()
+        containers.forEach { c ->
+            when (c.type) {
+                Container.BY_CHARACTER -> {
+                    val lines = repo.characters(projectId).mapNotNull { ch ->
+                        val v = repo.containerEntries(projectId, c.id, ch.id).lastOrNull()?.value?.takeIf { it.isNotBlank() }
+                            ?: return@mapNotNull null
+                        "${ch.name}：${v.take(300)}"
+                    }
+                    if (lines.isNotEmpty()) blocks += "《${c.name}》\n" + lines.joinToString("\n")
+                }
+                Container.BY_CHAPTER -> {
+                    val recent = repo.chapters(projectId).sortedBy { it.order_index }.takeLast(3)
+                    val lines = recent.mapNotNull { ch ->
+                        val v = repo.containerEntries(projectId, c.id, ch.id).lastOrNull()?.value?.takeIf { it.isNotBlank() }
+                            ?: return@mapNotNull null
+                        "第${ch.order_index}章：${v.take(200)}"
+                    }
+                    if (lines.isNotEmpty()) blocks += "《${c.name}》\n" + lines.joinToString("\n")
+                }
+                else -> {
+                    val v = repo.containerEntries(projectId, c.id, Container.SINGLE_BLOCK_KEY).lastOrNull()?.value
+                    if (!v.isNullOrBlank()) blocks += "《${c.name}》：${v.take(400)}"
+                }
+            }
+        }
+        if (blocks.isEmpty()) return null
+        val header = if (lang == "en")
+            "[Containers — reference state. Evolve naturally from here; do not contradict or regress these without an in-story reason.]"
+        else
+            "【资料容器 — 参考状态。请在此基础上自然演进，勿无理由跳变或倒退。】"
+        return header + "\n" + blocks.joinToString("\n\n")
     }
 
     private fun parseAppearanceJson(raw: String): Pair<String, String>? = runCatching {
@@ -1415,6 +1469,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         indexChapterIfEnabled(projectId, chapterId, title, text)
         if (repo.summariesEnabled()) generateChapterSummary(projectId, chapterId, title, text)
         if (repo.entitiesEnabled()) extractEntitiesForChapter(projectId, chapterId, title, text)
+        updateContainersForChapter(projectId, chapterId, title, text)
     }
 
     /** Index a single chapter (called after a successful chapter save when KB is enabled). */
@@ -1916,6 +1971,139 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
         return parts.joinToString("\n\n")
     }
+
+    // ── Containers (容器) ─────────────────────────────────────────────────────
+
+    fun containers(projectId: String): List<Container> = repo.containers(projectId)
+    fun container(projectId: String, containerId: String): Container? = repo.container(projectId, containerId)
+    fun createContainer(projectId: String, container: Container) = repo.createContainer(projectId, container)
+    fun deleteContainer(projectId: String, containerId: String) = repo.deleteContainer(projectId, containerId)
+    fun containerEntries(projectId: String, containerId: String, blockKey: String): List<ContainerEntry> =
+        repo.containerEntries(projectId, containerId, blockKey)
+
+    /** Manually overwrite the newest value in a block (latest value is user-editable). */
+    fun editLatestContainerEntry(projectId: String, containerId: String, blockKey: String, value: String) =
+        repo.replaceLatestContainerEntry(projectId, containerId, blockKey, value)
+
+    /** Manually append a value to a block (e.g. a scratch entry). */
+    fun addContainerEntry(projectId: String, containerId: String, blockKey: String, value: String) {
+        repo.appendContainerEntry(
+            projectId, containerId, blockKey,
+            ContainerEntry(id = "ce-${System.currentTimeMillis()}", value = value, createdAt = nowIso(), manual = true),
+        )
+    }
+
+    /** Blocks of a container as (blockKey, label), derived live from current characters/chapters. */
+    fun containerBlocks(projectId: String, container: Container): List<Pair<String, String>> = when (container.type) {
+        Container.BY_CHARACTER -> repo.characters(projectId).map { it.id to it.name }
+        Container.BY_CHAPTER -> repo.chapters(projectId).sortedBy { it.order_index }
+            .map { it.id to "第${it.order_index}章 ${it.title}" }
+        else -> listOf(Container.SINGLE_BLOCK_KEY to "主块")
+    }
+
+    private fun latestContainerValue(projectId: String, containerId: String, blockKey: String): String =
+        repo.containerEntries(projectId, containerId, blockKey).lastOrNull()?.value.orEmpty()
+
+    /** Re-run the AI update for one container against the latest chapter (manual "立即更新" button). */
+    fun updateContainerNow(projectId: String, containerId: String, onDone: (Boolean) -> Unit = {}) {
+        val c = repo.container(projectId, containerId) ?: return onDone(false)
+        val ch = repo.chapters(projectId).maxByOrNull { it.order_index }
+        if (ch == null) { _statusMessage.value = "暂无章节可供更新"; return onDone(false) }
+        val body = repo.chapterBody(ch.id)
+        val text = body.final.ifBlank { body.draft }
+        if (text.isBlank()) { _statusMessage.value = "最新章节暂无正文"; return onDone(false) }
+        val cfg = repo.activeTextModelConfig()
+        if (!cfg.isValid()) { _statusMessage.value = "请先配置文本模型"; return onDone(false) }
+        viewModelScope.launch(Dispatchers.IO) {
+            val ok = runCatching {
+                updateOneContainer(projectId, c, ch.id, ch.order_index, ch.title, text, cfg, _uiLanguage.value)
+            }.isSuccess
+            withContext(Dispatchers.Main) {
+                _statusMessage.value = if (ok) "容器《${c.name}》已更新" else "容器更新失败"
+                onDone(ok)
+            }
+        }
+    }
+
+    /** Fan out per-chapter AI updates for every auto-update container (called from onChapterSaved). */
+    private fun updateContainersForChapter(projectId: String, chapterId: String, title: String, text: String) {
+        val cfg = repo.activeTextModelConfig()
+        if (!cfg.isValid() || text.trim().length < 50) return
+        val containers = repo.containers(projectId).filter { it.autoUpdatePerChapter }
+        if (containers.isEmpty()) return
+        val lang = _uiLanguage.value
+        val order = repo.chapters(projectId).firstOrNull { it.id == chapterId }?.order_index ?: 0
+        viewModelScope.launch(Dispatchers.IO) {
+            containers.forEach { c ->
+                runCatching { updateOneContainer(projectId, c, chapterId, order, title, text, cfg, lang) }
+                    .onFailure { _statusMessage.value = "容器《${c.name}》更新失败：${it.message}" }
+            }
+        }
+    }
+
+    private suspend fun updateOneContainer(
+        projectId: String, container: Container, chapterId: String,
+        order: Int, title: String, text: String, cfg: TextModelConfig, lang: String,
+    ) {
+        fun entryFrom(value: String) = ContainerEntry(
+            id = "ce-${System.currentTimeMillis()}-${(0..999).random()}",
+            value = value.trim(),
+            sourceChapterId = chapterId, sourceChapterOrder = order, sourceChapterTitle = title,
+            createdAt = nowIso(),
+        )
+        when (container.type) {
+            Container.BY_CHARACTER -> {
+                val chars = repo.characters(projectId)
+                if (chars.isEmpty()) return
+                val perChar = chars.joinToString("\n") { ch ->
+                    val v = latestContainerValue(projectId, container.id, ch.id)
+                    "【${ch.name}】${if (lang == "en") "current: " else "当前值："}${v.ifBlank { if (lang == "en") "(none)" else "（暂无）" }}"
+                }
+                val reply = ai.chat(cfg, listOf(
+                    ChatMessage("system", Prompts.containerByCharacterSystem(container.name, lang)),
+                    ChatMessage("user", Prompts.containerByCharacterUser(container.name, perChar, order, title, text, lang)),
+                ))
+                val updates = parseStringMap(reply)
+                updates.forEach { (name, value) ->
+                    if (value.isBlank()) return@forEach
+                    val ch = chars.firstOrNull { it.name == name } ?: return@forEach
+                    repo.appendContainerEntry(projectId, container.id, ch.id, entryFrom(value))
+                }
+            }
+            Container.BY_CHAPTER -> {
+                val reply = ai.chat(cfg, listOf(
+                    ChatMessage("system", Prompts.containerByChapterSystem(container.name, lang)),
+                    ChatMessage("user", Prompts.containerByChapterUser(container.name, order, title, text, lang)),
+                )).trim()
+                if (!isNoChange(reply)) repo.appendContainerEntry(projectId, container.id, chapterId, entryFrom(reply))
+            }
+            else -> {
+                val cur = latestContainerValue(projectId, container.id, Container.SINGLE_BLOCK_KEY)
+                val reply = ai.chat(cfg, listOf(
+                    ChatMessage("system", Prompts.containerSingleSystem(container.name, lang)),
+                    ChatMessage("user", Prompts.containerSingleUser(container.name, cur, order, title, text, lang)),
+                )).trim()
+                if (!isNoChange(reply)) repo.appendContainerEntry(projectId, container.id, Container.SINGLE_BLOCK_KEY, entryFrom(reply))
+            }
+        }
+    }
+
+    private fun isNoChange(reply: String): Boolean {
+        val r = reply.trim().trim('"', '“', '”', '。', '.').uppercase()
+        return r.isEmpty() || r == "NO_CHANGE" || r == "NOCHANGE"
+    }
+
+    private fun parseStringMap(text: String): Map<String, String> = runCatching {
+        val stripped = text.replace(Regex("```(?:json)?\\s*"), "").replace("```", "").trim()
+        val start = stripped.indexOf('{'); val end = stripped.lastIndexOf('}')
+        if (start < 0 || end <= start) return emptyMap()
+        Json { ignoreUnknownKeys = true }.parseToJsonElement(stripped.substring(start, end + 1)).jsonObject
+            .mapNotNull { (k, v) ->
+                val s = (v as? kotlinx.serialization.json.JsonPrimitive)?.contentOrNull
+                    ?: v.toString().trim('"').takeIf { it.isNotBlank() && it != "null" }
+                if (s.isNullOrBlank()) null else k to s
+            }.toMap()
+    }.getOrDefault(emptyMap())
 
     data class ImportPreview(
         val bundle: BackupBundle,

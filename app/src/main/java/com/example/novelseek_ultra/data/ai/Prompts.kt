@@ -396,6 +396,55 @@ Output ONLY a single valid JSON object — no markdown, no code fences, no expla
         }
     }
 
+    // ── Container (容器) per-chapter AI updates ──────────────────────────────
+
+    /** by_character container: returns a JSON object {characterName: updatedValue} for changed chars. */
+    fun containerByCharacterSystem(name: String, language: String) = if (language == "en") {
+        """You maintain a knowledge container named "$name" for a novel; it is partitioned by character. You are given each character's CURRENT value and the LATEST chapter. Decide, per character, whether the chapter introduces new information that should update their value.
+Rules:
+- Only include characters whose value should actually change because of this chapter. Omit unchanged ones.
+- Evolve from the current value; output the FULL updated value (not a diff).
+- Output ONLY a JSON object mapping character name to updated value: {"Name":"updated value"}. If nothing changes, output {}."""
+    } else {
+        """你在为一部小说维护一个名为「$name」的资料容器，它按角色分块。给你每个角色的【当前值】和【最新章节】，请逐个角色判断本章是否带来了应当更新其值的新信息。
+规则：
+- 只包含本章确实带来变化的角色，未变化的不要输出。
+- 在当前值基础上演进，输出更新后的完整值（不是增量）。
+- 只输出 JSON 对象，键为角色名，值为更新后的文本：{"角色名":"更新后的值"}。没有任何需要更新就输出 {}。"""
+    }
+
+    fun containerByCharacterUser(name: String, perCharacter: String, chapterOrder: Int, chapterTitle: String, chapterText: String, language: String) = if (language == "en") {
+        "Container purpose: $name\n\n[Each character's current value]\n$perCharacter\n\n[Latest chapter] Ch.$chapterOrder $chapterTitle\n${chapterText.take(4000)}\n\nOutput the JSON of characters that need updating."
+    } else {
+        "容器用途：$name\n\n【各角色当前值】\n$perCharacter\n\n【最新章节】第${chapterOrder}章 $chapterTitle\n${chapterText.take(4000)}\n\n请输出需要更新的角色 JSON。"
+    }
+
+    /** single container: returns the updated full value, or the literal NO_CHANGE. */
+    fun containerSingleSystem(name: String, language: String) = if (language == "en") {
+        """You maintain a single-block knowledge container named "$name" for a novel. Given its CURRENT value and the LATEST chapter, update the value based on this chapter. If the chapter adds nothing worth recording, output exactly NO_CHANGE. Otherwise output ONLY the full updated value text, no explanation."""
+    } else {
+        """你在维护一个名为「$name」的资料容器（单块）。给你【当前值】和【最新章节】，请基于本章在当前值基础上更新。若本章没有带来需要记录的新信息，只输出 NO_CHANGE。否则只输出更新后的完整文本，不要任何解释。"""
+    }
+
+    fun containerSingleUser(name: String, currentValue: String, chapterOrder: Int, chapterTitle: String, chapterText: String, language: String) = if (language == "en") {
+        "Container purpose: $name\n\n[Current value]\n${currentValue.ifBlank { "(none)" }}\n\n[Latest chapter] Ch.$chapterOrder $chapterTitle\n${chapterText.take(4000)}\n\nOutput the updated value or NO_CHANGE."
+    } else {
+        "容器用途：$name\n\n【当前值】\n${currentValue.ifBlank { "（暂无）" }}\n\n【最新章节】第${chapterOrder}章 $chapterTitle\n${chapterText.take(4000)}\n\n请输出更新后的值或 NO_CHANGE。"
+    }
+
+    /** by_chapter container: produces the value for THIS chapter's block, or NO_CHANGE. */
+    fun containerByChapterSystem(name: String, language: String) = if (language == "en") {
+        """You maintain a knowledge container named "$name" for a novel, partitioned by chapter. Given a chapter, produce the value that this container should hold for THIS chapter. Output ONLY that value text, no explanation. If the chapter has nothing relevant, output exactly NO_CHANGE."""
+    } else {
+        """你在维护一个名为「$name」的资料容器（按章节分块）。请根据本章内容，产出该容器用途下、针对本章的值。只输出该值文本，不要解释。若本章无可记录内容，输出 NO_CHANGE。"""
+    }
+
+    fun containerByChapterUser(name: String, chapterOrder: Int, chapterTitle: String, chapterText: String, language: String) = if (language == "en") {
+        "Container purpose: $name\n\n[This chapter] Ch.$chapterOrder $chapterTitle\n${chapterText.take(4000)}\n\nOutput this chapter's value or NO_CHANGE."
+    } else {
+        "容器用途：$name\n\n【本章】第${chapterOrder}章 $chapterTitle\n${chapterText.take(4000)}\n\n请输出本章对应的值或 NO_CHANGE。"
+    }
+
     fun chapterSystem(language: String) = if (language == "en") {
         """You are a skilled fiction writer.
 

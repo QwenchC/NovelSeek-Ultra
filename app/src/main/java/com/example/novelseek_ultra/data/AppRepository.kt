@@ -10,6 +10,9 @@ import com.example.novelseek_ultra.data.model.Character
 import com.example.novelseek_ultra.data.model.CharacterEvent
 import com.example.novelseek_ultra.data.model.CharacterRealmEvent
 import com.example.novelseek_ultra.data.model.CharacterRelationship
+import com.example.novelseek_ultra.data.model.Container
+import com.example.novelseek_ultra.data.model.ContainerEntry
+import com.example.novelseek_ultra.data.model.ContainerStore
 import com.example.novelseek_ultra.data.model.CoverImageItem
 import com.example.novelseek_ultra.data.model.CultivationRealm
 import com.example.novelseek_ultra.data.model.EmbeddingConfig
@@ -801,6 +804,98 @@ class AppRepository(context: Context) {
     fun clearNovelChat(projectId: String) {
         novelChatFile(projectId).delete()
         _novelChatRevision.value += 1
+    }
+
+    // ── Audiobook (听书) reading progress + voice prefs ───────────────────────
+
+    /** (chapterId, segmentIndex) the user last listened to in [projectId], or null. */
+    fun listenProgress(projectId: String): Pair<String, Int>? {
+        val obj = (_state.value["listenProgressByProject"] as? JsonObject)?.get(projectId) as? JsonObject
+            ?: return null
+        val chapterId = (obj["chapterId"] as? JsonPrimitive)?.contentOrNull ?: return null
+        val seg = (obj["segment"] as? JsonPrimitive)?.contentOrNull?.toIntOrNull() ?: 0
+        return chapterId to seg
+    }
+
+    fun setListenProgress(projectId: String, chapterId: String, segment: Int) {
+        mutateState { current ->
+            val map = (current["listenProgressByProject"] as? JsonObject) ?: JsonObject(emptyMap())
+            val entry = JsonObject(mapOf("chapterId" to JsonPrimitive(chapterId), "segment" to JsonPrimitive(segment)))
+            current.with("listenProgressByProject", map.with(projectId, entry))
+        }
+    }
+
+    fun lastListenProjectId(): String? =
+        (_state.value["lastListenProjectId"] as? JsonPrimitive)?.contentOrNull?.ifBlank { null }
+
+    fun setLastListenProjectId(projectId: String) =
+        mutateState { it.with("lastListenProjectId", JsonPrimitive(projectId)) }
+
+    fun listenVoice(): String =
+        (_state.value["listenVoice"] as? JsonPrimitive)?.contentOrNull?.ifBlank { null }
+            ?: "zh-CN-XiaoxiaoNeural"
+
+    fun setListenVoice(voice: String) = mutateState { it.with("listenVoice", JsonPrimitive(voice)) }
+
+    fun listenRate(): Int =
+        (_state.value["listenRate"] as? JsonPrimitive)?.contentOrNull?.toIntOrNull() ?: 0
+
+    fun setListenRate(rate: Int) = mutateState { it.with("listenRate", JsonPrimitive(rate)) }
+
+    // ── Containers (容器) — flexible AI-evolved knowledge stores per project ──
+
+    fun containerStore(projectId: String): ContainerStore {
+        val el = (_state.value["containersByProject"] as? JsonObject)?.get(projectId) ?: return ContainerStore()
+        return runCatching { JSON.decodeFromJsonElement(ContainerStore.serializer(), el) }.getOrDefault(ContainerStore())
+    }
+
+    private fun setContainerStore(projectId: String, store: ContainerStore) {
+        mutateState { current ->
+            val map = (current["containersByProject"] as? JsonObject) ?: JsonObject(emptyMap())
+            current.with(
+                "containersByProject",
+                map.with(projectId, JSON.encodeToJsonElement(ContainerStore.serializer(), store) as JsonObject),
+            )
+        }
+    }
+
+    fun containers(projectId: String): List<Container> = containerStore(projectId).containers
+
+    fun container(projectId: String, containerId: String): Container? =
+        containerStore(projectId).containers.firstOrNull { it.id == containerId }
+
+    fun createContainer(projectId: String, container: Container) {
+        val s = containerStore(projectId)
+        setContainerStore(projectId, s.copy(containers = s.containers + container))
+    }
+
+    fun deleteContainer(projectId: String, containerId: String) {
+        val s = containerStore(projectId)
+        setContainerStore(projectId, s.copy(
+            containers = s.containers.filterNot { it.id == containerId },
+            entries = s.entries - containerId,
+        ))
+    }
+
+    fun containerEntries(projectId: String, containerId: String, blockKey: String): List<ContainerEntry> =
+        containerStore(projectId).entries[containerId]?.get(blockKey) ?: emptyList()
+
+    fun appendContainerEntry(projectId: String, containerId: String, blockKey: String, entry: ContainerEntry) {
+        val s = containerStore(projectId)
+        val byContainer = (s.entries[containerId] ?: emptyMap()).toMutableMap()
+        byContainer[blockKey] = (byContainer[blockKey] ?: emptyList()) + entry
+        setContainerStore(projectId, s.copy(entries = s.entries + (containerId to byContainer)))
+    }
+
+    /** Overwrite the value of the newest entry in a block (the user manually editing the latest value). */
+    fun replaceLatestContainerEntry(projectId: String, containerId: String, blockKey: String, value: String) {
+        val s = containerStore(projectId)
+        val byContainer = (s.entries[containerId] ?: return).toMutableMap()
+        val chain = byContainer[blockKey]?.toMutableList() ?: return
+        if (chain.isEmpty()) return
+        chain[chain.lastIndex] = chain.last().copy(value = value, manual = true)
+        byContainer[blockKey] = chain
+        setContainerStore(projectId, s.copy(entries = s.entries + (containerId to byContainer)))
     }
 
     // ── Project snapshots (version history) ──────────────────────────────────

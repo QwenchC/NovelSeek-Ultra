@@ -37,6 +37,7 @@ val PROJECT_MAP_FIELDS = listOf(
     "characterEventsByProject",
     "cultivationRealmsByProject",
     "characterRealmEventsByProject",
+    "containersByProject",
     "promoByChapter",
 )
 

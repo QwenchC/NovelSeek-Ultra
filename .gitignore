@@ -18,3 +18,4 @@ local.properties
 *.aab
 /app/release
 /app/debug
+.kotlin

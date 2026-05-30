@@ -37,7 +37,9 @@ import androidx.compose.material.icons.outlined.ExpandLess
 import androidx.compose.material.icons.outlined.ExpandMore
 import androidx.compose.material.icons.outlined.Explore
 import androidx.compose.material.icons.outlined.Image
+import androidx.compose.material.icons.outlined.Inventory2
 import androidx.compose.material.icons.outlined.KeyboardArrowDown
+import androidx.compose.material.icons.outlined.MoreVert
 import androidx.compose.material.icons.outlined.KeyboardArrowUp
 import androidx.compose.material.icons.outlined.PlayArrow
 import androidx.compose.material.icons.outlined.PlaylistAdd
@@ -51,6 +53,8 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
@@ -111,6 +115,7 @@ fun EditorScreen(
     chapterId: String,
     onBack: () -> Unit,
     onOpenQa: () -> Unit = {},
+    onOpenContainer: () -> Unit = {},
     onNavigateToChapter: (chapterId: String) -> Unit = {},
 ) {
     val lang by vm.uiLanguage.collectAsState()
@@ -173,6 +178,7 @@ fun EditorScreen(
     var showAiFill by remember { mutableStateOf(false) }
     var pendingTitleFromFill by remember { mutableStateOf<String?>(null) }
     var showRealmDialog by remember { mutableStateOf(false) }
+    var showOverflowMenu by remember { mutableStateOf(false) }
     var showChapterSwitcher by remember { mutableStateOf(false) }
     var showRenameDialog by remember { mutableStateOf(false) }
 
@@ -311,14 +317,30 @@ fun EditorScreen(
                                 contentDescription = tx(lang, "下一章", "Next chapter"))
                         }
                     }
-                    IconButton(onClick = onOpenQa) {
-                        Icon(Icons.Outlined.QuestionAnswer,
-                            contentDescription = tx(lang, "小说问答", "Ask the novel"))
-                    }
-                    IconButton(onClick = { showRealmDialog = true }) {
-                        Icon(Icons.Outlined.Explore, contentDescription = null)
-                    }
                     IconButton(onClick = save) { Icon(Icons.Outlined.Save, contentDescription = null) }
+                    // Overflow menu: collapses 问答 / 容器 / 境界 so the title keeps its space.
+                    Box {
+                        IconButton(onClick = { showOverflowMenu = true }) {
+                            Icon(Icons.Outlined.MoreVert, contentDescription = tx(lang, "更多", "More"))
+                        }
+                        DropdownMenu(expanded = showOverflowMenu, onDismissRequest = { showOverflowMenu = false }) {
+                            DropdownMenuItem(
+                                text = { Text(tx(lang, "问答", "Ask AI")) },
+                                leadingIcon = { Icon(Icons.Outlined.QuestionAnswer, contentDescription = null) },
+                                onClick = { showOverflowMenu = false; onOpenQa() },
+                            )
+                            DropdownMenuItem(
+                                text = { Text(tx(lang, "容器", "Containers")) },
+                                leadingIcon = { Icon(Icons.Outlined.Inventory2, contentDescription = null) },
+                                onClick = { showOverflowMenu = false; onOpenContainer() },
+                            )
+                            DropdownMenuItem(
+                                text = { Text(tx(lang, "境界", "Realms")) },
+                                leadingIcon = { Icon(Icons.Outlined.Explore, contentDescription = null) },
+                                onClick = { showOverflowMenu = false; showRealmDialog = true },
+                            )
+                        }
+                    }
                 },
             )
         },

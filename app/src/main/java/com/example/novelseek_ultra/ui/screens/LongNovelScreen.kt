@@ -48,6 +48,7 @@ import androidx.compose.material.icons.outlined.FileDownload
 import androidx.compose.material.icons.outlined.Group
 import androidx.compose.material.icons.outlined.History
 import androidx.compose.material.icons.outlined.Image
+import androidx.compose.material.icons.outlined.Inventory2
 import androidx.compose.material.icons.outlined.KeyboardArrowDown
 import androidx.compose.material.icons.outlined.KeyboardArrowUp
 import androidx.compose.material.icons.outlined.LibraryAdd
@@ -117,6 +118,7 @@ fun LongNovelScreen(
     onOpenCultivation: () -> Unit,
     onOpenHistory: () -> Unit,
     onOpenQa: () -> Unit,
+    onOpenContainer: () -> Unit,
 ) {
     val lang by vm.uiLanguage.collectAsState()
     val state by vm.state.collectAsState()
@@ -304,6 +306,11 @@ fun LongNovelScreen(
                         Icon(Icons.Outlined.QuestionAnswer, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(4.dp))
                         Text(tx(lang, "问答", "Ask AI"), maxLines = 1, softWrap = false)
+                    }
+                    FilledTonalButton(onClick = onOpenContainer) {
+                        Icon(Icons.Outlined.Inventory2, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text(tx(lang, "容器", "Containers"), maxLines = 1, softWrap = false)
                     }
                     // 5th button: generate whole-book synopsis via vm.generateBookSummary, which
                     // rolls up existing chapter/arc summaries via the active text model.

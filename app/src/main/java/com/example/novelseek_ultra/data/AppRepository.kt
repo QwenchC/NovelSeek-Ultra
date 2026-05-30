@@ -869,6 +869,20 @@ class AppRepository(context: Context) {
         setContainerStore(projectId, s.copy(containers = s.containers + container))
     }
 
+    /** Update a container's editable metadata (name + toggles). Type and id are never changed. */
+    fun updateContainerMeta(projectId: String, containerId: String, name: String, autoUpdatePerChapter: Boolean, affectsGeneration: Boolean) {
+        val s = containerStore(projectId)
+        setContainerStore(projectId, s.copy(
+            containers = s.containers.map {
+                if (it.id == containerId) it.copy(
+                    name = name,
+                    autoUpdatePerChapter = autoUpdatePerChapter,
+                    affectsGeneration = affectsGeneration,
+                ) else it
+            },
+        ))
+    }
+
     fun deleteContainer(projectId: String, containerId: String) {
         val s = containerStore(projectId)
         setContainerStore(projectId, s.copy(

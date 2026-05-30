@@ -59,6 +59,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.ui.unit.dp
 import com.example.novelseek_ultra.data.model.Chapter
@@ -171,7 +172,12 @@ fun ProjectScreen(
                             Spacer(Modifier.height(4.dp))
                         }
                         if (!project.description.isNullOrBlank()) {
-                            Text(project.description, style = MaterialTheme.typography.bodyMedium)
+                            Text(
+                                project.description,
+                                style = MaterialTheme.typography.bodyMedium,
+                                maxLines = 3,
+                                overflow = TextOverflow.Ellipsis,
+                            )
                             Spacer(Modifier.height(8.dp))
                         }
                         Text(

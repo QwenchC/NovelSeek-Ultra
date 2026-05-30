@@ -59,7 +59,7 @@ import androidx.compose.material3.AlertDialog
 import com.example.novelseek_ultra.data.model.Project
 import com.example.novelseek_ultra.ui.AppViewModel
 import com.example.novelseek_ultra.ui.components.ConfirmDialog
-import com.example.novelseek_ultra.ui.components.RenameDialog
+import com.example.novelseek_ultra.ui.components.EditProjectDialog
 import com.example.novelseek_ultra.util.tx
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -148,13 +148,13 @@ fun HomeScreen(vm: AppViewModel, onOpen: (projectId: String) -> Unit = {}) {
     }
 
     renamingProject?.let { p ->
-        RenameDialog(
-            title = tx(lang, "重命名项目", "Rename Project"),
-            label = tx(lang, "项目名称", "Project name"),
-            initialValue = p.title,
-            confirmLabel = tx(lang, "保存", "Save"),
-            dismissLabel = tx(lang, "取消", "Cancel"),
-            onConfirm = { newTitle -> vm.updateProject(p.id) { it.copy(title = newTitle) } },
+        EditProjectDialog(
+            lang = lang,
+            initialTitle = p.title,
+            initialDescription = p.description.orEmpty(),
+            onConfirm = { title, desc ->
+                vm.updateProject(p.id) { it.copy(title = title, description = desc.ifBlank { null }) }
+            },
             onDismiss = { renamingProject = null },
         )
     }

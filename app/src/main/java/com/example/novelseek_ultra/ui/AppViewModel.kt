@@ -1977,6 +1977,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun containers(projectId: String): List<Container> = repo.containers(projectId)
     fun container(projectId: String, containerId: String): Container? = repo.container(projectId, containerId)
     fun createContainer(projectId: String, container: Container) = repo.createContainer(projectId, container)
+    fun updateContainerMeta(projectId: String, containerId: String, name: String, autoUpdatePerChapter: Boolean, affectsGeneration: Boolean) =
+        repo.updateContainerMeta(projectId, containerId, name, autoUpdatePerChapter, affectsGeneration)
     fun deleteContainer(projectId: String, containerId: String) = repo.deleteContainer(projectId, containerId)
     fun containerEntries(projectId: String, containerId: String, blockKey: String): List<ContainerEntry> =
         repo.containerEntries(projectId, containerId, blockKey)

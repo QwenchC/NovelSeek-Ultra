@@ -21,6 +21,7 @@ import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.AutoAwesome
 import androidx.compose.material.icons.outlined.ChevronRight
 import androidx.compose.material.icons.outlined.Delete
+import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Card
@@ -187,6 +188,7 @@ private fun ContainerDetail(
     val state by vm.state.collectAsState()
     val blocks = remember(state, container.id) { vm.containerBlocks(projectId, container) }
     var updating by remember { mutableStateOf(false) }
+    var editing by remember { mutableStateOf(false) }
 
     LazyColumn(
         modifier = modifier.padding(horizontal = 16.dp),
@@ -196,8 +198,16 @@ private fun ContainerDetail(
         item {
             Card(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(16.dp)) {
-                    Text(tx(lang, "容器信息", "Container info"), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(tx(lang, "容器信息", "Container info"), style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.primary, modifier = Modifier.weight(1f))
+                        IconButton(onClick = { editing = true }, modifier = Modifier.size(28.dp)) {
+                            Icon(Icons.Outlined.Edit, contentDescription = tx(lang, "编辑容器信息", "Edit container info"),
+                                modifier = Modifier.size(20.dp))
+                        }
+                    }
                     Spacer(Modifier.height(6.dp))
+                    Text("${tx(lang, "名称", "Name")}：${container.name}", style = MaterialTheme.typography.bodyMedium)
                     Text("${tx(lang, "类型", "Type")}：${typeLabel(container.type, lang)}（${tx(lang, "不可更改", "fixed")}）",
                         style = MaterialTheme.typography.bodyMedium)
                     Text("${tx(lang, "按章更新", "Auto-update per chapter")}：${if (container.autoUpdatePerChapter) "✓" else "✗"}",
@@ -241,6 +251,57 @@ private fun ContainerDetail(
             }
         }
     }
+
+    if (editing) {
+        EditContainerDialog(
+            lang = lang,
+            container = container,
+            onDismiss = { editing = false },
+            onSave = { name, autoUpdate, affects ->
+                vm.updateContainerMeta(projectId, container.id, name, autoUpdate, affects)
+                editing = false
+            },
+        )
+    }
+}
+
+@Composable
+private fun EditContainerDialog(
+    lang: String,
+    container: Container,
+    onDismiss: () -> Unit,
+    onSave: (name: String, autoUpdate: Boolean, affects: Boolean) -> Unit,
+) {
+    var name by remember { mutableStateOf(container.name) }
+    var autoUpdate by remember { mutableStateOf(container.autoUpdatePerChapter) }
+    var affects by remember { mutableStateOf(container.affectsGeneration) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(tx(lang, "编辑容器", "Edit Container")) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(name, { name = it }, label = { Text(tx(lang, "容器名称", "Name")) },
+                    singleLine = true, modifier = Modifier.fillMaxWidth())
+                Text("${tx(lang, "类型", "Type")}：${typeLabel(container.type, lang)}（${tx(lang, "不可更改", "fixed")}）",
+                    style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.clickable { autoUpdate = !autoUpdate }) {
+                    Checkbox(checked = autoUpdate, onCheckedChange = { autoUpdate = it })
+                    Text(tx(lang, "按章更新（保存最新章时 AI 自动更新）", "Auto-update per chapter (AI)"))
+                }
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.clickable { affects = !affects }) {
+                    Checkbox(checked = affects, onCheckedChange = { affects = it })
+                    Text(tx(lang, "影响章节生成（作为软引导注入）", "Affects generation (soft guidance)"))
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(enabled = name.isNotBlank(), onClick = { onSave(name.trim(), autoUpdate, affects) }) {
+                Text(tx(lang, "保存", "Save"))
+            }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text(tx(lang, "取消", "Cancel")) } },
+    )
 }
 
 @Composable

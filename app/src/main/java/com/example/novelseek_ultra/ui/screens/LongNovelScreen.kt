@@ -255,7 +255,12 @@ fun LongNovelScreen(
                 Card(modifier = Modifier.fillMaxWidth().clickable { showOutlinePreview = true }) {
                     Column(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
                         if (!project.description.isNullOrBlank()) {
-                            Text(project.description, style = MaterialTheme.typography.bodyMedium)
+                            Text(
+                                project.description,
+                                style = MaterialTheme.typography.bodyMedium,
+                                maxLines = 3,
+                                overflow = TextOverflow.Ellipsis,
+                            )
                             Spacer(Modifier.height(8.dp))
                         }
                         Text(

@@ -9,7 +9,13 @@
       "Read(//mnt/e/Lumi/**)",
       "Bash(sed -n '917,921p' app/src/main/java/com/example/novelseek_ultra/ui/screens/LongNovelScreen.kt)",
       "PowerShell($path = \"E:\\\\Lumi\\\\NovelSeek-Ultra\\\\app\\\\src\\\\main\\\\java\\\\com\\\\example\\\\novelseek_ultra\\\\ui\\\\screens\\\\LongNovelScreen.kt\"; $lines = Get-Content $path; Write-Output \"total lines: $\\($lines.Count\\)\"; Write-Output \"line 954: $\\($lines[953]\\)\"; Write-Output \"line 956: $\\($lines[955]\\)\")",
-      "PowerShell($path = \"E:\\\\Lumi\\\\NovelSeek-Ultra\\\\app\\\\src\\\\main\\\\java\\\\com\\\\example\\\\novelseek_ultra\\\\ui\\\\screens\\\\LongNovelScreen.kt\"; $lines = Get-Content $path; $kept = $lines[0..953]; Set-Content -Path $path -Value $kept -Encoding utf8; Write-Output \"new line count: $\\(\\(Get-Content $path\\).Count\\)\"; Write-Output \"last line: $\\(\\(Get-Content $path\\)[-1]\\)\")"
+      "PowerShell($path = \"E:\\\\Lumi\\\\NovelSeek-Ultra\\\\app\\\\src\\\\main\\\\java\\\\com\\\\example\\\\novelseek_ultra\\\\ui\\\\screens\\\\LongNovelScreen.kt\"; $lines = Get-Content $path; $kept = $lines[0..953]; Set-Content -Path $path -Value $kept -Encoding utf8; Write-Output \"new line count: $\\(\\(Get-Content $path\\).Count\\)\"; Write-Output \"last line: $\\(\\(Get-Content $path\\)[-1]\\)\")",
+      "Read(//f/ComfyUI-aki/ComfyUI/user/default/workflows/**)",
+      "Read(//e/Lumi/NovelSeek-Pro-PC/**)",
+      "PowerShell(.\\\\gradlew.bat :app:compileDebugKotlin -q 2>&1)",
+      "PowerShell(Get-ChildItem \"C:\\\\Program Files\\\\Android\\\\Android Studio\\\\jbr\\\\bin\\\\java.exe\",\"$env:LOCALAPPDATA\\\\Programs\\\\Android Studio\\\\jbr\\\\bin\\\\java.exe\" -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }; if \\(Test-Path \"$env:USERPROFILE\\\\.gradle\\\\gradle.properties\"\\) { Get-Content \"$env:USERPROFILE\\\\.gradle\\\\gradle.properties\" } ; if \\(Test-Path \".\\\\gradle.properties\"\\) { \"---local---\"; Get-Content \".\\\\gradle.properties\" })",
+      "PowerShell($env:JAVA_HOME = \"D:\\\\Program Files\\\\Android\\\\Android Studio\\\\jbr\"; .\\\\gradlew.bat :app:compileDebugKotlin 2>&1 | Select-Object -Last 50)",
+      "PowerShell($env:JAVA_HOME = \"D:\\\\Program Files\\\\Android\\\\Android Studio\\\\jbr\"; .\\\\gradlew.bat :app:compileDebugKotlin 2>&1 | Select-Object -Last 30)"
     ]
   }
 }

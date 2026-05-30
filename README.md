@@ -33,8 +33,15 @@
 ### 📤 导出
 - 章节文本导出为 **PDF** 或纯文本
 
+### 🎨 图片生成引擎
+- **Pollinations**（默认）：云端免费图片生成，无需本地环境
+- **ComfyUI**：连接局域网内本地运行的 ComfyUI，使用 `z-image-turbo` 工作流，支持高质量本地推理
+  - 设置中填写局域网 IP 地址（如 `http://192.168.1.100:8188`）
+  - 内置连接测试按钮
+
 ### ⚙️ 设置
 - 配置 AI 服务的 API Key 与 Base URL（默认接入 Pollinations）
+- 选择图片生成引擎：Pollinations（云端）或 ComfyUI（本地）
 - 密钥本地加密存储（Android Keystore + `security-crypto`）
 
 ---
@@ -47,7 +54,8 @@
 | UI | Jetpack Compose + Material 3 |
 | 架构 | ViewModel + Repository（单模块） |
 | 网络 | OkHttp 4 + SSE 流式输出 |
-| 图片 | Coil Compose |
+| 图片生成 | Pollinations API / ComfyUI（本地局域网） |
+| 图片加载 | Coil Compose |
 | 序列化 | Kotlinx Serialization JSON |
 | 持久化 | DataStore Preferences + JSON 文件 |
 | 安全 | AndroidX Security Crypto（EncryptedSharedPreferences） |
@@ -76,15 +84,19 @@ cd NovelSeek-Ultra
 
 或在 Android Studio 中直接 **Run ▶**。
 
-### 配置 API Key
+### 配置 API Key 与图片引擎
 
 打开应用 → 右上角 **设置（⚙）** → 填写：
 
 | 字段 | 说明 |
 |------|------|
-| API Base URL | AI 服务地址，默认 `https://text.pollinations.ai` |
+| API Base URL | AI 文本服务地址，默认 `https://text.pollinations.ai` |
 | API Key | 对应服务的密钥（Pollinations 免费模式可留空） |
-| 图片 API URL | 图片生成地址，默认 `https://image.pollinations.ai` |
+| 图片 API URL | Pollinations 图片地址，默认 `https://image.pollinations.ai` |
+| 图片引擎 | `Pollinations`（云端）或 `ComfyUI`（本地） |
+| ComfyUI 地址 | 仅 ComfyUI 模式需填，填局域网 IP，如 `http://192.168.1.100:8188` |
+
+> **ComfyUI 须知**：手机与运行 ComfyUI 的电脑需在同一局域网。应用使用内置 `t2i-lumicreate.json` 工作流（z-image-turbo，不带 LoRA）。
 
 ---
 
@@ -120,6 +132,11 @@ app/src/main/java/com/example/novelseek_ultra/
 
 ## 版本历史
 
+### v1.1.0
+- 新增 **ComfyUI 图片生成引擎**：可在设置中切换 Pollinations / ComfyUI
+- ComfyUI 连接测试、局域网地址配置
+- 图片自动压缩（ComfyUI 返回大尺寸 PNG，写入状态前自动 JPEG 压缩）
+
 ### v1.0.0
 - 从 NovelSeek-Pro-PC 完整迁移至 Android
 - 长/短篇小说 AI 大纲生成与章节写作
@@ -133,4 +150,4 @@ app/src/main/java/com/example/novelseek_ultra/
 
 ## License
 
-MIT © 2025 QwenchC
+MIT © 2026 QwenchC

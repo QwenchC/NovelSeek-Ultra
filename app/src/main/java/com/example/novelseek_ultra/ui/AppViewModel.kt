@@ -104,6 +104,44 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun activeTextModelConfig(): TextModelConfig = repo.activeTextModelConfig()
     fun pollinationsKey(): String = repo.pollinationsKey()
     fun setPollinationsKey(key: String) = repo.setPollinationsKey(key)
+
+    // ── Image engine selection (Pollinations / ComfyUI) ───────────────────────
+    fun imageEngine(): String = repo.imageEngine()
+    fun setImageEngine(engine: String) = repo.setImageEngine(engine)
+    fun comfyUIUrl(): String = repo.comfyUIUrl()
+    fun setComfyUIUrl(url: String) = repo.setComfyUIUrl(url)
+
+    suspend fun testComfyUIConnection(): Boolean = withContext(Dispatchers.IO) {
+        ai.testComfyUIConnection(repo.comfyUIUrl())
+    }
+
+    /**
+     * Engine-agnostic image generation used by every image feature (portrait / illustration /
+     * promo / cover). Routes to ComfyUI when the user picked it in Settings, otherwise Pollinations.
+     * `model` only applies to Pollinations; the ComfyUI workflow (`t2i-lumicreate.json`) is fixed
+     * to z-image-turbo. Returns raw PNG/JPEG bytes either way. Must be called off the main thread.
+     */
+    private suspend fun generateImageBytes(
+        prompt: String,
+        width: Int,
+        height: Int,
+        model: String = "zimage",
+    ): ByteArray {
+        val raw = if (repo.imageEngine() == "comfyui") {
+            ai.generateImageComfyUI(prompt = prompt, width = width, height = height, baseUrl = repo.comfyUIUrl())
+        } else {
+            ai.generateImage(
+                prompt = prompt,
+                width = width,
+                height = height,
+                model = model,
+                pollinationsKey = repo.pollinationsKey().ifBlank { null },
+            )
+        }
+        // Downscale + JPEG-compress before the bytes get base64'd into app state. ComfyUI returns
+        // multi-MB PNGs that otherwise bloat app_state.json and OOM on save — see ImageUtils.
+        return com.example.novelseek_ultra.util.ImageUtils.compressForStorage(raw)
+    }
     fun embeddingConfig(): EmbeddingConfig = repo.embeddingConfig()
     fun saveEmbeddingConfig(cfg: EmbeddingConfig) = repo.saveEmbeddingConfig(cfg)
 
@@ -571,7 +609,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     suspend fun generatePortraitImage(prompt: String, width: Int = 768, height: Int = 1024): ByteArray? =
         withContext(Dispatchers.IO) {
             runCatching {
-                ai.generateImage(prompt, width, height, pollinationsKey = repo.pollinationsKey().ifBlank { null })
+                generateImageBytes(prompt, width, height)
             }.getOrNull()
         }
 
@@ -638,13 +676,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 return@launch
             }
             val bytes = runCatching {
-                ai.generateImage(
-                    prompt = prompt,
-                    width = width,
-                    height = height,
-                    model = model,
-                    pollinationsKey = repo.pollinationsKey().ifBlank { null },
-                )
+                generateImageBytes(prompt = prompt, width = width, height = height, model = model)
             }.getOrElse {
                 onDone(null, "图像生成失败：${it.message}"); return@launch
             }
@@ -699,13 +731,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             val summary = (el?.get("summary") as? kotlinx.serialization.json.JsonPrimitive)?.content.orEmpty()
             if (imagePrompt.isBlank()) { onDone(null, "模型未返回可用的图像提示词。"); return@launch }
             val bytes = runCatching {
-                ai.generateImage(
-                    prompt = imagePrompt,
-                    width = width,
-                    height = height,
-                    model = model,
-                    pollinationsKey = repo.pollinationsKey().ifBlank { null },
-                )
+                generateImageBytes(prompt = imagePrompt, width = width, height = height, model = model)
             }.getOrElse { onDone(null, "图像生成失败：${it.message}"); return@launch }
             val b64 = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
             val promo = ChapterPromo(imagePrompt = imagePrompt, summary = summary, imageBase64 = b64)
@@ -749,13 +775,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 .trim().lines().firstOrNull { it.isNotBlank() }.orEmpty()
             if (prompt.isBlank()) { onDone(null, "模型未返回可用的图像提示词。"); return@launch }
             val bytes = runCatching {
-                ai.generateImage(
-                    prompt = prompt,
-                    width = width,
-                    height = height,
-                    model = model,
-                    pollinationsKey = repo.pollinationsKey().ifBlank { null },
-                )
+                generateImageBytes(prompt = prompt, width = width, height = height, model = model)
             }.getOrElse { onDone(null, "图像生成失败：${it.message}"); return@launch }
             val b64 = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
             val labelPrefix = if (lang == "en") "Cover" else "封面"

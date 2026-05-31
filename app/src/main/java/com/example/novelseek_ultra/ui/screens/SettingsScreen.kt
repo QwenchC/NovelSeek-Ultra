@@ -4,6 +4,7 @@ import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -114,6 +115,7 @@ fun SettingsScreen(vm: AppViewModel) {
     }
 
     Scaffold(
+        contentWindowInsets = androidx.compose.foundation.layout.WindowInsets(0),
         topBar = {
             AppTopBar(
                 title = {
@@ -561,6 +563,7 @@ private fun ProfileDialog(
                 OutlinedTextField(apiUrl, { apiUrl = it }, label = { Text("API URL") }, singleLine = true)
                 OutlinedTextField(model, { model = it }, label = { Text(tx(lang, "模型名", "Model")) }, singleLine = true)
                 ApiKeyField(value = apiKey, onValueChange = { apiKey = it }, label = "API Key")
+                initial?.keyUrl?.takeIf { it.isNotBlank() }?.let { ApiKeyLink(it, lang) }
                 OutlinedTextField(temp, { temp = it }, label = { Text("Temperature") }, singleLine = true)
             }
         },
@@ -668,6 +671,18 @@ private fun ImageEngineSection(vm: AppViewModel, lang: String) {
     }
 }
 
+/** A tappable "get API key" hyperlink that opens [url] in the browser. */
+@Composable
+private fun ApiKeyLink(url: String, lang: String) {
+    val uriHandler = LocalUriHandler.current
+    Text(
+        text = tx(lang, "→ 获取 API Key：$url", "→ Get an API key: $url"),
+        style = MaterialTheme.typography.labelMedium,
+        color = MaterialTheme.colorScheme.primary,
+        modifier = Modifier.clickable { runCatching { uriHandler.openUri(url) } },
+    )
+}
+
 @Composable
 private fun PollinationsKeySection(vm: AppViewModel, lang: String) {
     var key by remember { mutableStateOf(vm.pollinationsKey()) }
@@ -678,14 +693,16 @@ private fun PollinationsKeySection(vm: AppViewModel, lang: String) {
         Text(
             tx(lang,
                 "用于角色立绘、封面图、章节插图等所有图像生成。\n" +
-                    "从 https://auth.pollinations.ai/ 注册后可拿到 sk_（服务端）/ pk_（客户端）token，填一个即可。\n" +
+                    "注册后可拿到 sk_（服务端）/ pk_（客户端）token，填一个即可。\n" +
                     "不填也能跑——会走匿名通道，但 gen.pollinations.ai 对匿名请求限流非常严格（重新生成大概率失败），且画质会用降级模型。强烈建议填一个。",
                 "Used for character portraits, cover art, and chapter illustrations.\n" +
-                    "Register at https://auth.pollinations.ai/ to get an sk_ (server-side) or pk_ (client-side) token — either works.\n" +
+                    "Register to get an sk_ (server-side) or pk_ (client-side) token — either works.\n" +
                     "Anonymous calls still work in theory, but gen.pollinations.ai aggressively throttles them and serves a lower-quality fallback model. Strongly recommended to fill one in."),
             style = MaterialTheme.typography.labelMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+        Spacer(Modifier.height(4.dp))
+        ApiKeyLink("https://enter.pollinations.ai/", lang)
         Spacer(Modifier.height(8.dp))
         ApiKeyField(
             value = key,
@@ -743,6 +760,8 @@ private fun KnowledgeBaseSection(vm: AppViewModel, lang: String) {
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+        Spacer(Modifier.height(4.dp))
+        ApiKeyLink("https://bailian.console.aliyun.com/?tab=model#/api-key", lang)
 
         Spacer(Modifier.height(8.dp))
         ApiKeyField(

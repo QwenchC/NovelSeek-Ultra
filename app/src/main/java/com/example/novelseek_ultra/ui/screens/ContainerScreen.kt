@@ -93,6 +93,7 @@ fun ContainerScreen(vm: AppViewModel, projectId: String, onBack: () -> Unit) {
     }
 
     Scaffold(
+        contentWindowInsets = androidx.compose.foundation.layout.WindowInsets(0),
         topBar = {
             AppTopBar(
                 navigationIcon = {
@@ -257,8 +258,8 @@ private fun ContainerDetail(
             lang = lang,
             container = container,
             onDismiss = { editing = false },
-            onSave = { name, autoUpdate, affects ->
-                vm.updateContainerMeta(projectId, container.id, name, autoUpdate, affects)
+            onSave = { name, autoUpdate, affects, affectsVol, affectsArc ->
+                vm.updateContainerMeta(projectId, container.id, name, autoUpdate, affects, affectsVol, affectsArc)
                 editing = false
             },
         )
@@ -270,11 +271,13 @@ private fun EditContainerDialog(
     lang: String,
     container: Container,
     onDismiss: () -> Unit,
-    onSave: (name: String, autoUpdate: Boolean, affects: Boolean) -> Unit,
+    onSave: (name: String, autoUpdate: Boolean, affects: Boolean, affectsVol: Boolean, affectsArc: Boolean) -> Unit,
 ) {
     var name by remember { mutableStateOf(container.name) }
     var autoUpdate by remember { mutableStateOf(container.autoUpdatePerChapter) }
     var affects by remember { mutableStateOf(container.affectsGeneration) }
+    var affectsVol by remember { mutableStateOf(container.affectsVolumeGeneration) }
+    var affectsArc by remember { mutableStateOf(container.affectsArcGeneration) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -285,23 +288,27 @@ private fun EditContainerDialog(
                     singleLine = true, modifier = Modifier.fillMaxWidth())
                 Text("${tx(lang, "类型", "Type")}：${typeLabel(container.type, lang)}（${tx(lang, "不可更改", "fixed")}）",
                     style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.clickable { autoUpdate = !autoUpdate }) {
-                    Checkbox(checked = autoUpdate, onCheckedChange = { autoUpdate = it })
-                    Text(tx(lang, "按章更新（保存最新章时 AI 自动更新）", "Auto-update per chapter (AI)"))
-                }
-                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.clickable { affects = !affects }) {
-                    Checkbox(checked = affects, onCheckedChange = { affects = it })
-                    Text(tx(lang, "影响章节生成（作为软引导注入）", "Affects generation (soft guidance)"))
-                }
+                ToggleRow(autoUpdate, { autoUpdate = it }, tx(lang, "按章更新（保存最新章时 AI 自动更新）", "Auto-update per chapter (AI)"))
+                ToggleRow(affects, { affects = it }, tx(lang, "影响章节生成（作为软引导注入）", "Affects chapter generation"))
+                ToggleRow(affectsVol, { affectsVol = it }, tx(lang, "影响副本生成", "Affects volume generation"))
+                ToggleRow(affectsArc, { affectsArc = it }, tx(lang, "影响剧情弧线生成", "Affects arc generation"))
             }
         },
         confirmButton = {
-            TextButton(enabled = name.isNotBlank(), onClick = { onSave(name.trim(), autoUpdate, affects) }) {
+            TextButton(enabled = name.isNotBlank(), onClick = { onSave(name.trim(), autoUpdate, affects, affectsVol, affectsArc) }) {
                 Text(tx(lang, "保存", "Save"))
             }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text(tx(lang, "取消", "Cancel")) } },
     )
+}
+
+@Composable
+private fun ToggleRow(checked: Boolean, onChange: (Boolean) -> Unit, label: String) {
+    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.clickable { onChange(!checked) }) {
+        Checkbox(checked = checked, onCheckedChange = onChange)
+        Text(label)
+    }
 }
 
 @Composable
@@ -394,6 +401,8 @@ private fun NewContainerDialog(lang: String, onDismiss: () -> Unit, onCreate: (C
     var type by remember { mutableStateOf(Container.BY_CHARACTER) }
     var autoUpdate by remember { mutableStateOf(false) }
     var affects by remember { mutableStateOf(false) }
+    var affectsVol by remember { mutableStateOf(false) }
+    var affectsArc by remember { mutableStateOf(false) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -420,18 +429,10 @@ private fun NewContainerDialog(lang: String, onDismiss: () -> Unit, onCreate: (C
                         Text(label)
                     }
                 }
-                item {
-                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.clickable { autoUpdate = !autoUpdate }) {
-                        Checkbox(checked = autoUpdate, onCheckedChange = { autoUpdate = it })
-                        Text(tx(lang, "按章更新（保存最新章时 AI 自动更新）", "Auto-update per chapter (AI)"))
-                    }
-                }
-                item {
-                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.clickable { affects = !affects }) {
-                        Checkbox(checked = affects, onCheckedChange = { affects = it })
-                        Text(tx(lang, "影响章节生成（作为软引导注入）", "Affects generation (soft guidance)"))
-                    }
-                }
+                item { ToggleRow(autoUpdate, { autoUpdate = it }, tx(lang, "按章更新（保存最新章时 AI 自动更新）", "Auto-update per chapter (AI)")) }
+                item { ToggleRow(affects, { affects = it }, tx(lang, "影响章节生成（作为软引导注入）", "Affects chapter generation")) }
+                item { ToggleRow(affectsVol, { affectsVol = it }, tx(lang, "影响副本生成", "Affects volume generation")) }
+                item { ToggleRow(affectsArc, { affectsArc = it }, tx(lang, "影响剧情弧线生成", "Affects arc generation")) }
             }
         },
         confirmButton = {
@@ -442,6 +443,7 @@ private fun NewContainerDialog(lang: String, onDismiss: () -> Unit, onCreate: (C
                         id = "ctn-${System.currentTimeMillis()}",
                         name = name.trim(), type = type,
                         autoUpdatePerChapter = autoUpdate, affectsGeneration = affects,
+                        affectsVolumeGeneration = affectsVol, affectsArcGeneration = affectsArc,
                         createdAt = java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", java.util.Locale.US)
                             .apply { timeZone = java.util.TimeZone.getTimeZone("UTC") }.format(java.util.Date()),
                     ))

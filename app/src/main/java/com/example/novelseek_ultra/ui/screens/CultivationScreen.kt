@@ -143,6 +143,7 @@ fun CultivationScreen(vm: AppViewModel, projectId: String, onBack: () -> Unit) {
     }
 
     Scaffold(
+        contentWindowInsets = androidx.compose.foundation.layout.WindowInsets(0),
         topBar = {
             AppTopBar(
                 navigationIcon = {

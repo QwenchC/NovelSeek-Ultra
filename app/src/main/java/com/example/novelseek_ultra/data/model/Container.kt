@@ -27,6 +27,8 @@ data class Container(
     val type: String,                       // by_character | by_chapter | single
     val autoUpdatePerChapter: Boolean = false,
     val affectsGeneration: Boolean = false,
+    val affectsVolumeGeneration: Boolean = false,   // inject latest values into 副本 generation
+    val affectsArcGeneration: Boolean = false,      // inject latest values into 剧情弧线 generation
     val createdAt: String = "",
 ) {
     companion object {

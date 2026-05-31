@@ -17,7 +17,6 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.ui.draw.clip
@@ -86,6 +85,7 @@ fun LongNovelsHomeScreen(vm: AppViewModel, onOpen: (projectId: String) -> Unit) 
     }
 
     Scaffold(
+        contentWindowInsets = androidx.compose.foundation.layout.WindowInsets(0),
         topBar = {
             AppTopBar(title = {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -105,7 +105,6 @@ fun LongNovelsHomeScreen(vm: AppViewModel, onOpen: (projectId: String) -> Unit) 
                     onClick = { showCreate = true },
                     icon = { Icon(Icons.Outlined.Add, contentDescription = null) },
                     text = { Text(tx(lang, "新建长篇", "New Long Novel")) },
-                    modifier = Modifier.offset(y = 24.dp),
                 )
             }
         },

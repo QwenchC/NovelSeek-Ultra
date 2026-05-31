@@ -29,6 +29,7 @@ import com.example.novelseek_ultra.data.model.RestoreResult
 import com.example.novelseek_ultra.data.model.SnapshotMeta
 import com.example.novelseek_ultra.data.model.SummaryPayload
 import com.example.novelseek_ultra.data.model.TextModelConfig
+import com.example.novelseek_ultra.data.model.Volume
 import com.example.novelseek_ultra.data.model.TextModelProfile
 import com.example.novelseek_ultra.data.model.collectProjectIds
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -303,6 +304,39 @@ class AppRepository(context: Context) {
 
     fun setPlotArcs(projectId: String, arcs: List<PlotArc>) =
         writeListMap("plotArcsByProject", projectId, arcs.sortedBy { it.order }, PlotArc.serializer())
+
+    // ── 副本 (Volumes) — long-novel containers for plot arcs ──────────────────
+
+    fun volumes(projectId: String): List<Volume> =
+        readListMap("volumesByProject", projectId, Volume.serializer())
+
+    fun setVolumes(projectId: String, volumes: List<Volume>) =
+        writeListMap("volumesByProject", projectId, volumes.sortedBy { it.order }, Volume.serializer())
+
+    /**
+     * Backward-compat migration: a long-novel project with arcs but no volumes gets all its arcs
+     * wrapped into a single volume "副本1". Also re-homes any orphan arcs (volumeId null/dangling)
+     * into the earliest volume. Idempotent — safe to call on every project open.
+     */
+    fun ensureVolumes(projectId: String) {
+        val arcs = plotArcs(projectId)
+        val vols = volumes(projectId)
+        if (vols.isNotEmpty()) {
+            val ids = vols.map { it.id }.toSet()
+            val firstId = vols.minByOrNull { it.order }?.id ?: return
+            if (arcs.any { it.volumeId == null || it.volumeId !in ids }) {
+                setPlotArcs(projectId, arcs.map {
+                    if (it.volumeId == null || it.volumeId !in ids) it.copy(volumeId = firstId) else it
+                })
+            }
+            return
+        }
+        if (arcs.isEmpty()) return  // no volumes & no arcs: nothing to migrate (volumes created on demand)
+        val name = if (uiLanguage() == "en") "Volume 1" else "副本1"
+        val vol = Volume(id = "vol-${System.currentTimeMillis()}", name = name, order = 0, createdAt = nowIso())
+        setVolumes(projectId, listOf(vol))
+        setPlotArcs(projectId, arcs.map { it.copy(volumeId = vol.id) })
+    }
 
     fun cultivationRealms(projectId: String): List<CultivationRealm> =
         readListMap("cultivationRealmsByProject", projectId, CultivationRealm.serializer())
@@ -596,13 +630,46 @@ class AppRepository(context: Context) {
     // ── export / import (PC-compatible) ────────────────────────────────────
 
     fun buildBackupBundle(): BackupBundle {
-        val merged = mergeSensitivesIntoState(_state.value)
+        val base = mergeSensitivesIntoState(_state.value)
+        // app_state holds metadata only — chapter bodies / illustrations / novel-chat live in their
+        // own files. Embed them under Android-specific keys so a backup fully restores on a fresh
+        // device (PC import ignores unknown keys).
+        val merged = buildJsonObject {
+            for ((k, v) in base) put(k, v)
+            val chapterIds = allChapterIds()
+            buildJsonObject {
+                chapterIds.forEach { cid ->
+                    val f = File(appContext.filesDir, "chapters/$cid.json")
+                    if (f.exists()) runCatching { JSON.parseToJsonElement(f.readText()) }.getOrNull()?.let { put(cid, it) }
+                }
+            }.takeIf { it.isNotEmpty() }?.let { put("chapterBodies", it) }
+            buildJsonObject {
+                chapterIds.forEach { cid ->
+                    val f = File(appContext.filesDir, "illustrations/$cid.json")
+                    if (f.exists()) runCatching { JSON.parseToJsonElement(f.readText()) }.getOrNull()?.let { put(cid, it) }
+                }
+            }.takeIf { it.isNotEmpty() }?.let { put("chapterIllustrations", it) }
+            buildJsonObject {
+                readProjects(_state.value).forEach { p ->
+                    val f = File(appContext.filesDir, "novel_chat/${p.id}.json")
+                    if (f.exists()) runCatching { JSON.parseToJsonElement(f.readText()) }.getOrNull()?.let { put(p.id, it) }
+                }
+            }.takeIf { it.isNotEmpty() }?.let { put("novelChats", it) }
+        }
         return BackupBundle(
             version = BackupBundle.BACKUP_VERSION,
             exportedAt = nowIso(),
             appVersion = ANDROID_APP_VERSION,
             data = merged,
         )
+    }
+
+    /** All chapter ids across every project (keys for the body/illustration files). */
+    private fun allChapterIds(): List<String> {
+        val map = _state.value["chaptersByProject"] as? JsonObject ?: return emptyList()
+        return map.values.filterIsInstance<JsonArray>().flatMap { arr ->
+            arr.mapNotNull { (it as? JsonObject)?.get("id")?.jsonPrimitive?.contentOrNull }
+        }
     }
 
     private fun mergeSensitivesIntoState(base: JsonObject): JsonObject = buildJsonObject {
@@ -630,10 +697,12 @@ class AppRepository(context: Context) {
     }
 
     fun summarizeBackup(bundle: BackupBundle): BackupSummary {
+        fun projectArrayIds(obj: JsonObject): Set<String> =
+            (obj["projects"] as? JsonArray)?.mapNotNull { (it as? JsonObject)?.get("id")?.jsonPrimitive?.contentOrNull }?.toSet() ?: emptySet()
         val inMaps = PROJECT_MAP_FIELDS.filter { it != "promoByChapter" }.map { bundle.data[it] }
         val curMaps = PROJECT_MAP_FIELDS.filter { it != "promoByChapter" }.map { _state.value[it] }
-        val inIds = collectProjectIds(inMaps)
-        val curIds = collectProjectIds(curMaps)
+        val inIds = collectProjectIds(inMaps) + projectArrayIds(bundle.data)
+        val curIds = collectProjectIds(curMaps) + projectArrayIds(_state.value)
         val overlap = inIds.count { it in curIds }
         val promosIn = (bundle.data["promoByChapter"] as? JsonObject)?.size ?: 0
         val hasAppSettings = APP_SETTINGS_FIELDS.any { it in bundle.data }
@@ -643,12 +712,31 @@ class AppRepository(context: Context) {
     fun importBackup(bundle: BackupBundle, includeAppSettings: Boolean) {
         val incoming = bundle.data
         val (sanitizedIncoming, sensitives) = if (includeAppSettings) splitSensitives(incoming)
-        else JsonObject(incoming.filterKeys { it in PROJECT_MAP_FIELDS || it == "folders" }) to emptyMap()
+        else incoming to emptyMap()
+
+        // Per-project maps to restore: every `*ByProject` key present in the backup (future-proof —
+        // new per-project fields are picked up automatically) plus `promoByChapter`. KB caches are
+        // excluded because the vector store itself isn't backed up (re-indexable).
+        val kbCacheKeys = setOf("kbIndexHashByProject", "kbStaleByProject")
+        val projectMapKeys = (sanitizedIncoming.keys.filter { it.endsWith("ByProject") && it !in kbCacheKeys } +
+            "promoByChapter").distinct()
 
         mutateState { current ->
             val next = current.toMutableMap()
 
-            for (k in PROJECT_MAP_FIELDS) {
+            // projects array — merge by id (incoming wins for the same id, others kept).
+            (sanitizedIncoming["projects"] as? JsonArray)?.let { incArr ->
+                val map = LinkedHashMap<String, JsonObject>()
+                (current["projects"] as? JsonArray)?.forEach { e ->
+                    (e as? JsonObject)?.let { obj -> obj["id"]?.jsonPrimitive?.contentOrNull?.let { map[it] = obj } }
+                }
+                incArr.forEach { e ->
+                    (e as? JsonObject)?.let { obj -> obj["id"]?.jsonPrimitive?.contentOrNull?.let { map[it] = obj } }
+                }
+                next["projects"] = JsonArray(map.values.toList())
+            }
+
+            for (k in projectMapKeys) {
                 val inc = sanitizedIncoming[k] as? JsonObject ?: continue
                 val cur = current[k] as? JsonObject ?: JsonObject(emptyMap())
                 next[k] = JsonObject(cur + inc)
@@ -682,6 +770,20 @@ class AppRepository(context: Context) {
             JsonObject(next)
         }
         if (sensitives.isNotEmpty()) secureStore.putAll(sensitives)
+
+        // Restore content that lives in separate files (chapter bodies / illustrations / chats).
+        (incoming["chapterBodies"] as? JsonObject)?.forEach { (cid, el) ->
+            runCatching { JSON.decodeFromJsonElement(ChapterBody.serializer(), el) }.getOrNull()
+                ?.let { saveChapterBody(cid, it) }
+        }
+        (incoming["chapterIllustrations"] as? JsonObject)?.forEach { (cid, el) ->
+            runCatching { JSON.decodeFromJsonElement(ListSerializer(Illustration.serializer()), el) }.getOrNull()
+                ?.let { setChapterIllustrations(cid, it) }
+        }
+        (incoming["novelChats"] as? JsonObject)?.forEach { (pid, el) ->
+            runCatching { JSON.decodeFromJsonElement(ListSerializer(NovelChatMessage.serializer()), el) }.getOrNull()
+                ?.let { setNovelChatHistory(pid, it) }
+        }
     }
 
     private fun splitSensitives(incoming: JsonObject): Pair<JsonObject, Map<String, String>> {
@@ -870,7 +972,11 @@ class AppRepository(context: Context) {
     }
 
     /** Update a container's editable metadata (name + toggles). Type and id are never changed. */
-    fun updateContainerMeta(projectId: String, containerId: String, name: String, autoUpdatePerChapter: Boolean, affectsGeneration: Boolean) {
+    fun updateContainerMeta(
+        projectId: String, containerId: String, name: String,
+        autoUpdatePerChapter: Boolean, affectsGeneration: Boolean,
+        affectsVolumeGeneration: Boolean, affectsArcGeneration: Boolean,
+    ) {
         val s = containerStore(projectId)
         setContainerStore(projectId, s.copy(
             containers = s.containers.map {
@@ -878,6 +984,8 @@ class AppRepository(context: Context) {
                     name = name,
                     autoUpdatePerChapter = autoUpdatePerChapter,
                     affectsGeneration = affectsGeneration,
+                    affectsVolumeGeneration = affectsVolumeGeneration,
+                    affectsArcGeneration = affectsArcGeneration,
                 ) else it
             },
         ))

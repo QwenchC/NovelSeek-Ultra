@@ -49,13 +49,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.unit.dp
 import com.example.novelseek_ultra.data.model.Character
-import com.example.novelseek_ultra.data.model.PlotArc
+import com.example.novelseek_ultra.data.model.Volume
 import com.example.novelseek_ultra.ui.AppViewModel
 import com.example.novelseek_ultra.util.tx
 
 // ── Parsed data types ─────────────────────────────────────────────────────────
 
-private data class ParsedArc(val title: String, val summary: String)
+private data class ParsedVolume(val name: String, val description: String)
 
 internal data class ParsedChapter(
     val title: String,        // full heading e.g. "第1章：引子"
@@ -74,7 +74,7 @@ private data class ParsedChar(
 private data class ParsedOutlineSections(
     val worldSetting: String?,
     val timeline: String?,
-    val arcs: List<ParsedArc>,
+    val volumes: List<ParsedVolume>,
     val chars: List<ParsedChar>,
     val shortChapters: List<ParsedChapter> = emptyList(),
 )
@@ -82,7 +82,7 @@ private data class ParsedOutlineSections(
 private data class SaveSelection(
     val overwriteWorld: Boolean = true,
     val overwriteTimeline: Boolean = true,
-    val overwriteArcs: Boolean = true,
+    val overwriteVolumes: Boolean = true,
     val importChars: Boolean = true,
     val importChapters: Boolean = true,
 )
@@ -164,15 +164,26 @@ private fun parseOutlineSections(outline: String, isLong: Boolean = false): Pars
     val worldSetting = extractOutlineSection(outline, "世界观概述", "世界观设定", "World Overview", "World Setting")
     val timeline = extractOutlineSection(outline, "时间线", "故事时间线", "Timeline", "Story Timeline")
 
-    // Parse arcs
-    val arcs = mutableListOf<ParsedArc>()
-    Regex("#{2,3}\\s+弧线[^：:\\n]+?[：:]\\s*(.+?)(?:\\n|\$)([\\s\\S]*?)(?=\\n#{2,3}|\\z)")
+    // Parse volumes (副本). Falls back to legacy "弧线 / Arc N" headings so an old-style outline
+    // still imports as volumes.
+    val volumes = mutableListOf<ParsedVolume>()
+    Regex("#{2,3}\\s+副本[^：:\\n]*?[：:]\\s*(.+?)(?:\\n|\$)([\\s\\S]*?)(?=\\n#{2,3}|\\z)")
         .findAll(outline)
-        .forEach { m -> arcs += ParsedArc(m.groupValues[1].trim(), m.groupValues[2].trim()) }
-    if (arcs.isEmpty()) {
+        .forEach { m -> volumes += ParsedVolume(m.groupValues[1].trim(), m.groupValues[2].trim()) }
+    if (volumes.isEmpty()) {
+        Regex("#{2,3}\\s+Volume\\s+\\d+[:：]?\\s*(.+?)(?:\\n|\$)([\\s\\S]*?)(?=\\n#{2,3}|\\z)", RegexOption.IGNORE_CASE)
+            .findAll(outline)
+            .forEach { m -> volumes += ParsedVolume(m.groupValues[1].trim(), m.groupValues[2].trim()) }
+    }
+    if (volumes.isEmpty()) {
+        Regex("#{2,3}\\s+弧线[^：:\\n]+?[：:]\\s*(.+?)(?:\\n|\$)([\\s\\S]*?)(?=\\n#{2,3}|\\z)")
+            .findAll(outline)
+            .forEach { m -> volumes += ParsedVolume(m.groupValues[1].trim(), m.groupValues[2].trim()) }
+    }
+    if (volumes.isEmpty()) {
         Regex("#{2,3}\\s+Arc\\s+\\d+[:：]?\\s*(.+?)(?:\\n|\$)([\\s\\S]*?)(?=\\n#{2,3}|\\z)", RegexOption.IGNORE_CASE)
             .findAll(outline)
-            .forEach { m -> arcs += ParsedArc(m.groupValues[1].trim(), m.groupValues[2].trim()) }
+            .forEach { m -> volumes += ParsedVolume(m.groupValues[1].trim(), m.groupValues[2].trim()) }
     }
 
     // Parse characters
@@ -206,7 +217,7 @@ private fun parseOutlineSections(outline: String, isLong: Boolean = false): Pars
     return ParsedOutlineSections(
         worldSetting = worldSetting,
         timeline = timeline,
-        arcs = arcs.take(10),
+        volumes = volumes.take(10),
         chars = chars.take(12),
         shortChapters = if (!isLong) parseShortChapters(outline) else emptyList(),
     )
@@ -235,6 +246,7 @@ fun OutlineScreen(vm: AppViewModel, projectId: String, isLong: Boolean = false, 
     }
 
     Scaffold(
+        contentWindowInsets = androidx.compose.foundation.layout.WindowInsets(0),
         topBar = {
             AppTopBar(
                 navigationIcon = {
@@ -385,7 +397,7 @@ fun OutlineScreen(vm: AppViewModel, projectId: String, isLong: Boolean = false, 
                 parsed = parsed,
                 currentWorld = world,
                 currentTimeline = timeline,
-                existingArcCount = vm.plotArcs(projectId).size,
+                existingVolumeCount = vm.volumes(projectId).size,
                 existingCharCount = vm.characters(projectId).size,
                 existingChapterCount = vm.chapters(projectId).size,
                 onConfirm = { sel ->
@@ -402,12 +414,14 @@ fun OutlineScreen(vm: AppViewModel, projectId: String, isLong: Boolean = false, 
                     } else {
                         vm.setTimeline(projectId, timeline)
                     }
-                    if (isLong && sel.overwriteArcs && parsed.arcs.isNotEmpty()) {
+                    if (isLong && sel.overwriteVolumes && parsed.volumes.isNotEmpty()) {
                         val ts = System.currentTimeMillis()
-                        vm.setPlotArcs(projectId, parsed.arcs.mapIndexed { i, arc ->
-                            PlotArc(id = "arc-$ts-$i", title = arc.title, summary = arc.summary,
-                                order = i + 1, status = "upcoming")
+                        // Replace the volume list with the freshly parsed volumes (arcs are generated
+                        // per-volume later), and drop arcs from the now-removed old volumes.
+                        vm.setVolumes(projectId, parsed.volumes.mapIndexed { i, v ->
+                            Volume(id = "vol-$ts-$i", name = v.name, description = v.description, order = i)
                         })
+                        vm.setPlotArcs(projectId, emptyList())
                     }
                     if (sel.importChars && parsed.chars.isNotEmpty()) {
                         val existing = vm.characters(projectId)
@@ -454,7 +468,7 @@ private fun SaveOutlineDialog(
     parsed: ParsedOutlineSections,
     currentWorld: String,
     currentTimeline: String,
-    existingArcCount: Int,
+    existingVolumeCount: Int,
     existingCharCount: Int,
     existingChapterCount: Int,
     onConfirm: (SaveSelection) -> Unit,
@@ -463,7 +477,7 @@ private fun SaveOutlineDialog(
     var sel by remember { mutableStateOf(SaveSelection()) }
     val hasWorld = parsed.worldSetting != null
     val hasTimeline = parsed.timeline != null
-    val hasArcs = parsed.arcs.isNotEmpty()
+    val hasVolumes = parsed.volumes.isNotEmpty()
     val hasChars = parsed.chars.isNotEmpty()
     val hasChapters = !isLong && parsed.shortChapters.isNotEmpty()
 
@@ -508,21 +522,21 @@ private fun SaveOutlineDialog(
                     preview = parsed.timeline?.take(120),
                     lang = lang,
                 )
-                if (isLong && hasArcs) SaveSectionRow(
-                    checked = sel.overwriteArcs,
-                    onCheckedChange = { sel = sel.copy(overwriteArcs = it) },
-                    label = tx(lang, "覆盖剧情弧线（替换为 ${parsed.arcs.size} 个新弧线）",
-                        "Overwrite Plot Arcs (replace with ${parsed.arcs.size} new arcs)"),
-                    warning = if (existingArcCount > 0) tx(lang, "⚠ 当前已有 $existingArcCount 个弧线，将全部替换",
-                        "⚠ $existingArcCount existing arcs will be replaced") else null,
+                if (isLong && hasVolumes) SaveSectionRow(
+                    checked = sel.overwriteVolumes,
+                    onCheckedChange = { sel = sel.copy(overwriteVolumes = it) },
+                    label = tx(lang, "导入副本（替换为 ${parsed.volumes.size} 个新副本）",
+                        "Import Volumes (replace with ${parsed.volumes.size} new volumes)"),
+                    warning = if (existingVolumeCount > 0) tx(lang, "⚠ 当前已有 $existingVolumeCount 个副本，将全部替换（含其下弧线）",
+                        "⚠ $existingVolumeCount existing volumes (and their arcs) will be replaced") else null,
                     customContent = {
                         Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                            parsed.arcs.take(6).forEachIndexed { i, arc ->
-                                Text("${i + 1}. ${arc.title}", style = MaterialTheme.typography.labelSmall,
+                            parsed.volumes.take(6).forEachIndexed { i, v ->
+                                Text("${i + 1}. ${v.name}", style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant)
                             }
-                            if (parsed.arcs.size > 6) Text(
-                                tx(lang, "…还有 ${parsed.arcs.size - 6} 个弧线", "…and ${parsed.arcs.size - 6} more arcs"),
+                            if (parsed.volumes.size > 6) Text(
+                                tx(lang, "…还有 ${parsed.volumes.size - 6} 个副本", "…and ${parsed.volumes.size - 6} more volumes"),
                                 style = MaterialTheme.typography.labelSmall, fontStyle = FontStyle.Italic,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
@@ -572,7 +586,7 @@ private fun SaveOutlineDialog(
                     },
                     lang = lang,
                 )
-                if (!hasWorld && !hasTimeline && !(isLong && hasArcs) && !hasChars && !hasChapters) {
+                if (!hasWorld && !hasTimeline && !(isLong && hasVolumes) && !hasChars && !hasChapters) {
                     Text(
                         tx(lang, "未能从大纲中识别出可解析的结构化内容，仅保存大纲文本。",
                             "No parseable structured content found — only outline text will be saved."),

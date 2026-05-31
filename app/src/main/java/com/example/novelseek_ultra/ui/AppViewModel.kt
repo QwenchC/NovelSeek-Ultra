@@ -28,6 +28,7 @@ import com.example.novelseek_ultra.data.model.RestoreResult
 import com.example.novelseek_ultra.data.model.SnapshotMeta
 import com.example.novelseek_ultra.data.model.SummaryPayload
 import com.example.novelseek_ultra.data.model.Project
+import com.example.novelseek_ultra.data.model.Volume
 import com.example.novelseek_ultra.data.model.TextModelConfig
 import com.example.novelseek_ultra.data.model.TextModelProfile
 import com.example.novelseek_ultra.data.nowIso
@@ -263,6 +264,62 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun plotArcs(projectId: String): List<PlotArc> = repo.plotArcs(projectId)
     fun setPlotArcs(projectId: String, arcs: List<PlotArc>) = repo.setPlotArcs(projectId, arcs)
 
+    // ── 副本 (Volumes) ────────────────────────────────────────────────────────
+    fun volumes(projectId: String): List<Volume> = repo.volumes(projectId).sortedBy { it.order }
+    fun setVolumes(projectId: String, volumes: List<Volume>) = repo.setVolumes(projectId, volumes)
+    fun ensureVolumes(projectId: String) = repo.ensureVolumes(projectId)
+
+    fun arcsForVolume(projectId: String, volumeId: String): List<PlotArc> =
+        repo.plotArcs(projectId).filter { it.volumeId == volumeId }.sortedBy { it.order }
+
+    fun createVolume(projectId: String, name: String, description: String): Volume {
+        val order = (repo.volumes(projectId).maxOfOrNull { it.order } ?: -1) + 1
+        val v = Volume(id = "vol-${System.currentTimeMillis()}", name = name, description = description, order = order, createdAt = nowIso())
+        repo.setVolumes(projectId, repo.volumes(projectId) + v)
+        return v
+    }
+
+    fun updateVolume(projectId: String, volumeId: String, patch: (Volume) -> Volume) =
+        repo.setVolumes(projectId, repo.volumes(projectId).map { if (it.id == volumeId) patch(it) else it })
+
+    /** Delete a volume AND the arcs it contains. */
+    fun deleteVolume(projectId: String, volumeId: String) {
+        repo.setVolumes(projectId, repo.volumes(projectId).filterNot { it.id == volumeId })
+        repo.setPlotArcs(projectId, repo.plotArcs(projectId).filterNot { it.volumeId == volumeId })
+    }
+
+    /**
+     * Move [arcId] to [newPos1Based] (1-based) within its own volume: arcs before the target keep
+     * their position, arcs at/after the target shift back by one. Reuses the volume's existing order
+     * slots so other volumes are untouched.
+     */
+    fun moveArcToPosition(projectId: String, arcId: String, newPos1Based: Int) {
+        val all = repo.plotArcs(projectId)
+        val arc = all.firstOrNull { it.id == arcId } ?: return
+        val volArcs = all.filter { it.volumeId == arc.volumeId }.sortedBy { it.order }.toMutableList()
+        val curIdx = volArcs.indexOfFirst { it.id == arcId }
+        if (curIdx < 0) return
+        val target = newPos1Based.coerceIn(1, volArcs.size) - 1
+        if (target == curIdx) return
+        val orderSlots = volArcs.map { it.order }          // pool of order values for this volume
+        val moved = volArcs.removeAt(curIdx)
+        volArcs.add(target, moved)
+        val byId = volArcs.mapIndexed { i, a -> a.id to a.copy(order = orderSlots[i]) }.toMap()
+        repo.setPlotArcs(projectId, all.map { byId[it.id] ?: it })
+    }
+
+    /** Swap a volume with its neighbour (reorder). */
+    fun moveVolume(projectId: String, volumeId: String, up: Boolean) {
+        val vols = repo.volumes(projectId).sortedBy { it.order }.toMutableList()
+        val i = vols.indexOfFirst { it.id == volumeId }
+        if (i < 0) return
+        val j = if (up) i - 1 else i + 1
+        if (j !in vols.indices) return
+        val a = vols[i]; val b = vols[j]
+        vols[i] = a.copy(order = b.order); vols[j] = b.copy(order = a.order)
+        repo.setVolumes(projectId, vols)
+    }
+
     fun cultivationRealms(projectId: String): List<CultivationRealm> = repo.cultivationRealms(projectId)
     fun setCultivationRealms(projectId: String, realms: List<CultivationRealm>) =
         repo.setCultivationRealms(projectId, realms)
@@ -300,11 +357,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         val realmCtx = buildRealmSystemContext(repo.cultivationRealms(projectId), lang).ifBlank { null }
         val existingWorld = repo.worldSetting(projectId).ifBlank { null }
         val existingTimeline = repo.timeline(projectId).ifBlank { null }
-        val existingArcs: String? = if (isLong) {
-            repo.plotArcs(projectId).sortedBy { it.order }.takeIf { it.isNotEmpty() }
-                ?.mapIndexed { i, arc ->
-                    val label = if (lang == "en") "Arc ${i + 1}: ${arc.title}" else "弧线${i + 1}：${arc.title}"
-                    if (arc.summary.isNotBlank()) "$label\n  ${arc.summary}" else label
+        val existingVolumes: String? = if (isLong) {
+            repo.volumes(projectId).sortedBy { it.order }.takeIf { it.isNotEmpty() }
+                ?.mapIndexed { i, v ->
+                    val label = if (lang == "en") "Volume ${i + 1}: ${v.name}" else "副本${i + 1}：${v.name}"
+                    if (v.description.isNotBlank()) "$label\n  ${v.description}" else label
                 }?.joinToString("\n")
         } else null
         val existingCharsInfo = buildCharactersInfo(projectId)
@@ -319,7 +376,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     realmContext = realmCtx,
                     existingWorld = existingWorld,
                     existingTimeline = existingTimeline,
-                    existingArcs = existingArcs,
+                    existingVolumes = existingVolumes,
                     charactersInfo = existingCharsInfo,
                     isContinuation = continueFromExisting && currentOutline.isNotBlank(),
                     currentOutline = currentOutline.takeIf { it.isNotBlank() },
@@ -443,14 +500,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     // manual save button did this, so AI-generated / continued chapters were never
                     // auto-indexed or summarized.
                     onChapterSaved(projectId, chapter.id, chapter.title, final)
-                }
-                // Arc ending auto-decrement
-                val endingArc = arcs.find { it.status == "ending" }
-                if (endingArc != null) {
-                    val remaining = (endingArc.chaptersUntilEnd ?: 1) - 1
-                    repo.setPlotArcs(projectId, arcs.map { arc ->
-                        if (arc.id == endingArc.id) arc.copy(chaptersUntilEnd = maxOf(0, remaining)) else arc
-                    })
                 }
             } finally {
                 _isGenerating.value = false
@@ -989,6 +1038,146 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         return arc
     }
 
+    // ── 副本 / 弧线 AI generation ─────────────────────────────────────────────
+
+    /** Generate [count] volumes from the outline + realm system + influencing containers (no arcs).
+     *  [requirements] is the user's free-form instruction (e.g. what the first/later volumes cover). */
+    fun generateVolumes(projectId: String, count: Int, requirements: String? = null, onDone: (Int) -> Unit = {}) {
+        val cfg = repo.activeTextModelConfig()
+        if (!cfg.isValid()) { _statusMessage.value = "请先在「设置」中配置可用的文本模型"; onDone(0); return }
+        val lang = _uiLanguage.value
+        viewModelScope.launch(Dispatchers.IO) {
+            val context = buildString {
+                repo.outline(projectId).takeIf { it.isNotBlank() }?.let {
+                    append(if (lang == "en") "[Outline]\n" else "【大纲】\n"); append(it.take(4000))
+                }
+                buildRealmSystemContext(repo.cultivationRealms(projectId), lang).takeIf { it.isNotBlank() }?.let {
+                    if (isNotEmpty()) append("\n\n"); append(it)
+                }
+                containerGuidanceFor(projectId, lang) { it.affectsVolumeGeneration }.takeIf { it.isNotBlank() }?.let {
+                    if (isNotEmpty()) append("\n\n"); append(it)
+                }
+            }
+            val existing = repo.volumes(projectId).sortedBy { it.order }.joinToString("\n") { "- ${it.name}" }.ifBlank { null }
+            val reply = runCatching {
+                ai.chat(cfg, listOf(
+                    ChatMessage("system", Prompts.volumePlanSystem(lang)),
+                    ChatMessage("user", Prompts.volumePlanUser(count, context, existing, requirements?.trim()?.ifBlank { null }, lang)),
+                ))
+            }.getOrNull()
+            val parsed = reply?.let { parseVolumeArray(it) } ?: emptyList()
+            if (parsed.isEmpty()) { withContext(Dispatchers.Main) { _statusMessage.value = "副本生成失败"; onDone(0) }; return@launch }
+            var order = (repo.volumes(projectId).maxOfOrNull { it.order } ?: -1) + 1
+            val ts = System.currentTimeMillis()
+            val newVols = parsed.mapIndexed { i, (name, desc) ->
+                Volume(id = "vol-$ts-$i", name = name, description = desc, order = order++, createdAt = nowIso())
+            }
+            repo.setVolumes(projectId, repo.volumes(projectId) + newVols)
+            withContext(Dispatchers.Main) { _statusMessage.value = "已生成 ${newVols.size} 个副本"; onDone(newVols.size) }
+        }
+    }
+
+    /** Generate [count] plot arcs inside [volumeId] (no chapter planning). [requirements] is the
+     *  user's free-form instruction (e.g. what specific arcs should cover). */
+    fun generateArcsForVolume(projectId: String, volumeId: String, count: Int, requirements: String? = null, onDone: (Int) -> Unit = {}) {
+        val cfg = repo.activeTextModelConfig()
+        if (!cfg.isValid()) { _statusMessage.value = "请先在「设置」中配置可用的文本模型"; onDone(0); return }
+        val lang = _uiLanguage.value
+        val volume = repo.volumes(projectId).firstOrNull { it.id == volumeId } ?: run { onDone(0); return }
+        viewModelScope.launch(Dispatchers.IO) {
+            val context = buildString {
+                repo.outline(projectId).takeIf { it.isNotBlank() }?.let {
+                    append(if (lang == "en") "[Outline]\n" else "【大纲】\n"); append(it.take(3000))
+                }
+                buildRealmSystemContext(repo.cultivationRealms(projectId), lang).takeIf { it.isNotBlank() }?.let {
+                    if (isNotEmpty()) append("\n\n"); append(it)
+                }
+                containerGuidanceFor(projectId, lang) { it.affectsArcGeneration }.takeIf { it.isNotBlank() }?.let {
+                    if (isNotEmpty()) append("\n\n"); append(it)
+                }
+            }
+            val existingArcs = repo.plotArcs(projectId).filter { it.volumeId == volumeId }
+                .joinToString("\n") { "- ${it.title}" }.ifBlank { null }
+            val reply = runCatching {
+                ai.chat(cfg, listOf(
+                    ChatMessage("system", Prompts.arcsForVolumeSystem(lang)),
+                    ChatMessage("user", Prompts.arcsForVolumeUser(count, volume.name, volume.description.ifBlank { null }, context, existingArcs, requirements?.trim()?.ifBlank { null }, lang)),
+                ))
+            }.getOrNull()
+            val parsed = reply?.let { parseArcArray(it) } ?: emptyList()
+            if (parsed.isEmpty()) { withContext(Dispatchers.Main) { _statusMessage.value = "弧线生成失败"; onDone(0) }; return@launch }
+            var order = (repo.plotArcs(projectId).maxOfOrNull { it.order } ?: -1) + 1
+            val ts = System.currentTimeMillis()
+            val newArcs = parsed.mapIndexed { i, p ->
+                PlotArc(id = "arc-$ts-$i", title = p.title, summary = p.summary, order = order++,
+                    status = "upcoming", chapterCount = p.chapterCount, volumeId = volumeId)
+            }
+            repo.setPlotArcs(projectId, repo.plotArcs(projectId) + newArcs)
+            withContext(Dispatchers.Main) { _statusMessage.value = "已生成 ${newArcs.size} 条弧线"; onDone(newArcs.size) }
+        }
+    }
+
+    /** Compact "latest values" guidance for the containers matching [predicate] (volume/arc gen). */
+    private fun containerGuidanceFor(projectId: String, lang: String, predicate: (Container) -> Boolean): String {
+        val containers = repo.containers(projectId).filter(predicate)
+        if (containers.isEmpty()) return ""
+        val blocks = mutableListOf<String>()
+        containers.forEach { c ->
+            when (c.type) {
+                Container.BY_CHARACTER -> {
+                    val lines = repo.characters(projectId).mapNotNull { ch ->
+                        val v = repo.containerEntries(projectId, c.id, ch.id).lastOrNull()?.value?.takeIf { it.isNotBlank() }
+                            ?: return@mapNotNull null
+                        "${ch.name}：${v.take(200)}"
+                    }
+                    if (lines.isNotEmpty()) blocks += "《${c.name}》\n" + lines.joinToString("\n")
+                }
+                Container.BY_CHAPTER -> {
+                    val recent = repo.chapters(projectId).sortedBy { it.order_index }.takeLast(3)
+                    val lines = recent.mapNotNull { ch ->
+                        val v = repo.containerEntries(projectId, c.id, ch.id).lastOrNull()?.value?.takeIf { it.isNotBlank() }
+                            ?: return@mapNotNull null
+                        "第${ch.order_index}章：${v.take(150)}"
+                    }
+                    if (lines.isNotEmpty()) blocks += "《${c.name}》\n" + lines.joinToString("\n")
+                }
+                else -> {
+                    val v = repo.containerEntries(projectId, c.id, Container.SINGLE_BLOCK_KEY).lastOrNull()?.value
+                    if (!v.isNullOrBlank()) blocks += "《${c.name}》：${v.take(300)}"
+                }
+            }
+        }
+        if (blocks.isEmpty()) return ""
+        val header = if (lang == "en") "[Containers — reference state]" else "【资料容器 — 参考状态】"
+        return header + "\n" + blocks.joinToString("\n\n")
+    }
+
+    private fun parseVolumeArray(raw: String): List<Pair<String, String>> = runCatching {
+        val s = raw.replace(Regex("```(?:json)?\\s*"), "").replace("```", "").trim()
+        val start = s.indexOf('['); val end = s.lastIndexOf(']')
+        if (start < 0 || end <= start) return emptyList()
+        Json { ignoreUnknownKeys = true }.parseToJsonElement(s.substring(start, end + 1)).jsonArray.mapNotNull { el ->
+            val o = el.jsonObject
+            val name = (o["name"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.trim().orEmpty()
+            if (name.isBlank()) return@mapNotNull null
+            name to (o["description"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.trim().orEmpty()
+        }
+    }.getOrDefault(emptyList())
+
+    private fun parseArcArray(raw: String): List<ParsedArc> = runCatching {
+        val s = raw.replace(Regex("```(?:json)?\\s*"), "").replace("```", "").trim()
+        val start = s.indexOf('['); val end = s.lastIndexOf(']')
+        if (start < 0 || end <= start) return emptyList()
+        Json { ignoreUnknownKeys = true }.parseToJsonElement(s.substring(start, end + 1)).jsonArray.mapNotNull { el ->
+            val o = el.jsonObject
+            val title = (o["title"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.trim().orEmpty()
+            if (title.isBlank()) return@mapNotNull null
+            val summary = (o["summary"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.trim().orEmpty()
+            val cc = (o["chapter_count"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.toIntOrNull() ?: 10
+            ParsedArc(title, summary, cc, null)
+        }
+    }.getOrDefault(emptyList())
+
     // ── backup / restore ──────────────────────────────────────────────────
 
     fun generateCharactersFromOutline(
@@ -1175,10 +1364,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             if (activeArc != null) {
                 appendLine("Current arc: ${activeArc.title}")
                 if (activeArc.summary.isNotBlank()) appendLine("Arc summary: ${activeArc.summary}")
-                if (activeArc.status == "ending")
-                    appendLine("⚠ ENDING PHASE: This arc is winding down. Drive the story to a satisfying arc conclusion.")
-                else
-                    appendLine("This arc is actively unfolding. Maintain the arc's core conflict and keep plot threads alive.")
+                appendLine("This arc is actively unfolding. Maintain the arc's core conflict and keep plot threads alive.")
             }
             if (upcoming.isNotEmpty()) appendLine("Upcoming arcs: ${upcoming.joinToString(", ") { it.title }}")
         }.trimEnd()
@@ -1188,10 +1374,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             if (activeArc != null) {
                 appendLine("当前弧线：${activeArc.title}")
                 if (activeArc.summary.isNotBlank()) appendLine("弧线概述：${activeArc.summary}")
-                if (activeArc.status == "ending")
-                    appendLine("⚠ 结尾阶段：当前弧线进入最后阶段，本章需推动剧情走向本弧线的阶段性收束，但不要仓促。")
-                else
-                    appendLine("弧线进行中：维持核心矛盾，推进主线剧情，为后续伏笔做铺垫。")
+                appendLine("弧线进行中：维持核心矛盾，推进主线剧情，为后续伏笔做铺垫。")
             }
             if (upcoming.isNotEmpty()) appendLine("后续弧线（暂不展开）：${upcoming.joinToString("、") { it.title }}")
         }.trimEnd()
@@ -1977,8 +2160,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun containers(projectId: String): List<Container> = repo.containers(projectId)
     fun container(projectId: String, containerId: String): Container? = repo.container(projectId, containerId)
     fun createContainer(projectId: String, container: Container) = repo.createContainer(projectId, container)
-    fun updateContainerMeta(projectId: String, containerId: String, name: String, autoUpdatePerChapter: Boolean, affectsGeneration: Boolean) =
-        repo.updateContainerMeta(projectId, containerId, name, autoUpdatePerChapter, affectsGeneration)
+    fun updateContainerMeta(
+        projectId: String, containerId: String, name: String,
+        autoUpdatePerChapter: Boolean, affectsGeneration: Boolean,
+        affectsVolumeGeneration: Boolean, affectsArcGeneration: Boolean,
+    ) = repo.updateContainerMeta(projectId, containerId, name, autoUpdatePerChapter, affectsGeneration, affectsVolumeGeneration, affectsArcGeneration)
     fun deleteContainer(projectId: String, containerId: String) = repo.deleteContainer(projectId, containerId)
     fun containerEntries(projectId: String, containerId: String, blockKey: String): List<ContainerEntry> =
         repo.containerEntries(projectId, containerId, blockKey)

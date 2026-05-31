@@ -46,7 +46,7 @@ object Prompts {
         realmContext: String? = null,
         existingWorld: String? = null,
         existingTimeline: String? = null,
-        existingArcs: String? = null,
+        existingVolumes: String? = null,
         charactersInfo: String? = null,
         // Continuation mode: ALL the above prompt blocks are still emitted verbatim, then a
         // tail instruction is appended telling the model to pick up where `currentOutline` ends
@@ -66,9 +66,9 @@ object Prompts {
                 if (language == "en") appendLine("[Existing Timeline]\n$it")
                 else appendLine("【已有时间线】\n$it")
             }
-            existingArcs?.takeIf { it.isNotBlank() }?.let {
-                if (language == "en") appendLine("[Existing Plot Arcs]\n$it")
-                else appendLine("【已有剧情弧线规划】\n$it")
+            existingVolumes?.takeIf { it.isNotBlank() }?.let {
+                if (language == "en") appendLine("[Existing Volume Plan]\n$it")
+                else appendLine("【已有副本规划】\n$it")
             }
             realmContext?.takeIf { it.isNotBlank() }?.let {
                 if (language == "en") appendLine("[Cultivation Realm System]\n$it")
@@ -113,14 +113,12 @@ object Prompts {
                     appendLine("## Story Timeline")
                     appendLine("List the major events and milestones in chronological order (not tied to specific chapters).")
                     appendLine()
-                    appendLine("## Plot Arc Plan (4-7 arcs)")
-                    appendLine("For each arc, use EXACTLY this heading format:")
-                    appendLine("### Arc N: [Arc Name]")
-                    appendLine("- **Core Objective**: What does this arc accomplish?")
-                    appendLine("- **Primary Conflict**: The central tension driving this arc")
-                    appendLine("- **Key Turning Point**: The pivotal moment that changes things")
-                    appendLine("- **Emotional Journey**: The emotional progression for the protagonist")
-                    appendLine("- **Ending Beat**: How this arc concludes and what changes")
+                    appendLine("## Volume Plan (3-6 volumes)")
+                    appendLine("A 'volume' (副本) is a self-contained STAGE of the story that will later hold several plot arcs. Plan volumes only — do NOT break them into individual arcs or chapters here. For each volume use EXACTLY this heading format:")
+                    appendLine("### Volume N: [Volume Name]")
+                    appendLine("- **Stage Goal**: What this volume accomplishes in the overall story")
+                    appendLine("- **Core Conflict**: The central tension of this stage")
+                    appendLine("- **Outcome**: How this stage ends and what changes going into the next volume")
                     appendLine()
                     appendLine("## Themes & Depth")
                     appendLine("What deeper themes does this story explore?")
@@ -152,21 +150,19 @@ object Prompts {
                     appendLine("## 时间线")
                     appendLine("按时间顺序列出故事中的重大事件与转折节点（不与具体章节绑定）。")
                     appendLine()
-                    appendLine("## 剧情弧线规划")
-                    appendLine("每个弧线请严格使用以下标题格式（将N替换为实际序号，如1、2、3）：")
-                    appendLine("### 弧线N：[弧线名称]")
-                    appendLine("- **核心目标**：这段剧情要完成什么任务？")
-                    appendLine("- **主要冲突**：驱动这段剧情的核心张力")
-                    appendLine("- **关键转折**：改变一切的关键时刻")
-                    appendLine("- **情感走向**：主角的情感历程演变")
-                    appendLine("- **结尾收束**：这段弧线如何结束，带来什么变化")
+                    appendLine("## 副本规划（3-6个副本）")
+                    appendLine("「副本」是一段相对完整的故事阶段，之后会在其中容纳若干剧情弧线。此处只做副本层面的规划，不要拆分成具体的剧情弧线或章节。每个副本请严格使用以下标题格式（将N替换为实际序号，如1、2、3）：")
+                    appendLine("### 副本N：[副本名称]")
+                    appendLine("- **阶段目标**：这个副本在整部小说中要完成什么？")
+                    appendLine("- **核心矛盾**：这一阶段的中心冲突")
+                    appendLine("- **阶段收束**：这个副本如何结束，进入下一副本时发生了什么变化")
                     appendLine()
                     appendLine("## 主题与深度")
                     appendLine("这部作品探讨哪些更深层的主题？")
                     appendLine()
                     appendLine("【重要】请直接从 `## 世界观概述` 开始输出，第一个字符即为标题，" +
                         "不要在此之前写任何问候、确认或引导性语句。严格使用上述标题格式，" +
-                        "例如 `## 时间线`、`## 剧情弧线规划`。")
+                        "例如 `## 时间线`、`## 副本规划`。")
                 }
             }
         } else {
@@ -725,6 +721,82 @@ Style:
             realmSystemContext?.takeIf { it.isNotBlank() }?.let { appendLine("修炼体系：\n$it") }
             charactersSummary?.takeIf { it.isNotBlank() }?.let { appendLine("角色：\n$it") }
             targetChapterCount?.let { appendLine("目标章节数：$it") }
+        }
+    }
+
+    // ── 副本 (Volume) & in-volume arc generation ────────────────────────────
+
+    fun volumePlanSystem(language: String) = if (language == "en") {
+        "You plan VOLUMES (副本) for a long serialized novel — each volume is a self-contained stage of " +
+            "the story that will later hold several plot arcs. Do NOT plan individual arcs or chapters. " +
+            "Reply with a STRICT JSON array, no prose outside JSON: " +
+            "[{\"name\":\"<volume name>\",\"description\":\"<2-4 sentences: this stage's goal, core conflict, and outcome>\"}]"
+    } else {
+        "你为长篇连载小说规划「副本」——每个副本是一段相对完整的故事阶段，之后会在其中容纳若干剧情弧线。" +
+            "不要规划具体的剧情弧线或章节。严格只输出 JSON 数组，不要 JSON 之外的任何文字：" +
+            "[{\"name\":\"副本名称\",\"description\":\"2-4句：该副本的阶段目标、核心矛盾与收束\"}]"
+    }
+
+    fun volumePlanUser(count: Int, context: String, existingVolumes: String?, requirements: String?, language: String) = buildString {
+        if (language == "en") {
+            appendLine("Plan $count new volume(s) that continue the story coherently.")
+            requirements?.takeIf { it.isNotBlank() }?.let {
+                appendLine("Author requirements (follow these; they may specify what specific volumes should cover):\n$it")
+            }
+            existingVolumes?.takeIf { it.isNotBlank() }?.let { appendLine("Existing volumes (do not duplicate):\n$it") }
+            if (context.isNotBlank()) { appendLine("\nReference material:"); appendLine(context) }
+            append("\nOutput the JSON array of $count volume(s) only.")
+        } else {
+            appendLine("请规划 $count 个能让故事连贯推进的新副本。")
+            requirements?.takeIf { it.isNotBlank() }?.let {
+                appendLine("作者要求（请遵循，可能会指定第几个副本讲什么）：\n$it")
+            }
+            existingVolumes?.takeIf { it.isNotBlank() }?.let { appendLine("已有副本（不要重复）：\n$it") }
+            if (context.isNotBlank()) { appendLine("\n参考资料："); appendLine(context) }
+            append("\n只输出包含 $count 个副本的 JSON 数组。")
+        }
+    }
+
+    fun arcsForVolumeSystem(language: String) = if (language == "en") {
+        "You plan PLOT ARCS inside one volume (副本) of a long novel. Each arc is a multi-chapter " +
+            "narrative unit. Do NOT plan individual chapters (chapter planning is done separately). " +
+            "Reply with a STRICT JSON array, no prose outside JSON: " +
+            "[{\"title\":\"<arc title>\",\"summary\":\"<2-4 sentences>\",\"chapter_count\":<int>}]"
+    } else {
+        "你为长篇小说某个「副本」内部规划剧情弧线。每条弧线是一个跨多章的叙事单元。" +
+            "不要规划具体章节（章节规划另行进行）。严格只输出 JSON 数组，不要 JSON 之外的任何文字：" +
+            "[{\"title\":\"弧线名称\",\"summary\":\"2-4句概述\",\"chapter_count\":<整数>}]"
+    }
+
+    fun arcsForVolumeUser(
+        count: Int,
+        volumeName: String,
+        volumeDescription: String?,
+        context: String,
+        existingArcs: String?,
+        requirements: String?,
+        language: String,
+    ) = buildString {
+        if (language == "en") {
+            appendLine("Volume: $volumeName")
+            volumeDescription?.takeIf { it.isNotBlank() }?.let { appendLine("Volume description: $it") }
+            appendLine("Plan $count plot arc(s) that fit WITHIN this volume.")
+            requirements?.takeIf { it.isNotBlank() }?.let {
+                appendLine("Author requirements (follow these; they may specify what specific arcs should cover):\n$it")
+            }
+            existingArcs?.takeIf { it.isNotBlank() }?.let { appendLine("Existing arcs in this volume (do not duplicate):\n$it") }
+            if (context.isNotBlank()) { appendLine("\nReference material:"); appendLine(context) }
+            append("\nOutput the JSON array of $count arc(s) only.")
+        } else {
+            appendLine("副本：$volumeName")
+            volumeDescription?.takeIf { it.isNotBlank() }?.let { appendLine("副本描述：$it") }
+            appendLine("请规划 $count 条契合本副本的剧情弧线。")
+            requirements?.takeIf { it.isNotBlank() }?.let {
+                appendLine("作者要求（请遵循，可能会指定第几条弧线讲什么）：\n$it")
+            }
+            existingArcs?.takeIf { it.isNotBlank() }?.let { appendLine("本副本已有弧线（不要重复）：\n$it") }
+            if (context.isNotBlank()) { appendLine("\n参考资料："); appendLine(context) }
+            append("\n只输出包含 $count 条弧线的 JSON 数组。")
         }
     }
 

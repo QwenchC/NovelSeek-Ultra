@@ -92,11 +92,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.novelseek_ultra.data.model.Chapter
+import com.example.novelseek_ultra.data.model.Volume
 import com.example.novelseek_ultra.data.model.CoverImageConfig
 import com.example.novelseek_ultra.data.model.CoverImageItem
 import com.example.novelseek_ultra.data.model.PlotArc
@@ -132,8 +134,8 @@ fun LongNovelScreen(
     val scope = rememberCoroutineScope()
 
     var showArcDialog by remember { mutableStateOf<PlotArc?>(null) }
-    var showCreateArc by remember { mutableStateOf(false) }
-    var showAiArcDialog by remember { mutableStateOf(false) }
+    var createArcVolumeId by remember { mutableStateOf<String?>(null) }   // manual add arc → which volume
+    var aiArcVolumeId by remember { mutableStateOf<String?>(null) }       // AI generate arcs → which volume
     var showCreateChapter by remember { mutableStateOf(false) }
     var showMiniOutlineArcId by remember { mutableStateOf<String?>(null) }
     var showRealmDialog by remember { mutableStateOf(false) }
@@ -143,7 +145,16 @@ fun LongNovelScreen(
     var deletingArc by remember { mutableStateOf<PlotArc?>(null) }
     var renamingChapter by remember { mutableStateOf<Chapter?>(null) }
     var deletingChapter by remember { mutableStateOf<Chapter?>(null) }
-    var arcsExpanded by remember { mutableStateOf(true) }
+    var volumesExpanded by remember { mutableStateOf(true) }
+    var expandedVolumeId by remember { mutableStateOf<String?>(null) }
+    var showCreateVolume by remember { mutableStateOf(false) }
+    var showAiVolumeDialog by remember { mutableStateOf(false) }
+    var editingVolume by remember { mutableStateOf<Volume?>(null) }
+    var deletingVolume by remember { mutableStateOf<Volume?>(null) }
+
+    // 副本列表 + 旧项目迁移（无副本但有弧线 → 归入"副本1"）
+    val volumes = remember(state, projectId) { vm.volumes(projectId) }
+    LaunchedEffect(projectId) { vm.ensureVolumes(projectId) }
     var navInput by remember { mutableStateOf("") }
     var showScrollArrows by remember { mutableStateOf(false) }
     var showCoverDialog by remember { mutableStateOf(false) }
@@ -174,9 +185,12 @@ fun LongNovelScreen(
     // posWithinPage to scroll to after a page switch (set by the nav search).
     var pendingScrollPos by remember { mutableStateOf<Int?>(null) }
     // Leading LazyColumn items before the first chapter card: stats(1) + actionRow(1) +
-    // arcsHeader(1) + arcs(arcsItemCount) + chaptersHeader(1) = 4 + arcsItemCount.
-    val arcsItemCount = if (arcsExpanded) maxOf(1, arcs.size) else 0
-    val firstChapterItemIndex = 4 + arcsItemCount
+    // volumesHeader(1) + volumes(volumesItemCount) + chaptersHeader(1) = 4 + volumesItemCount.
+    val volumesItemCount = if (volumesExpanded) {
+        if (volumes.isEmpty()) 1
+        else volumes.size + (expandedVolumeId?.let { vid -> maxOf(1, arcs.count { it.volumeId == vid }) } ?: 0)
+    } else 0
+    val firstChapterItemIndex = 4 + volumesItemCount
 
     LaunchedEffect(pendingScrollPos, safePage) {
         val pos = pendingScrollPos ?: return@LaunchedEffect
@@ -214,6 +228,7 @@ fun LongNovelScreen(
     }
 
     Scaffold(
+        contentWindowInsets = androidx.compose.foundation.layout.WindowInsets(0),
         topBar = {
             AppTopBar(
                 navigationIcon = {
@@ -374,65 +389,88 @@ fun LongNovelScreen(
                 }
             }
 
-            // ── Arcs section ────────────────────────────────────────────
+            // ── 副本 (Volumes) section — each volume holds its plot arcs ─────
             item {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(tx(lang, "剧情弧线", "Story Arcs"),
+                    Text(tx(lang, "副本", "Volumes"),
                         style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
-                    TextButton(onClick = { showAiArcDialog = true }) {
+                    TextButton(onClick = { showAiVolumeDialog = true }) {
                         Icon(Icons.Outlined.AutoAwesome, contentDescription = null)
                         Spacer(Modifier.width(4.dp))
                         Text(tx(lang, "AI 生成", "AI"))
                     }
-                    TextButton(onClick = { showCreateArc = true }) {
+                    TextButton(onClick = { showCreateVolume = true }) {
                         Icon(Icons.Outlined.Add, contentDescription = null)
                         Spacer(Modifier.width(4.dp))
                         Text(tx(lang, "手动添加", "Add"))
                     }
-                    IconButton(onClick = { arcsExpanded = !arcsExpanded }, modifier = Modifier.size(32.dp)) {
+                    IconButton(onClick = { volumesExpanded = !volumesExpanded }, modifier = Modifier.size(32.dp)) {
                         Icon(
-                            if (arcsExpanded) Icons.Outlined.ExpandLess else Icons.Outlined.ExpandMore,
+                            if (volumesExpanded) Icons.Outlined.ExpandLess else Icons.Outlined.ExpandMore,
                             contentDescription = null, modifier = Modifier.size(20.dp),
                         )
                     }
                 }
             }
-            if (arcsExpanded) {
-                if (arcs.isEmpty()) {
+            if (volumesExpanded) {
+                if (volumes.isEmpty()) {
                     item {
-                        Text(tx(lang, "尚未规划弧线", "No arcs planned yet"),
+                        Text(tx(lang, "尚未规划副本", "No volumes planned yet"),
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 } else {
-                    itemsIndexed(arcs, key = { _, arc -> arc.id }) { idx, arc ->
-                        ArcCard(arc, idx + 1, lang,
-                            onCycleStatus = {
-                                val next = nextArcStatus(arc.status)
-                                vm.setPlotArcs(projectId, arcs.map { if (it.id == arc.id) it.copy(status = next) else it })
-                            },
-                            onEdit = { showArcDialog = arc },
-                            onDelete = { deletingArc = arc },
-                            onPlanChapters = { showMiniOutlineArcId = arc.id },
-                            onMoveUp = if (idx > 0) {
-                                {
-                                    val prev = arcs[idx - 1]
-                                    val reordered = arcs.toMutableList()
-                                    reordered[idx] = arc.copy(order = prev.order)
-                                    reordered[idx - 1] = prev.copy(order = arc.order)
-                                    vm.setPlotArcs(projectId, reordered)
+                    volumes.forEachIndexed { vIdx, vol ->
+                        val volArcs = arcs.filter { it.volumeId == vol.id }
+                        item(key = "vol-${vol.id}") {
+                            VolumeCard(
+                                vol = vol, number = vIdx + 1, arcCount = volArcs.size,
+                                expanded = expandedVolumeId == vol.id, lang = lang,
+                                onToggle = { expandedVolumeId = if (expandedVolumeId == vol.id) null else vol.id },
+                                onEdit = { editingVolume = vol },
+                                onDelete = { deletingVolume = vol },
+                                onMoveUp = if (vIdx > 0) ({ vm.moveVolume(projectId, vol.id, up = true) }) else null,
+                                onMoveDown = if (vIdx < volumes.size - 1) ({ vm.moveVolume(projectId, vol.id, up = false) }) else null,
+                                onAiArcs = { aiArcVolumeId = vol.id },
+                                onAddArc = { createArcVolumeId = vol.id },
+                            )
+                        }
+                        if (expandedVolumeId == vol.id) {
+                            if (volArcs.isEmpty()) {
+                                item(key = "vol-empty-${vol.id}") {
+                                    Text(tx(lang, "本副本暂无弧线，点上方按钮生成或添加", "No arcs in this volume yet"),
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.padding(start = 12.dp))
                                 }
-                            } else null,
-                            onMoveDown = if (idx < arcs.size - 1) {
-                                {
-                                    val next = arcs[idx + 1]
-                                    val reordered = arcs.toMutableList()
-                                    reordered[idx] = arc.copy(order = next.order)
-                                    reordered[idx + 1] = next.copy(order = arc.order)
-                                    vm.setPlotArcs(projectId, reordered)
+                            } else {
+                                itemsIndexed(volArcs, key = { _, a -> a.id }) { aIdx, arc ->
+                                    Box(Modifier.padding(start = 12.dp)) {
+                                        ArcCard(arc, aIdx + 1, lang,
+                                            onCycleStatus = {
+                                                val next = nextArcStatus(arc.status)
+                                                vm.setPlotArcs(projectId, arcs.map { if (it.id == arc.id) it.copy(status = next) else it })
+                                            },
+                                            onEdit = { showArcDialog = arc },
+                                            onDelete = { deletingArc = arc },
+                                            onPlanChapters = { showMiniOutlineArcId = arc.id },
+                                            onMoveUp = if (aIdx > 0) ({
+                                                val prev = volArcs[aIdx - 1]
+                                                vm.setPlotArcs(projectId, arcs.map {
+                                                    when (it.id) { arc.id -> it.copy(order = prev.order); prev.id -> it.copy(order = arc.order); else -> it }
+                                                })
+                                            }) else null,
+                                            onMoveDown = if (aIdx < volArcs.size - 1) ({
+                                                val nxt = volArcs[aIdx + 1]
+                                                vm.setPlotArcs(projectId, arcs.map {
+                                                    when (it.id) { arc.id -> it.copy(order = nxt.order); nxt.id -> it.copy(order = arc.order); else -> it }
+                                                })
+                                            }) else null,
+                                        )
+                                    }
                                 }
-                            } else null,
-                        )
+                            }
+                        }
                     }
                 }
             }
@@ -640,53 +678,127 @@ fun LongNovelScreen(
         )
     }
 
-    if (showCreateArc) {
+    createArcVolumeId?.let { volId ->
         ArcDialog(
             lang = lang, initial = null,
-            onDismiss = { showCreateArc = false },
-            onSave = { arc ->
+            onDismiss = { createArcVolumeId = null },
+            onSave = { arc, _ ->
                 val id = "arc-${System.currentTimeMillis()}"
-                vm.setPlotArcs(projectId, arcs + arc.copy(id = id, order = arcs.size))
-                showCreateArc = false
+                val order = (arcs.maxOfOrNull { it.order } ?: -1) + 1
+                vm.setPlotArcs(projectId, arcs + arc.copy(id = id, order = order, volumeId = volId))
+                createArcVolumeId = null
             },
         )
     }
     showArcDialog?.let { arc ->
+        // Position of this arc within its own volume (1-based) + how many arcs the volume has.
+        val volArcs = arcs.filter { it.volumeId == arc.volumeId }.sortedBy { it.order }
+        val curPos = volArcs.indexOfFirst { it.id == arc.id } + 1
         ArcDialog(
             lang = lang, initial = arc,
+            position = curPos.takeIf { it > 0 },
+            maxPosition = volArcs.size,
             onDismiss = { showArcDialog = null },
-            onSave = { updated ->
-                vm.setPlotArcs(projectId, arcs.map { if (it.id == arc.id) updated.copy(id = arc.id, order = arc.order) else it })
+            onSave = { updated, newPos ->
+                // 1) apply field edits (keep id / order / volume), then 2) reorder if position changed.
+                vm.setPlotArcs(projectId, arcs.map {
+                    if (it.id == arc.id) updated.copy(id = arc.id, order = arc.order, volumeId = arc.volumeId) else it
+                })
+                if (newPos != null && newPos != curPos) vm.moveArcToPosition(projectId, arc.id, newPos)
                 showArcDialog = null
             },
         )
     }
-    if (showAiArcDialog) {
-        var idea by remember { mutableStateOf("") }
-        var targetCh by remember { mutableStateOf("10") }
+    // AI generate N arcs inside a volume (no chapter planning — that's a per-arc manual action).
+    aiArcVolumeId?.let { volId ->
+        var countStr by remember { mutableStateOf("3") }
+        var requirements by remember { mutableStateOf("") }
         var loading by remember { mutableStateOf(false) }
+        val volName = volumes.firstOrNull { it.id == volId }?.name.orEmpty()
         AlertDialog(
-            onDismissRequest = { showAiArcDialog = false },
-            title = { Text(tx(lang, "AI 生成弧线", "AI Generate Arc")) },
+            onDismissRequest = { if (!loading) aiArcVolumeId = null },
+            title = { Text(tx(lang, "AI 生成弧线", "AI Generate Arcs")) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedTextField(idea, { idea = it }, label = { Text(tx(lang, "想法/方向", "Idea / direction")) }, minLines = 2)
-                    OutlinedTextField(targetCh, { targetCh = it.filter { c -> c.isDigit() } },
-                        label = { Text(tx(lang, "目标章节数", "Target chapter count")) }, singleLine = true)
-                    if (loading) CircularProgressIndicator()
+                    Text(tx(lang, "在副本《$volName》内生成剧情弧线", "Generate arcs inside volume \"$volName\""),
+                        style = MaterialTheme.typography.bodyMedium)
+                    OutlinedTextField(countStr, { countStr = it.filter { c -> c.isDigit() }.take(2) },
+                        label = { Text(tx(lang, "一次生成几个弧线", "How many arcs")) }, singleLine = true,
+                        modifier = Modifier.fillMaxWidth())
+                    OutlinedTextField(requirements, { requirements = it },
+                        label = { Text(tx(lang, "要求（可选，如：第1条讲…后面讲…）", "Requirements (optional)")) },
+                        minLines = 2, maxLines = 5, modifier = Modifier.fillMaxWidth().heightIn(max = 140.dp))
+                    if (loading) Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                        Text(tx(lang, "生成中…", "Generating…"), style = MaterialTheme.typography.labelSmall)
+                    }
                 }
             },
             confirmButton = {
-                TextButton(enabled = idea.isNotBlank() && !loading, onClick = {
+                TextButton(enabled = !loading, onClick = {
                     loading = true
-                    scope.launch {
-                        vm.generatePlotArc(projectId, idea, targetCh.toIntOrNull() ?: 10)
-                        loading = false
-                        showAiArcDialog = false
+                    vm.generateArcsForVolume(projectId, volId, countStr.toIntOrNull()?.coerceIn(1, 10) ?: 3, requirements) {
+                        loading = false; aiArcVolumeId = null
                     }
                 }) { Text(tx(lang, "生成", "Generate")) }
             },
-            dismissButton = { TextButton(onClick = { showAiArcDialog = false }) { Text(tx(lang, "取消", "Cancel")) } },
+            dismissButton = { TextButton(onClick = { if (!loading) aiArcVolumeId = null }) { Text(tx(lang, "取消", "Cancel")) } },
+        )
+    }
+
+    // Create / edit / delete volume + AI generate volumes
+    if (showCreateVolume) {
+        VolumeDialog(lang = lang, initial = null, onDismiss = { showCreateVolume = false },
+            onSave = { name, desc -> vm.createVolume(projectId, name, desc); showCreateVolume = false })
+    }
+    editingVolume?.let { vol ->
+        VolumeDialog(lang = lang, initial = vol, onDismiss = { editingVolume = null },
+            onSave = { name, desc -> vm.updateVolume(projectId, vol.id) { it.copy(name = name, description = desc) }; editingVolume = null })
+    }
+    deletingVolume?.let { vol ->
+        ConfirmDialog(
+            title = tx(lang, "删除副本", "Delete Volume"),
+            message = tx(lang, "确定删除副本《${vol.name}》及其下所有剧情弧线？章节本身不会被删除。",
+                "Delete volume \"${vol.name}\" and all its plot arcs? Chapters themselves stay."),
+            confirmLabel = tx(lang, "删除", "Delete"),
+            dismissLabel = tx(lang, "取消", "Cancel"),
+            onConfirm = { if (expandedVolumeId == vol.id) expandedVolumeId = null; vm.deleteVolume(projectId, vol.id) },
+            onDismiss = { deletingVolume = null },
+        )
+    }
+    if (showAiVolumeDialog) {
+        var countStr by remember { mutableStateOf("3") }
+        var requirements by remember { mutableStateOf("") }
+        var loading by remember { mutableStateOf(false) }
+        AlertDialog(
+            onDismissRequest = { if (!loading) showAiVolumeDialog = false },
+            title = { Text(tx(lang, "AI 生成副本", "AI Generate Volumes")) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(tx(lang, "依据大纲、境界体系与相关容器规划副本（不生成弧线）",
+                        "Plan volumes from the outline, realm system and containers (no arcs)"),
+                        style = MaterialTheme.typography.bodyMedium)
+                    OutlinedTextField(countStr, { countStr = it.filter { c -> c.isDigit() }.take(2) },
+                        label = { Text(tx(lang, "一次生成几个副本", "How many volumes")) }, singleLine = true,
+                        modifier = Modifier.fillMaxWidth())
+                    OutlinedTextField(requirements, { requirements = it },
+                        label = { Text(tx(lang, "要求（可选，如：前2个讲…后面讲…）", "Requirements (optional)")) },
+                        minLines = 2, maxLines = 5, modifier = Modifier.fillMaxWidth().heightIn(max = 140.dp))
+                    if (loading) Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                        Text(tx(lang, "生成中…", "Generating…"), style = MaterialTheme.typography.labelSmall)
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(enabled = !loading, onClick = {
+                    loading = true
+                    vm.generateVolumes(projectId, countStr.toIntOrNull()?.coerceIn(1, 10) ?: 3, requirements) {
+                        loading = false; showAiVolumeDialog = false
+                    }
+                }) { Text(tx(lang, "生成", "Generate")) }
+            },
+            dismissButton = { TextButton(onClick = { if (!loading) showAiVolumeDialog = false }) { Text(tx(lang, "取消", "Cancel")) } },
         )
     }
 
@@ -935,22 +1047,44 @@ private fun ArcCard(
 }
 
 @Composable
-private fun ArcDialog(lang: String, initial: PlotArc?, onDismiss: () -> Unit, onSave: (PlotArc) -> Unit) {
+private fun ArcDialog(
+    lang: String,
+    initial: PlotArc?,
+    position: Int? = null,      // current 1-based position within its volume (null when creating)
+    maxPosition: Int = 0,       // number of arcs in the volume
+    onDismiss: () -> Unit,
+    onSave: (PlotArc, newPosition: Int?) -> Unit,
+) {
     var title by remember { mutableStateOf(initial?.title.orEmpty()) }
     var summary by remember { mutableStateOf(initial?.summary.orEmpty()) }
     var count by remember { mutableStateOf((initial?.chapterCount ?: 10).toString()) }
     var status by remember { mutableStateOf(initial?.status ?: "upcoming") }
+    var posStr by remember { mutableStateOf(position?.toString().orEmpty()) }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text(if (initial == null) tx(lang, "新建弧线", "New Arc") else tx(lang, "编辑弧线", "Edit Arc")) },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedTextField(title, { title = it }, label = { Text(tx(lang, "标题", "Title")) }, singleLine = true)
-                OutlinedTextField(summary, { summary = it }, label = { Text(tx(lang, "概述", "Summary")) }, minLines = 3)
+            // Scrollable + capped summary height so a long summary can't squeeze the count field
+            // and status chips off the bottom of the dialog.
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                OutlinedTextField(title, { title = it }, label = { Text(tx(lang, "标题", "Title")) },
+                    singleLine = true, modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(summary, { summary = it }, label = { Text(tx(lang, "概述", "Summary")) },
+                    minLines = 3, maxLines = 8, modifier = Modifier.fillMaxWidth().heightIn(max = 200.dp))
                 OutlinedTextField(count, { count = it.filter { c -> c.isDigit() } },
-                    label = { Text(tx(lang, "章节数", "Chapter count")) }, singleLine = true)
+                    label = { Text(tx(lang, "章节数", "Chapter count")) }, singleLine = true,
+                    modifier = Modifier.fillMaxWidth())
+                if (position != null) {
+                    OutlinedTextField(posStr, { posStr = it.filter { c -> c.isDigit() }.take(3) },
+                        label = { Text(tx(lang, "弧线序号（1-$maxPosition，改后保存即调整顺序）",
+                            "Order (1-$maxPosition, save to reorder)")) },
+                        singleLine = true, modifier = Modifier.fillMaxWidth())
+                }
                 Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    listOf("upcoming", "active", "ending", "completed").forEach { s ->
+                    listOf("upcoming", "active", "completed").forEach { s ->
                         FilterChip(selected = status == s, onClick = { status = s },
                             label = { Text(arcStatusLabel(s, lang)) })
                     }
@@ -959,15 +1093,19 @@ private fun ArcDialog(lang: String, initial: PlotArc?, onDismiss: () -> Unit, on
         },
         confirmButton = {
             TextButton(enabled = title.isNotBlank(), onClick = {
-                onSave(PlotArc(
-                    id = initial?.id ?: "",
-                    title = title, summary = summary,
-                    order = initial?.order ?: 0,
-                    status = status,
-                    chapterCount = count.toIntOrNull() ?: 0,
-                    miniOutline = initial?.miniOutline,
-                    builtChapterIds = initial?.builtChapterIds,
-                ))
+                onSave(
+                    PlotArc(
+                        id = initial?.id ?: "",
+                        title = title, summary = summary,
+                        order = initial?.order ?: 0,
+                        status = status,
+                        chapterCount = count.toIntOrNull() ?: 0,
+                        miniOutline = initial?.miniOutline,
+                        builtChapterIds = initial?.builtChapterIds,
+                        volumeId = initial?.volumeId,
+                    ),
+                    posStr.toIntOrNull(),
+                )
             }) { Text(tx(lang, "保存", "Save")) }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text(tx(lang, "取消", "Cancel")) } },
@@ -976,25 +1114,107 @@ private fun ArcDialog(lang: String, initial: PlotArc?, onDismiss: () -> Unit, on
 
 private fun nextArcStatus(s: String): String = when (s) {
     "upcoming" -> "active"
-    "active" -> "ending"
-    "ending" -> "completed"
-    else -> "upcoming"
+    "completed" -> "upcoming"
+    else -> "completed"   // active (and legacy "ending") → completed
 }
 
 private fun arcStatusLabel(s: String, lang: String): String = when (s) {
     "upcoming" -> tx(lang, "未开始", "Upcoming")
-    "active" -> tx(lang, "进行中", "Active")
-    "ending" -> tx(lang, "结尾阶段", "Ending")
     "completed" -> tx(lang, "已完成", "Completed")
-    else -> s
+    else -> tx(lang, "进行中", "Active")   // active + legacy "ending"
+}
+
+@Composable
+private fun VolumeCard(
+    vol: Volume, number: Int, arcCount: Int, expanded: Boolean, lang: String,
+    onToggle: () -> Unit, onEdit: () -> Unit, onDelete: () -> Unit,
+    onMoveUp: (() -> Unit)?, onMoveDown: (() -> Unit)?,
+    onAiArcs: () -> Unit, onAddArc: () -> Unit,
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = if (expanded) MaterialTheme.colorScheme.primaryContainer
+                             else MaterialTheme.colorScheme.surfaceVariant,
+        ),
+    ) {
+        Column(Modifier.fillMaxWidth().clickable { onToggle() }.padding(horizontal = 12.dp, vertical = 10.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("$number. ${vol.name}", style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(tx(lang, "$arcCount 弧线", "$arcCount arcs"), style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Spacer(Modifier.width(4.dp))
+                Icon(if (expanded) Icons.Outlined.ExpandLess else Icons.Outlined.ExpandMore,
+                    contentDescription = null, modifier = Modifier.size(20.dp))
+            }
+            if (vol.description.isNotBlank()) {
+                Spacer(Modifier.height(4.dp))
+                Text(vol.description, style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = if (expanded) 6 else 2, overflow = TextOverflow.Ellipsis)
+            }
+            if (expanded) {
+                Spacer(Modifier.height(6.dp))
+                Row(
+                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    TextButton(onClick = onAiArcs) {
+                        Icon(Icons.Outlined.AutoAwesome, null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(2.dp)); Text(tx(lang, "AI弧线", "AI arcs"))
+                    }
+                    TextButton(onClick = onAddArc) {
+                        Icon(Icons.Outlined.Add, null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(2.dp)); Text(tx(lang, "加弧线", "Add arc"))
+                    }
+                    TextButton(onClick = onEdit) {
+                        Icon(Icons.Outlined.Edit, null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(2.dp)); Text(tx(lang, "编辑", "Edit"))
+                    }
+                    IconButton(onClick = onMoveUp ?: {}, enabled = onMoveUp != null, modifier = Modifier.size(30.dp)) {
+                        Icon(Icons.Outlined.KeyboardArrowUp, contentDescription = null, modifier = Modifier.size(17.dp))
+                    }
+                    IconButton(onClick = onMoveDown ?: {}, enabled = onMoveDown != null, modifier = Modifier.size(30.dp)) {
+                        Icon(Icons.Outlined.KeyboardArrowDown, contentDescription = null, modifier = Modifier.size(17.dp))
+                    }
+                    IconButton(onClick = onDelete, modifier = Modifier.size(30.dp)) {
+                        Icon(Icons.Outlined.Delete, contentDescription = tx(lang, "删除", "Delete"), modifier = Modifier.size(17.dp))
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun VolumeDialog(lang: String, initial: Volume?, onDismiss: () -> Unit, onSave: (name: String, description: String) -> Unit) {
+    var name by remember { mutableStateOf(initial?.name.orEmpty()) }
+    var desc by remember { mutableStateOf(initial?.description.orEmpty()) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(if (initial == null) tx(lang, "新建副本", "New Volume") else tx(lang, "编辑副本", "Edit Volume")) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(name, { name = it }, label = { Text(tx(lang, "副本名称", "Name")) },
+                    singleLine = true, modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(desc, { desc = it }, label = { Text(tx(lang, "副本描述", "Description")) },
+                    minLines = 3, modifier = Modifier.fillMaxWidth())
+            }
+        },
+        confirmButton = {
+            TextButton(enabled = name.isNotBlank(), onClick = { onSave(name.trim(), desc.trim()) }) { Text(tx(lang, "保存", "Save")) }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text(tx(lang, "取消", "Cancel")) } },
+    )
 }
 
 @Composable
 private fun arcStatusColor(s: String) = when (s) {
-    "active" -> MaterialTheme.colorScheme.primaryContainer
-    "ending" -> MaterialTheme.colorScheme.tertiaryContainer
+    "upcoming" -> MaterialTheme.colorScheme.surface
     "completed" -> MaterialTheme.colorScheme.secondaryContainer
-    else -> MaterialTheme.colorScheme.surface
+    else -> MaterialTheme.colorScheme.primaryContainer   // active + legacy "ending"
 }
 
 @Composable

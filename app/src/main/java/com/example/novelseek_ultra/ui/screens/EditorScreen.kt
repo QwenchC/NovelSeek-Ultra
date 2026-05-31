@@ -264,6 +264,7 @@ fun EditorScreen(
     }
 
     Scaffold(
+        contentWindowInsets = androidx.compose.foundation.layout.WindowInsets(0),
         topBar = {
             AppTopBar(
                 navigationIcon = {
@@ -591,12 +592,6 @@ fun EditorScreen(
                             MaterialTheme.colorScheme.surfaceVariant,
                             MaterialTheme.colorScheme.onSurfaceVariant,
                             tx(lang, "无激活弧线", "No active arc"),
-                        )
-                        activeArc.status == "ending" -> Triple(
-                            MaterialTheme.colorScheme.errorContainer,
-                            MaterialTheme.colorScheme.onErrorContainer,
-                            tx(lang, "⚠ 弧线结尾：${activeArc.title}",
-                               "⚠ Arc ending: ${activeArc.title}"),
                         )
                         else -> Triple(
                             MaterialTheme.colorScheme.secondaryContainer,

@@ -74,6 +74,7 @@ fun ListenScreen(vm: AppViewModel) {
     DisposableEffect(Unit) { onDispose { ab.pauseAndSave() } }
 
     Scaffold(
+        contentWindowInsets = androidx.compose.foundation.layout.WindowInsets(0),
         topBar = {
             AppTopBar(
                 title = { Text(tx(lang, "听书", "Listen"), style = MaterialTheme.typography.titleLarge) },

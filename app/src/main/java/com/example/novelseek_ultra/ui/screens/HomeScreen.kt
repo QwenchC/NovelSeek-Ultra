@@ -15,7 +15,6 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -91,6 +90,7 @@ fun HomeScreen(vm: AppViewModel, onOpen: (projectId: String) -> Unit = {}) {
     }
 
     Scaffold(
+        contentWindowInsets = androidx.compose.foundation.layout.WindowInsets(0),
         topBar = {
             AppTopBar(title = {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -110,7 +110,6 @@ fun HomeScreen(vm: AppViewModel, onOpen: (projectId: String) -> Unit = {}) {
                     onClick = { showCreateDialog = true },
                     icon = { Icon(Icons.Filled.Add, contentDescription = null) },
                     text = { Text(tx(lang, "新建项目", "New Project")) },
-                    modifier = Modifier.offset(y = 24.dp),
                 )
             }
         },

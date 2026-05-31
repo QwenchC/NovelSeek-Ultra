@@ -123,6 +123,23 @@ data class PlotArc(
     val chapterCount: Int = 0,
     val miniOutline: String? = null,
     val builtChapterIds: List<String>? = null,
+    // The 副本 (Volume) this arc belongs to. Null = legacy/un-assigned; migrated into "副本1".
+    val volumeId: String? = null,
+)
+
+/**
+ * 副本 (Volume) — a long-novel container for plot arcs. Volumes are the unit the outline now
+ * produces; each volume holds an ordered list of [PlotArc]s (arcs reference their volume via
+ * [PlotArc.volumeId]; volumes themselves only carry metadata + ordering). Stored in
+ * `volumesByProject`, so version snapshots cover them automatically.
+ */
+@Serializable
+data class Volume(
+    val id: String,
+    val name: String,
+    val description: String = "",
+    val order: Int = 0,
+    val createdAt: String = "",
 )
 
 @Serializable

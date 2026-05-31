@@ -131,7 +131,8 @@ fun EditorScreen(
     val snackbarHost = remember { SnackbarHostState() }
 
     if (chapter == null) {
-        Text(tx(lang, "章节不存在", "Chapter not found"), modifier = Modifier.padding(16.dp))
+        // The chapter was deleted (e.g. by the agent) while open → leave this page automatically.
+        LaunchedEffect(Unit) { onBack() }
         return
     }
 

@@ -2,6 +2,10 @@ package com.example.novelseek_ultra.data
 
 import android.content.Context
 import com.example.novelseek_ultra.data.model.APP_SETTINGS_FIELDS
+import com.example.novelseek_ultra.data.model.AgentIndex
+import com.example.novelseek_ultra.data.model.AgentSession
+import com.example.novelseek_ultra.data.model.AgentSessionMeta
+import com.example.novelseek_ultra.data.model.AgentStep
 import com.example.novelseek_ultra.data.model.BackupBundle
 import com.example.novelseek_ultra.data.model.BackupSummary
 import com.example.novelseek_ultra.data.model.Chapter
@@ -906,6 +910,64 @@ class AppRepository(context: Context) {
     fun clearNovelChat(projectId: String) {
         novelChatFile(projectId).delete()
         _novelChatRevision.value += 1
+    }
+
+    // ── Agent (智能体) name ───────────────────────────────────────────────────
+
+    fun activeTextModelProfileId(): String? =
+        (_state.value["activeTextModelProfileId"] as? JsonPrimitive)?.contentOrNull
+
+    fun agentName(): String = (_state.value["agentName"] as? JsonPrimitive)?.contentOrNull.orEmpty()
+    fun setAgentName(name: String) = mutateState { it.with("agentName", JsonPrimitive(name)) }
+
+    // ── Agent multi-session persistence (index + per-session files) ───────────
+
+    private val agentDir: File get() = File(appContext.filesDir, "agent")
+    private val agentIndexFile: File get() = File(agentDir, "index.json")
+    private fun agentSessionFile(id: String): File = File(agentDir, "sessions/$id.json")
+
+    fun loadAgentIndex(): AgentIndex {
+        migrateLegacyAgentSession()
+        val f = agentIndexFile
+        if (!f.exists()) return AgentIndex()
+        return runCatching { JSON.decodeFromString(AgentIndex.serializer(), f.readText()) }.getOrDefault(AgentIndex())
+    }
+
+    fun saveAgentIndex(index: AgentIndex) {
+        if (!agentDir.exists()) agentDir.mkdirs()
+        agentIndexFile.writeText(JSON.encodeToString(AgentIndex.serializer(), index))
+    }
+
+    fun loadAgentSessionById(id: String): AgentSession? {
+        val f = agentSessionFile(id)
+        if (!f.exists()) return null
+        return runCatching { JSON.decodeFromString(AgentSession.serializer(), f.readText()) }.getOrNull()
+    }
+
+    fun saveAgentSessionById(session: AgentSession) {
+        val dir = File(agentDir, "sessions")
+        if (!dir.exists()) dir.mkdirs()
+        agentSessionFile(session.id).writeText(JSON.encodeToString(AgentSession.serializer(), session))
+    }
+
+    fun deleteAgentSessionById(id: String) {
+        agentSessionFile(id).delete()
+    }
+
+    /** One-time migration of the old single `agent/session.json` into the new multi-session store. */
+    private fun migrateLegacyAgentSession() {
+        val old = File(agentDir, "session.json")
+        if (!old.exists() || agentIndexFile.exists()) return
+        val obj = runCatching { JSON.parseToJsonElement(old.readText()).jsonObject }.getOrNull()
+        val steps = (obj?.get("steps"))?.let {
+            runCatching { JSON.decodeFromJsonElement(ListSerializer(AgentStep.serializer()), it) }.getOrNull()
+        } ?: emptyList()
+        val locked = (obj?.get("activeProjectId") as? JsonPrimitive)?.contentOrNull
+        val s = AgentSession(id = "sess-${System.currentTimeMillis()}", title = "会话 1", createdAt = nowIso(),
+            steps = steps, lockedProjectId = locked)
+        saveAgentSessionById(s)
+        saveAgentIndex(AgentIndex(currentId = s.id, items = listOf(AgentSessionMeta(s.id, s.title, s.createdAt))))
+        old.delete()
     }
 
     // ── Audiobook (听书) reading progress + voice prefs ───────────────────────

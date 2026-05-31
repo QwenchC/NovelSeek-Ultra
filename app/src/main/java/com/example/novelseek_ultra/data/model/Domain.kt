@@ -49,6 +49,9 @@ data class Chapter(
     val status: String = "draft",
     val created_at: String = "",
     val updated_at: String = "",
+    // The 剧情弧线 (PlotArc) this chapter belongs to; its 副本 is that arc's volumeId. Lets the
+    // agent (and UI) walk chapter → arc → volume. Null for un-assigned/manual chapters.
+    val arcId: String? = null,
 )
 
 @Serializable

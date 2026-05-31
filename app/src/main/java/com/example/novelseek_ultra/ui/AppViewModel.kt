@@ -19,6 +19,7 @@ import com.example.novelseek_ultra.data.model.ContainerEntry
 import com.example.novelseek_ultra.data.model.CoverImageConfig
 import com.example.novelseek_ultra.data.model.CoverImageItem
 import com.example.novelseek_ultra.data.model.CultivationRealm
+import com.example.novelseek_ultra.data.model.CultivationSubRealm
 import com.example.novelseek_ultra.data.model.EmbeddingConfig
 import com.example.novelseek_ultra.data.model.EntityPayload
 import com.example.novelseek_ultra.data.model.Illustration
@@ -53,6 +54,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     /** Audiobook (听书) playback engine — observed directly by the listen screen. */
     val audiobook = com.example.novelseek_ultra.data.audio.AudiobookController(application, repo, viewModelScope)
+
+    /** Autonomous agent (智能体) — drives the app's operations via tool calls. */
+    val agent = com.example.novelseek_ultra.agent.AgentController(this, repo, viewModelScope, application)
 
     // ── observable state ───────────────────────────────────────────────────
 
@@ -110,6 +114,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     override fun onCleared() {
         audiobook.release()
+        agent.stop()
         super.onCleared()
     }
 
@@ -205,6 +210,56 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun setChapters(projectId: String, chapters: List<Chapter>) = repo.setChapters(projectId, chapters)
     fun upsertChapter(projectId: String, ch: Chapter) = repo.upsertChapter(projectId, ch)
     fun deleteChapter(projectId: String, chapterId: String) = repo.deleteChapter(projectId, chapterId)
+
+    /** Delete a chapter and clean up its references (arc.builtChapterIds + KB/summary/entities). */
+    fun deleteChapterFully(projectId: String, chapterId: String) {
+        repo.setPlotArcs(projectId, repo.plotArcs(projectId).map { a ->
+            if (a.builtChapterIds?.contains(chapterId) == true)
+                a.copy(builtChapterIds = a.builtChapterIds.filterNot { it == chapterId }) else a
+        })
+        forgetKbForChapter(projectId, chapterId)
+        repo.deleteChapter(projectId, chapterId)
+    }
+
+    /** Resolve a chapter's arc id (explicit, else inferred from any arc's builtChapterIds). */
+    fun chapterArcId(projectId: String, chapter: Chapter): String? =
+        chapter.arcId ?: repo.plotArcs(projectId).firstOrNull { it.builtChapterIds?.contains(chapter.id) == true }?.id
+
+    /** Move a chapter to [newPos1Based] (1-based) in the chapter list, renumbering order_index 1..n. */
+    fun moveChapterToPosition(projectId: String, chapterId: String, newPos1Based: Int) {
+        val list = repo.chapters(projectId).sortedBy { it.order_index }.toMutableList()
+        val idx = list.indexOfFirst { it.id == chapterId }
+        if (idx < 0) return
+        val target = newPos1Based.coerceIn(1, list.size) - 1
+        if (target == idx) return
+        val moved = list.removeAt(idx)
+        list.add(target, moved)
+        repo.setChapters(projectId, list.mapIndexed { i, c -> c.copy(order_index = i + 1) })
+    }
+
+    /** Build the cultivation-realm system from a JSON array (agent tool). Returns realm count. */
+    fun agentSetRealmsFromJson(projectId: String, jsonText: String): Int {
+        val s = jsonText.replace(Regex("```(?:json)?\\s*"), "").replace("```", "").trim()
+        val start = s.indexOf('['); val end = s.lastIndexOf(']')
+        if (start < 0 || end <= start) return 0
+        val arr = runCatching { Json { ignoreUnknownKeys = true }.parseToJsonElement(s.substring(start, end + 1)).jsonArray }
+            .getOrNull() ?: return 0
+        val ts = System.currentTimeMillis()
+        fun str(o: kotlinx.serialization.json.JsonObject, k: String) =
+            (o[k] as? kotlinx.serialization.json.JsonPrimitive)?.content?.trim()
+        val realms = arr.mapIndexedNotNull { i, el ->
+            val o = el.jsonObject
+            val name = str(o, "name").orEmpty(); if (name.isBlank()) return@mapIndexedNotNull null
+            val subs = (o["subRealms"] as? kotlinx.serialization.json.JsonArray)?.mapIndexedNotNull { j, se ->
+                val so = se.jsonObject
+                val sn = str(so, "name").orEmpty(); if (sn.isBlank()) return@mapIndexedNotNull null
+                CultivationSubRealm(id = "sub-$ts-$i-$j", order = j, name = sn, description = str(so, "description"))
+            }?.ifEmpty { null }
+            CultivationRealm(id = "realm-$ts-$i", order = i, name = name, description = str(o, "description"), subRealms = subs)
+        }
+        repo.setCultivationRealms(projectId, realms)
+        return realms.size
+    }
     fun chapterBody(chapterId: String): AppRepository.ChapterBody = repo.chapterBody(chapterId)
     fun saveChapterBody(chapterId: String, body: AppRepository.ChapterBody) = repo.saveChapterBody(chapterId, body)
 
@@ -306,6 +361,19 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         volArcs.add(target, moved)
         val byId = volArcs.mapIndexed { i, a -> a.id to a.copy(order = orderSlots[i]) }.toMap()
         repo.setPlotArcs(projectId, all.map { byId[it.id] ?: it })
+    }
+
+    /** Move a volume to [newPos1Based] (1-based) among the project's volumes. */
+    fun moveVolumeToPosition(projectId: String, volumeId: String, newPos1Based: Int) {
+        val vols = repo.volumes(projectId).sortedBy { it.order }.toMutableList()
+        val idx = vols.indexOfFirst { it.id == volumeId }
+        if (idx < 0) return
+        val target = newPos1Based.coerceIn(1, vols.size) - 1
+        if (target == idx) return
+        val slots = vols.map { it.order }
+        val moved = vols.removeAt(idx)
+        vols.add(target, moved)
+        repo.setVolumes(projectId, vols.mapIndexed { i, v -> v.copy(order = slots[i]) })
     }
 
     /** Swap a volume with its neighbour (reorder). */
@@ -633,6 +701,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 outline_goal = goal,
                 created_at = now,
                 updated_at = now,
+                arcId = arcId,
             )
         }
         newChapters.forEach { ch -> repo.upsertChapter(projectId, ch) }
@@ -1175,6 +1244,196 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             val summary = (o["summary"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.trim().orEmpty()
             val cc = (o["chapter_count"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.toIntOrNull() ?: 10
             ParsedArc(title, summary, cc, null)
+        }
+    }.getOrDefault(emptyList())
+
+    // ── Agent AI primitives — blocking (suspend) variants that return results ───
+    // These let the AgentController perform AI operations deterministically (await completion +
+    // get the result), reusing the same prompts/context builders as the interactive UI flows.
+
+    /** Raw chat call on the active text model — the agent's reasoning step. Throws on network /
+     *  HTTP / timeout errors so the caller can retry and surface the real cause. */
+    suspend fun agentChat(messages: List<ChatMessage>): String? {
+        val cfg = repo.activeTextModelConfig(); if (!cfg.isValid()) return null
+        return withContext(Dispatchers.IO) { ai.chat(cfg, messages) }
+    }
+
+    fun agentTextModelReady(): Boolean = repo.activeTextModelConfig().isValid()
+
+    fun agentName(): String = repo.agentName()
+    fun setAgentName(name: String) = repo.setAgentName(name)
+    fun activeTextModelProfileId(): String? = repo.activeTextModelProfileId()
+
+    /** Collect a streaming completion, reporting the cumulative text via [onDelta]. */
+    private suspend fun streamCollect(
+        cfg: TextModelConfig,
+        messages: List<ChatMessage>,
+        onDelta: (String) -> Unit,
+    ): String {
+        val sb = StringBuilder()
+        ai.streamChat(cfg, messages).collect { ev ->
+            when (ev) {
+                is AiService.StreamEvent.Delta -> { sb.append(ev.text); onDelta(sb.toString()) }
+                else -> {}
+            }
+        }
+        return sb.toString().trim()
+    }
+
+    suspend fun agentGenerateOutline(projectId: String, onDelta: (String) -> Unit = {}): String? {
+        val cfg = repo.activeTextModelConfig(); if (!cfg.isValid()) return null
+        val p = repo.project(projectId) ?: return null
+        val lang = _uiLanguage.value
+        return withContext(Dispatchers.IO) {
+            val realmCtx = buildRealmSystemContext(repo.cultivationRealms(projectId), lang).ifBlank { null }
+            val messages = listOf(
+                ChatMessage("system", Prompts.outlineSystem(lang, isLong = true)),
+                ChatMessage("user", Prompts.outlineUser(
+                    p.title, p.genre.orEmpty(), p.description.orEmpty(), null, null, lang,
+                    isLong = true, realmContext = realmCtx,
+                    existingWorld = repo.worldSetting(projectId).ifBlank { null },
+                    existingTimeline = repo.timeline(projectId).ifBlank { null },
+                    existingVolumes = null,
+                    charactersInfo = buildCharactersInfo(projectId),
+                )),
+            )
+            val out = runCatching { streamCollect(cfg, messages, onDelta) }.getOrNull()?.takeIf { it.isNotEmpty() }
+            if (out != null) repo.setOutline(projectId, out)
+            out
+        }
+    }
+
+    suspend fun agentGenerateChapterText(projectId: String, chapterId: String, onDelta: (String) -> Unit = {}): String? {
+        val cfg = repo.activeTextModelConfig(); if (!cfg.isValid()) return null
+        val chapter = repo.chapters(projectId).firstOrNull { it.id == chapterId } ?: return null
+        val lang = _uiLanguage.value
+        return withContext(Dispatchers.IO) {
+            val arcContext = buildArcContext(repo.plotArcs(projectId), lang)
+            val realmCtx = buildRealmSystemContext(repo.cultivationRealms(projectId), lang)
+            val worldRaw = repo.worldSetting(projectId).ifBlank { repo.outline(projectId) }
+            val worldSetting = listOfNotNull(arcContext.ifBlank { null }, realmCtx.ifBlank { null }, worldRaw.ifBlank { null })
+                .joinToString("\n\n").ifBlank { null }
+            val kbAug = buildKbAugmentation(projectId, chapter, lang)
+            val messages = listOf(
+                ChatMessage("system", Prompts.chapterSystem(lang)),
+                ChatMessage("user", Prompts.chapterUser(
+                    chapterTitle = chapter.title,
+                    outlineGoal = chapter.outline_goal.orEmpty(),
+                    conflict = chapter.conflict,
+                    prevSummary = buildPreviousChapterSummary(projectId, chapter.order_index).ifBlank { null },
+                    currentContent = null,
+                    chapterList = buildChapterList(projectId, chapter.id).ifBlank { null },
+                    charactersInfo = buildCharactersInfo(projectId),
+                    worldSetting = worldSetting,
+                    timeline = repo.timeline(projectId).ifBlank { null },
+                    targetWords = TARGET_WORDS,
+                    isContinuation = false,
+                    language = lang,
+                    kbAugmentation = kbAug,
+                )),
+            )
+            val text = runCatching { streamCollect(cfg, messages, onDelta) }.getOrNull()?.takeIf { it.isNotEmpty() }
+            if (text != null) {
+                repo.saveChapterBody(chapterId, repo.chapterBody(chapterId).copy(final = text))
+                repo.upsertChapter(projectId, chapter.copy(word_count = countWords(text), updated_at = nowIso(), status = "review"))
+                onChapterSaved(projectId, chapterId, chapter.title, text)
+            }
+            text
+        }
+    }
+
+    suspend fun agentReviseChapter(projectId: String, chapterId: String, instruction: String, onDelta: (String) -> Unit = {}): String? {
+        val cfg = repo.activeTextModelConfig(); if (!cfg.isValid()) return null
+        val chapter = repo.chapters(projectId).firstOrNull { it.id == chapterId } ?: return null
+        val body = repo.chapterBody(chapterId)
+        val src = body.final.ifBlank { body.draft }
+        if (src.isBlank()) return null
+        return withContext(Dispatchers.IO) {
+            val messages = listOf(
+                ChatMessage("system", "你是资深小说编辑。请按用户要求修改给定章节正文，只输出修改后的完整正文，不要任何解释或标记。"),
+                ChatMessage("user", "原文：\n$src\n\n修改要求：$instruction"),
+            )
+            val out = runCatching { streamCollect(cfg, messages, onDelta) }.getOrNull()?.takeIf { it.isNotEmpty() }
+            if (out != null) {
+                repo.saveChapterBody(chapterId, body.copy(final = out))
+                repo.upsertChapter(projectId, chapter.copy(word_count = countWords(out), updated_at = nowIso()))
+                onChapterSaved(projectId, chapterId, chapter.title, out)
+            }
+            out
+        }
+    }
+
+    suspend fun agentAnswerQuestion(projectId: String, question: String): String {
+        val cfg = repo.activeTextModelConfig(); if (!cfg.isValid()) return "（未配置文本模型）"
+        val lang = _uiLanguage.value
+        return withContext(Dispatchers.IO) {
+            val ctx = runCatching { buildNovelQaContext(projectId, question, lang) }.getOrDefault("")
+            val messages = listOf(
+                ChatMessage("system", novelQaSystemPrompt(lang)),
+                ChatMessage("user", "【小说资料】\n${ctx.ifBlank { "（暂无资料）" }}\n\n【问题】\n$question"),
+            )
+            runCatching { ai.chat(cfg, messages) }.getOrNull()?.trim() ?: "（检索失败）"
+        }
+    }
+
+    /** Plan [count] chapters for an arc (AI → JSON), then create them via [addChaptersBatch]. */
+    suspend fun agentPlanArcChapters(projectId: String, arcId: String, count: Int): Int {
+        val cfg = repo.activeTextModelConfig(); if (!cfg.isValid()) return 0
+        val arc = repo.plotArcs(projectId).firstOrNull { it.id == arcId } ?: return 0
+        val lang = _uiLanguage.value
+        return withContext(Dispatchers.IO) {
+            val ctx = buildString {
+                repo.outline(projectId).takeIf { it.isNotBlank() }?.let { append("【大纲】\n"); append(it.take(2000)) }
+                buildRealmSystemContext(repo.cultivationRealms(projectId), lang).takeIf { it.isNotBlank() }
+                    ?.let { if (isNotEmpty()) append("\n\n"); append(it) }
+            }
+            val messages = listOf(
+                ChatMessage("system", "你为某条剧情弧线规划具体章节。只输出 JSON 数组：[{\"title\":\"章节名\",\"goal\":\"本章目标(1-2句)\"}]，不要任何其它文字。"),
+                ChatMessage("user", "弧线：${arc.title}\n${arc.summary}\n请规划 $count 个章节。\n参考资料：\n$ctx"),
+            )
+            val reply = runCatching { ai.chat(cfg, messages) }.getOrNull() ?: return@withContext 0
+            val items = parseChapterPlanArray(reply)
+            if (items.isNotEmpty()) withContext(Dispatchers.Main) { addChaptersBatch(projectId, arcId, items) }
+            items.size
+        }
+    }
+
+    /** Review the project's chapters for contradictions / logic errors (streaming). */
+    suspend fun agentReviewConsistency(projectId: String, onDelta: (String) -> Unit = {}): String? {
+        val cfg = repo.activeTextModelConfig(); if (!cfg.isValid()) return null
+        val lang = _uiLanguage.value
+        return withContext(Dispatchers.IO) {
+            val chapters = repo.chapters(projectId).sortedBy { it.order_index }
+            if (chapters.isEmpty()) return@withContext "（暂无章节，无法审阅）"
+            val sums = repo.summaries(projectId)
+            val lines = chapters.joinToString("\n") { ch ->
+                val sum = sums.firstOrNull { it.scopeType == "chapter" && it.scopeId == ch.id }?.summaryText?.takeIf { it.isNotBlank() }
+                val body = sum ?: repo.chapterBody(ch.id).let { it.final.ifBlank { it.draft } }.take(180)
+                "第${ch.order_index}章《${ch.title}》：${body.ifBlank { "(空)" }}"
+            }
+            val chars = buildCharactersInfo(projectId).orEmpty()
+            val realm = buildRealmSystemContext(repo.cultivationRealms(projectId), lang)
+            val messages = listOf(
+                ChatMessage("system", "你是严谨的小说审校。请找出章节之间的前后矛盾、逻辑谬误、人物/设定/境界不一致之处。逐条列出，每条注明涉及章节与具体问题，按严重程度排序；若整体无明显问题也请说明。"),
+                ChatMessage("user", buildString {
+                    if (chars.isNotBlank()) appendLine("【角色】\n$chars\n")
+                    if (realm.isNotBlank()) appendLine("【境界体系】\n$realm\n")
+                    appendLine("【各章梗概/节选】\n$lines")
+                }),
+            )
+            runCatching { streamCollect(cfg, messages, onDelta) }.getOrNull()?.takeIf { it.isNotEmpty() } ?: "（审阅失败）"
+        }
+    }
+
+    private fun parseChapterPlanArray(raw: String): List<Pair<String, String?>> = runCatching {
+        val s = raw.replace(Regex("```(?:json)?\\s*"), "").replace("```", "").trim()
+        val start = s.indexOf('['); val end = s.lastIndexOf(']')
+        if (start < 0 || end <= start) return emptyList()
+        Json { ignoreUnknownKeys = true }.parseToJsonElement(s.substring(start, end + 1)).jsonArray.mapNotNull { el ->
+            val o = el.jsonObject
+            val title = (o["title"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.trim().orEmpty()
+            if (title.isBlank()) return@mapNotNull null
+            title to (o["goal"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.trim()
         }
     }.getOrDefault(emptyList())
 

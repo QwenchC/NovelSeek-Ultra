@@ -77,7 +77,7 @@
   - 内置连接测试按钮
 
 ### ⚙️ 设置
-- 配置 AI 服务的 API Key 与 Base URL（默认接入 Pollinations）；各 API 配置区附带获取地址超链接
+- 配置 AI 服务的 API Key 与 Base URL；各 API 配置区附带获取地址超链接
 - 选择图片生成引擎：Pollinations（云端）或 ComfyUI（本地）
 - 密钥本地加密存储（Android Keystore + `security-crypto`）
 - **数据备份/恢复**：完整导出/导入全部内容——项目、章节正文与草稿、章节插图、大纲/世界观/时间线、角色、副本与弧线、容器、摘要/实体、小说问答记录等（向量索引可重建，故不入备份）
@@ -195,11 +195,7 @@ cd NovelSeek-Ultra
 在**文本模型配置**区块，点击 **「+ 添加」** 新建 API 配置：
 
 - **API Base URL**：AI 文本服务地址（例如 `https://api.deepseek.com`）
-<<<<<<< HEAD
 - **API Key**：服务密钥（DeepSeek密钥获取地址`https://platform.deepseek.com/api_keys`）
-=======
-- **API Key**：服务密钥
->>>>>>> c22f16719c2739c0db0e8c3d6ca127875713dea0
 - **模型名称**：填写你使用的模型 ID
 
 填写后点击**测试连接**，出现绿色成功提示则配置正确。

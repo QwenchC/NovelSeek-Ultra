@@ -8,10 +8,12 @@ import com.example.novelseek_ultra.data.model.AgentIndex
 import com.example.novelseek_ultra.data.model.AgentSession
 import com.example.novelseek_ultra.data.model.AgentSessionMeta
 import com.example.novelseek_ultra.data.model.AgentStep
+import com.example.novelseek_ultra.data.model.ChapterPromo
 import com.example.novelseek_ultra.data.model.Container
 import com.example.novelseek_ultra.data.model.ContainerEntry
 import com.example.novelseek_ultra.data.model.CoverImageItem
 import com.example.novelseek_ultra.data.model.CultivationRealm
+import com.example.novelseek_ultra.data.model.Illustration
 import com.example.novelseek_ultra.data.model.Project
 import com.example.novelseek_ultra.data.nowIso
 import com.example.novelseek_ultra.ui.AppViewModel
@@ -378,12 +380,24 @@ class AgentController(
 
     // ── persistence ───────────────────────────────────────────────────────────
 
-    private fun addStep(type: String, text: String, tool: String = ""): String {
-        val step = AgentStep("a-${System.nanoTime()}", type, text, tool, nowIso())
+    private fun addStep(type: String, text: String, tool: String = "", image: String = ""): String {
+        val step = AgentStep("a-${System.nanoTime()}", type, text, tool, nowIso(), image)
         _steps.value = _steps.value + step
         // Keep the foreground notification's text current while running.
         if (_status.value == Status.RUNNING) AgentForegroundService.update(appContext, text.take(50))
         return step.id
+    }
+
+    /** Persist generated image bytes to a preview file and add an image bubble to the chain. */
+    private fun addImageStep(label: String, bytes: ByteArray) {
+        val dir = java.io.File(appContext.filesDir, "agent_images").apply { if (!exists()) mkdirs() }
+        val file = java.io.File(dir, "img-${System.currentTimeMillis()}.png")
+        runCatching { file.writeBytes(bytes) }
+        addStep(AgentStep.IMAGE, label, image = file.absolutePath)
+    }
+
+    private fun addImageStepFromBase64(label: String, b64: String) {
+        runCatching { Base64.decode(b64, Base64.NO_WRAP) }.getOrNull()?.let { addImageStep(label, it) }
     }
 
     private fun replaceStepText(id: String, newText: String) {
@@ -469,6 +483,13 @@ class AgentController(
             val out = vm.agentGenerateOutline(id) { _streamingText.value = it } ?: return@AgentTool "大纲生成失败"
             "已生成大纲（${out.length} 字符）。节选：${out.take(150)}…"
         },
+        AgentTool("extract_characters_from_chapter", "从某章正文识别并把新出场的角色同步到角色管理（剧情推进新增角色时用）。args: projectId?, chapterId") { a ->
+            val id = pid(a) ?: return@AgentTool "无聚焦项目"
+            val cid = a.str("chapterId") ?: return@AgentTool "缺少 chapterId"
+            if (repo.chapters(id).none { it.id == cid }) return@AgentTool "未找到章节"
+            val added = vm.agentExtractCharactersFromChapter(id, cid)
+            if (added.isEmpty()) "本章未发现需要新增的角色" else "已新增 ${added.size} 个角色：${added.joinToString("、")}"
+        },
         AgentTool("import_characters_from_outline", "从大纲识别并导入角色。args: projectId?") { a ->
             val id = pid(a) ?: return@AgentTool "无聚焦项目"
             suspendCancellableCoroutine { cont ->
@@ -489,18 +510,21 @@ class AgentController(
             repo.setCharacters(id, repo.characters(id) + withId)
             "已创建角色：${c.name}"
         },
-        AgentTool("generate_portrait", "为角色生成立绘。args: projectId?, character(姓名或id)", sensitive = true) { a ->
+        AgentTool("generate_portrait", "为角色生成立绘（可传 prompt 自定义画面，否则用角色形象）。args: projectId?, character(姓名或id), prompt?", sensitive = true) { a ->
             val id = pid(a) ?: return@AgentTool "无聚焦项目"
             val key = a.str("character") ?: return@AgentTool "缺少 character"
             val ch = repo.characters(id).firstOrNull { it.id == key || it.name == key } ?: return@AgentTool "未找到角色"
-            val prompt = (ch.portraitPrompt?.takeIf { it.isNotBlank() } ?: ch.appearance.takeIf { it.isNotBlank() })
-                ?: return@AgentTool "该角色暂无外貌描述，无法生成立绘"
+            val prompt = a.str("prompt")
+                ?: ch.portraitPrompt?.takeIf { it.isNotBlank() } ?: ch.appearance.takeIf { it.isNotBlank() }
+                ?: return@AgentTool "该角色暂无外貌描述，请提供 prompt 或先补充形象"
             val bytes = vm.generatePortraitImage(prompt) ?: return@AgentTool "立绘生成失败"
-            val b64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
-            repo.setCharacters(id, repo.characters(id).map { if (it.id == ch.id) it.copy(portraitBase64 = b64) else it })
+            repo.setCharacters(id, repo.characters(id).map {
+                if (it.id == ch.id) it.copy(portraitBase64 = Base64.encodeToString(bytes, Base64.NO_WRAP)) else it
+            })
+            addImageStep("${ch.name} 立绘", bytes)
             "已为 ${ch.name} 生成立绘"
         },
-        AgentTool("generate_cover", "为项目生成封面。args: projectId?, prompt?", sensitive = true) { a ->
+        AgentTool("generate_cover", "为项目生成封面（可传 prompt 自定义画面，否则按项目信息默认生成）。args: projectId?, prompt?", sensitive = true) { a ->
             val id = pid(a) ?: return@AgentTool "无聚焦项目"
             val p = repo.project(id) ?: return@AgentTool "项目不存在"
             val prompt = a.str("prompt") ?: "${p.genre.orEmpty()} ${p.title} cover art, ${p.description.orEmpty()}"
@@ -508,7 +532,8 @@ class AgentController(
             val item = CoverImageItem(id = "cover-${System.currentTimeMillis()}",
                 name = "AI 封面", imageBase64 = Base64.encodeToString(bytes, Base64.NO_WRAP), prompt = prompt, createdAt = nowIso())
             repo.setCoverImages(id, repo.getCoverImages(id) + item, item.id)
-            "已生成封面"
+            addImageStep("项目封面", bytes)
+            "已生成封面并设为默认"
         },
         AgentTool("create_volume", "新建副本。args: projectId?, name, description?") { a ->
             val id = pid(a) ?: return@AgentTool "无聚焦项目"
@@ -564,17 +589,66 @@ class AgentController(
             val b = repo.chapterBody(cid); val t = b.final.ifBlank { b.draft }
             if (t.isBlank()) "（该章暂无正文）" else "长度 ${t.length}；节选：${t.take(300)}…"
         },
-        AgentTool("generate_chapter", "为某章生成正文。args: projectId?, chapterId", sensitive = true) { a ->
+        AgentTool("refine_chapter_plan", "生成正文前先细化本章规划（目标/核心冲突）——批量建的空白章规划很粗糙，写前先勘误细化。args: projectId?, chapterId", sensitive = true) { a ->
+            val id = pid(a) ?: return@AgentTool "无聚焦项目"
+            val cid = a.str("chapterId") ?: return@AgentTool "缺少 chapterId"
+            if (repo.chapters(id).none { it.id == cid }) return@AgentTool "未找到章节"
+            vm.agentRefineChapterPlan(id, cid)?.let { "已细化章节规划——\n$it" } ?: "细化失败"
+        },
+        AgentTool("generate_chapter", "为某章生成正文（建议先 refine_chapter_plan 细化规划）。args: projectId?, chapterId", sensitive = true) { a ->
             val id = pid(a) ?: return@AgentTool "无聚焦项目"
             val cid = a.str("chapterId") ?: return@AgentTool "缺少 chapterId"
             val text = vm.agentGenerateChapterText(id, cid) { _streamingText.value = it } ?: return@AgentTool "章节生成失败"
             "已生成正文（${text.length} 字符）。开头：${text.take(80)}…"
         },
-        AgentTool("revise_chapter", "按要求润色/修改某章正文。args: projectId?, chapterId, instruction", sensitive = true) { a ->
+        AgentTool("revise_chapter", "按要求润色/修改某章正文（AI 整章重写）。小问题请优先用 read_chapter + replace_in_chapter 局部修改。args: projectId?, chapterId, instruction", sensitive = true) { a ->
             val id = pid(a) ?: return@AgentTool "无聚焦项目"
             val cid = a.str("chapterId") ?: return@AgentTool "缺少 chapterId"
             val ins = a.str("instruction") ?: return@AgentTool "缺少 instruction"
             vm.agentReviseChapter(id, cid, ins) { _streamingText.value = it }?.let { "已润色（${it.length} 字符）" } ?: "润色失败"
+        },
+        AgentTool("read_chapter", "读取某章完整正文（用于定位要局部修改的原文片段）。args: projectId?, chapterId") { a ->
+            val id = pid(a) ?: return@AgentTool "无聚焦项目"
+            val cid = a.str("chapterId") ?: return@AgentTool "缺少 chapterId"
+            if (repo.chapters(id).none { it.id == cid }) return@AgentTool "未找到章节"
+            val b = repo.chapterBody(cid); val t = b.final.ifBlank { b.draft }
+            if (t.isBlank()) "（该章暂无正文）"
+            else if (t.length > 8000) t.take(8000) + "\n…（已截断，共 ${t.length} 字符；如需后半段请告知）" else t
+        },
+        AgentTool("replace_in_chapter", "局部修改：把某章正文中的一段原文精确替换为新文本（不重写整章）。先用 read_chapter 拿到准确原文。args: projectId?, chapterId, find(要替换的原文片段，需逐字一致), replace(新文本；留空=删除)", sensitive = true) { a ->
+            val id = pid(a) ?: return@AgentTool "无聚焦项目"
+            val cid = a.str("chapterId") ?: return@AgentTool "缺少 chapterId"
+            val find = a.str("find") ?: return@AgentTool "缺少 find"
+            val replace = a["replace"]?.let { (it as? JsonPrimitive)?.contentOrNull } ?: ""
+            val b = repo.chapterBody(cid); val text = b.final.ifBlank { b.draft }
+            if (!text.contains(find)) return@AgentTool "未在正文中找到该片段，请先用 read_chapter 复制逐字一致的原文"
+            val count = text.split(find).size - 1
+            vm.agentApplyChapterText(id, cid, text.replace(find, replace))
+            "已替换 $count 处"
+        },
+        AgentTool("edit_paragraph", "局部修改：用新文本替换某章的第 N 段（按非空行计数）。args: projectId?, chapterId, paragraphIndex(从1开始), newText") { a ->
+            val id = pid(a) ?: return@AgentTool "无聚焦项目"
+            val cid = a.str("chapterId") ?: return@AgentTool "缺少 chapterId"
+            val idx = a.intOr("paragraphIndex", 0); if (idx < 1) return@AgentTool "paragraphIndex 需≥1"
+            val newText = a.str("newText") ?: return@AgentTool "缺少 newText"
+            val b = repo.chapterBody(cid); val text = b.final.ifBlank { b.draft }
+            if (text.isBlank()) return@AgentTool "该章暂无正文"
+            val lines = text.split("\n").toMutableList()
+            var count = 0; var target = -1
+            for (i in lines.indices) if (lines[i].isNotBlank()) { count++; if (count == idx) { target = i; break } }
+            if (target < 0) return@AgentTool "未找到第 $idx 段（共 $count 段）"
+            lines[target] = newText
+            vm.agentApplyChapterText(id, cid, lines.joinToString("\n"))
+            "已替换第 $idx 段"
+        },
+        AgentTool("list_paragraphs", "列出某章各段落（带序号，便于定位局部修改）。args: projectId?, chapterId") { a ->
+            val id = pid(a) ?: return@AgentTool "无聚焦项目"
+            val cid = a.str("chapterId") ?: return@AgentTool "缺少 chapterId"
+            val b = repo.chapterBody(cid); val text = b.final.ifBlank { b.draft }
+            if (text.isBlank()) return@AgentTool "（该章暂无正文）"
+            text.split("\n").filter { it.isNotBlank() }.mapIndexed { i, p ->
+                "段${i + 1}：${if (p.length > 120) p.take(120) + "…" else p}"
+            }.joinToString("\n")
         },
         AgentTool("create_container", "新建资料容器。args: projectId?, name, type(by_character|by_chapter|single), autoUpdate?, affectsGeneration?") { a ->
             val id = pid(a) ?: return@AgentTool "无聚焦项目"
@@ -697,17 +771,39 @@ class AgentController(
             val id = pid(a) ?: return@AgentTool "无聚焦项目"
             vm.agentReviewConsistency(id) { _streamingText.value = it } ?: "审阅失败"
         },
-        AgentTool("generate_promo", "为某章生成推文（摘要 + 配图）。args: projectId?, chapterId", sensitive = true) { a ->
+        AgentTool("generate_promo", "为某章生成推文配图。给 prompt 则用自定义画面直接生成并应用；不给则用默认机制（AI 依正文出图）。args: projectId?, chapterId, prompt?", sensitive = true) { a ->
             val id = pid(a) ?: return@AgentTool "无聚焦项目"
             val cid = a.str("chapterId") ?: return@AgentTool "缺少 chapterId"
             val ch = repo.chapters(id).firstOrNull { it.id == cid } ?: return@AgentTool "未找到章节"
+            val custom = a.str("prompt")
+            if (custom != null) {
+                val bytes = vm.generatePortraitImage(custom, 1024, 1024) ?: return@AgentTool "推文配图生成失败"
+                repo.setChapterPromo(cid, ChapterPromo(imagePrompt = custom,
+                    summary = repo.getChapterPromo(cid)?.summary.orEmpty(), imageBase64 = Base64.encodeToString(bytes, Base64.NO_WRAP)))
+                addImageStep("推文配图", bytes)
+                return@AgentTool "已用自定义提示词生成并应用推文配图"
+            }
             val body = repo.chapterBody(cid); val content = body.final.ifBlank { body.draft }
-            if (content.length < 100) return@AgentTool "章节内容太少，无法生成推文"
+            if (content.length < 100) return@AgentTool "章节内容太少，无法用默认机制生成推文"
             suspendCancellableCoroutine { cont ->
                 vm.generateChapterPromo(cid, ch.title, content, null, "zimage", 1024, 1024) { promo, err ->
+                    if (promo != null) promo.imageBase64?.let { addImageStepFromBase64("推文配图", it) }
                     if (cont.isActive) cont.resume(if (promo != null) "已生成推文：${promo.summary.take(60)}" else "推文生成失败：${err.orEmpty()}")
                 }
             }
+        },
+        AgentTool("generate_illustration", "为某章生成插图。给 prompt 则用自定义画面；不给则按正文节选自动出图。args: projectId?, chapterId, prompt?, paragraphIndex?(锚定第几段,默认1)", sensitive = true) { a ->
+            val id = pid(a) ?: return@AgentTool "无聚焦项目"
+            val cid = a.str("chapterId") ?: return@AgentTool "缺少 chapterId"
+            val body = repo.chapterBody(cid); val content = body.final.ifBlank { body.draft }
+            val prompt = a.str("prompt") ?: content.take(220).ifBlank { return@AgentTool "无 prompt 且本章无正文，无法生成插图" }
+            val bytes = vm.generatePortraitImage(prompt, 768, 1024) ?: return@AgentTool "插图生成失败"
+            val anchor = a.intOr("paragraphIndex", 1).coerceAtLeast(1)
+            repo.upsertIllustration(cid, Illustration(
+                id = "ill-${System.currentTimeMillis()}", anchorIndex = anchor, paragraphIndices = listOf(anchor),
+                prompt = prompt, imageBase64 = Base64.encodeToString(bytes, Base64.NO_WRAP), createdAt = nowIso()))
+            addImageStep("第${anchor}段插图", bytes)
+            "已生成并插入插图（锚定第 $anchor 段）"
         },
         AgentTool("create_snapshot", "保存当前项目为版本快照。args: projectId?, label?") { a ->
             val id = pid(a) ?: return@AgentTool "无聚焦项目"
@@ -815,6 +911,26 @@ class AgentController(
             })
             "已更新角色 ${c.name}"
         },
+        AgentTool("get_character_growth", "查看某角色的成长路线（按章演进的发展记录）。args: projectId?, character(姓名或id)") { a ->
+            val id = pid(a) ?: return@AgentTool "无聚焦项目"
+            val key = a.str("character") ?: return@AgentTool "缺少 character"
+            val c = repo.characters(id).firstOrNull { it.id == key || it.name == key } ?: return@AgentTool "未找到角色"
+            val chain = repo.characterGrowth(id, c.id)
+            if (chain.isEmpty()) "（${c.name} 暂无成长记录）"
+            else chain.joinToString("\n") { e ->
+                val src = e.chapterOrder?.let { "第${it}章" } ?: if (e.manual) "手动" else ""
+                "- $src：${e.value.take(200)}"
+            }
+        },
+        AgentTool("add_character_growth", "为某角色追加一条成长记录（绑定章节，会软引导后续生成）。args: projectId?, character(姓名或id), value, chapterId?") { a ->
+            val id = pid(a) ?: return@AgentTool "无聚焦项目"
+            val key = a.str("character") ?: return@AgentTool "缺少 character"
+            val value = a.str("value") ?: return@AgentTool "缺少 value"
+            val c = repo.characters(id).firstOrNull { it.id == key || it.name == key } ?: return@AgentTool "未找到角色"
+            val ch = a.str("chapterId")?.let { cid -> repo.chapters(id).firstOrNull { it.id == cid } }
+            vm.addCharacterGrowth(id, c.id, value, ch, manual = ch == null)
+            "已记录 ${c.name} 的成长" + (ch?.let { "（第${it.order_index}章）" } ?: "")
+        },
         AgentTool("delete_character", "删除角色。args: projectId?, character(姓名或id)", sensitive = true) { a ->
             val id = pid(a) ?: return@AgentTool "无聚焦项目"
             val key = a.str("character") ?: return@AgentTool "缺少 character"
@@ -841,6 +957,11 @@ class AgentController(
             val pos = a.intOr("position", 0); if (pos < 1) return@AgentTool "position 需≥1"
             if (repo.chapters(id).none { it.id == cid }) return@AgentTool "未找到章节"
             vm.moveChapterToPosition(id, cid, pos); "已把章节移到第 $pos 位"
+        },
+        AgentTool("renumber_chapters", "把章节序号重排为连续的 1..N（修复删除后留下的跳号；不影响章节与弧线的归属索引）。args: projectId?") { a ->
+            val id = pid(a) ?: return@AgentTool "无聚焦项目"
+            val changed = vm.renumberChapters(id)
+            if (changed) "已将章节序号重排为连续编号" else "章节序号本已连续，无需重排"
         },
 
         // ── 项目编辑 / 删除 ──

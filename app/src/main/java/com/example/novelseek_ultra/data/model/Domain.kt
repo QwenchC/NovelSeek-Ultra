@@ -115,6 +115,23 @@ data class Illustration(
     val createdAt: String = "",
 )
 
+/**
+ * One entry in a character's growth route (成长路线) — a per-chapter knowledge base of how the
+ * character develops. Distinct from the static character profile; the latest entries are injected
+ * into new-chapter generation as soft guidance so the character evolves consistently.
+ * Stored in `characterGrowthByProject[projectId][characterId]`.
+ */
+@Serializable
+data class CharacterGrowthEntry(
+    val id: String,
+    val value: String,                 // what the character has become / changed (by this chapter)
+    val chapterId: String? = null,
+    val chapterOrder: Int? = null,
+    val chapterTitle: String? = null,
+    val createdAt: String = "",
+    val manual: Boolean = false,
+)
+
 @Serializable
 data class PlotArc(
     val id: String,

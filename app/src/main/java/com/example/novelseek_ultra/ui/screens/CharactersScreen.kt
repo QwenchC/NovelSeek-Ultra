@@ -3,6 +3,7 @@ package com.example.novelseek_ultra.ui.screens
 import android.graphics.BitmapFactory
 import android.util.Base64
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -16,6 +17,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.lazy.LazyColumn
@@ -75,6 +77,7 @@ fun CharactersScreen(vm: AppViewModel, projectId: String, onBack: () -> Unit) {
     var characters by remember(state, projectId) { mutableStateOf(vm.characters(projectId)) }
     var editing by remember { mutableStateOf<Character?>(null) }
     var showCreate by remember { mutableStateOf(false) }
+    var growthChar by remember { mutableStateOf<Character?>(null) }
 
     // Import-from-outline dialog state
     var showImportDialog by remember { mutableStateOf(false) }
@@ -133,6 +136,7 @@ fun CharactersScreen(vm: AppViewModel, projectId: String, onBack: () -> Unit) {
                 items(characters, key = { it.id }) { c ->
                     CharacterCard(
                         c, lang,
+                        onClick = { growthChar = c },
                         onEdit = { editing = c },
                         onDelete = {
                             characters = characters.filterNot { it.id == c.id }
@@ -166,6 +170,9 @@ fun CharactersScreen(vm: AppViewModel, projectId: String, onBack: () -> Unit) {
                 editing = null
             },
         )
+    }
+    growthChar?.let { c ->
+        CharacterGrowthDialog(vm = vm, projectId = projectId, character = c, lang = lang, onDismiss = { growthChar = null })
     }
 
     if (showImportDialog) {
@@ -316,14 +323,68 @@ private fun ImportFromOutlineDialog(
 }
 
 @Composable
-private fun CharacterCard(c: Character, lang: String, onEdit: () -> Unit, onDelete: () -> Unit) {
+private fun CharacterGrowthDialog(
+    vm: AppViewModel,
+    projectId: String,
+    character: Character,
+    lang: String,
+    onDismiss: () -> Unit,
+) {
+    val state by vm.state.collectAsState()
+    val entries = remember(state, character.id) { vm.characterGrowth(projectId, character.id) }
+    var newEntry by remember { mutableStateOf("") }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("${character.name} · ${tx(lang, "成长路线", "Growth route")}") },
+        text = {
+            LazyColumn(modifier = Modifier.heightIn(max = 420.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (entries.isEmpty()) item {
+                    Text(tx(lang, "暂无成长记录。可在下方手动添加，或让智能体在写章节时自动记录。",
+                        "No growth entries yet. Add one below, or let the agent record growth per chapter."),
+                        style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                items(entries, key = { it.id }) { e ->
+                    Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
+                        Column(Modifier.padding(10.dp)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    e.chapterOrder?.let { "第${it}章 ${e.chapterTitle.orEmpty()}" } ?: tx(lang, "手动", "manual"),
+                                    style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.weight(1f),
+                                )
+                                IconButton(onClick = { vm.deleteCharacterGrowth(projectId, character.id, e.id) }, modifier = Modifier.size(28.dp)) {
+                                    Icon(Icons.Outlined.Delete, contentDescription = tx(lang, "删除", "Delete"), modifier = Modifier.size(16.dp))
+                                }
+                            }
+                            Text(e.value, style = MaterialTheme.typography.bodyMedium)
+                        }
+                    }
+                }
+                item {
+                    OutlinedTextField(newEntry, { newEntry = it },
+                        label = { Text(tx(lang, "添加成长记录", "Add a growth entry")) },
+                        minLines = 2, modifier = Modifier.fillMaxWidth())
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(enabled = newEntry.isNotBlank(), onClick = {
+                vm.addCharacterGrowth(projectId, character.id, newEntry.trim()); newEntry = ""
+            }) { Text(tx(lang, "添加", "Add")) }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text(tx(lang, "关闭", "Close")) } },
+    )
+}
+
+@Composable
+private fun CharacterCard(c: Character, lang: String, onClick: () -> Unit, onEdit: () -> Unit, onDelete: () -> Unit) {
     // Mirrors HomeScreen's ProjectCard: the portrait fills the card's left edge, clipped to the
     // card's rounded corners (no image border), cover-cropped. Card height is driven by the text
     // column; a minHeight keeps short-info cards tall enough to show the portrait nicely.
     val portrait = remember(c.portraitBase64) { c.portraitBase64?.let { base64ToBitmap(it) } }
     val portraitW = 84.dp
     Card(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier.fillMaxWidth().clickable { onClick() },
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
     ) {
         Box(modifier = Modifier.fillMaxWidth()) {

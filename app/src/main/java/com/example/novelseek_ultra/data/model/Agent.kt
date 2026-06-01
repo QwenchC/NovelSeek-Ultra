@@ -10,10 +10,11 @@ import kotlinx.serialization.Serializable
 @Serializable
 data class AgentStep(
     val id: String,
-    val type: String,                 // user | thought | action | observation | message | question | answer | error
+    val type: String,                 // user | thought | action | observation | message | question | answer | error | image
     val text: String,
     val tool: String = "",            // tool name for type == "action"
     val createdAt: String = "",
+    val image: String = "",           // local file path of a generated image (type == "image")
 ) {
     companion object {
         const val USER = "user"
@@ -24,6 +25,7 @@ data class AgentStep(
         const val QUESTION = "question"
         const val ANSWER = "answer"
         const val ERROR = "error"
+        const val IMAGE = "image"     // an image the agent generated, shown as a preview bubble
     }
 }
 

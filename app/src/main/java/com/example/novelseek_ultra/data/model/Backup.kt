@@ -55,6 +55,11 @@ val APP_SETTINGS_FIELDS = listOf(
     "entitiesEnabled",
     "theme",
     "uiLanguage",
+    // Android-only app preferences (PC ignores unknown keys on import).
+    "agentName",
+    "listenVoice",
+    "listenRate",
+    "lastListenProjectId",
 )
 
 data class BackupSummary(

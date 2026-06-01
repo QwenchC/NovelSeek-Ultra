@@ -14,6 +14,7 @@ import com.example.novelseek_ultra.data.model.BackupSummary
 import com.example.novelseek_ultra.data.model.Chapter
 import com.example.novelseek_ultra.data.model.ChapterPromo
 import com.example.novelseek_ultra.data.model.Character
+import com.example.novelseek_ultra.data.model.CharacterGrowthEntry
 import com.example.novelseek_ultra.data.model.Container
 import com.example.novelseek_ultra.data.model.ContainerEntry
 import com.example.novelseek_ultra.data.model.CoverImageConfig
@@ -209,9 +210,23 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun chapters(projectId: String): List<Chapter> = repo.chapters(projectId)
     fun setChapters(projectId: String, chapters: List<Chapter>) = repo.setChapters(projectId, chapters)
     fun upsertChapter(projectId: String, ch: Chapter) = repo.upsertChapter(projectId, ch)
-    fun deleteChapter(projectId: String, chapterId: String) = repo.deleteChapter(projectId, chapterId)
+    fun deleteChapter(projectId: String, chapterId: String) {
+        repo.deleteChapter(projectId, chapterId)
+        renumberChapters(projectId)   // close the序号 gap left by deletion
+    }
 
-    /** Delete a chapter and clean up its references (arc.builtChapterIds + KB/summary/entities). */
+    /** Renumber chapters to a contiguous 1..n by current order (only display order_index changes;
+     *  the agent's chapter index is by id/arcId so it is NOT affected). */
+    fun renumberChapters(projectId: String): Boolean {
+        val sorted = repo.chapters(projectId).sortedBy { it.order_index }
+        if (sorted.isEmpty()) return false
+        val needs = sorted.withIndex().any { (i, c) -> c.order_index != i + 1 }
+        if (needs) repo.setChapters(projectId, sorted.mapIndexed { i, c -> c.copy(order_index = i + 1) })
+        return needs
+    }
+
+    /** Delete a chapter and clean up its references (arc.builtChapterIds + KB/summary/entities),
+     *  then renumber so chapter numbers stay contiguous. */
     fun deleteChapterFully(projectId: String, chapterId: String) {
         repo.setPlotArcs(projectId, repo.plotArcs(projectId).map { a ->
             if (a.builtChapterIds?.contains(chapterId) == true)
@@ -219,11 +234,22 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         })
         forgetKbForChapter(projectId, chapterId)
         repo.deleteChapter(projectId, chapterId)
+        renumberChapters(projectId)
     }
 
     /** Resolve a chapter's arc id (explicit, else inferred from any arc's builtChapterIds). */
     fun chapterArcId(projectId: String, chapter: Chapter): String? =
         chapter.arcId ?: repo.plotArcs(projectId).firstOrNull { it.builtChapterIds?.contains(chapter.id) == true }?.id
+
+    /** Apply edited final text to a chapter (save + refresh word count + KB reindex). For the
+     *  agent's local edits. Returns false if the chapter doesn't exist. */
+    fun agentApplyChapterText(projectId: String, chapterId: String, text: String): Boolean {
+        val ch = repo.chapters(projectId).firstOrNull { it.id == chapterId } ?: return false
+        repo.saveChapterBody(chapterId, repo.chapterBody(chapterId).copy(final = text))
+        repo.upsertChapter(projectId, ch.copy(word_count = countWords(text), updated_at = nowIso()))
+        onChapterSaved(projectId, chapterId, ch.title, text)
+        return true
+    }
 
     /** Move a chapter to [newPos1Based] (1-based) in the chapter list, renumbering order_index 1..n. */
     fun moveChapterToPosition(projectId: String, chapterId: String, newPos1Based: Int) {
@@ -315,6 +341,28 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     fun characters(projectId: String): List<Character> = repo.characters(projectId)
     fun setCharacters(projectId: String, list: List<Character>) = repo.setCharacters(projectId, list)
+
+    // ── Character growth route (角色成长) ──
+    fun characterGrowth(projectId: String, characterId: String): List<CharacterGrowthEntry> =
+        repo.characterGrowth(projectId, characterId)
+
+    fun addCharacterGrowth(projectId: String, characterId: String, value: String, chapter: Chapter? = null, manual: Boolean = true) {
+        repo.appendCharacterGrowth(projectId, characterId, CharacterGrowthEntry(
+            id = "grow-${System.currentTimeMillis()}", value = value,
+            chapterId = chapter?.id, chapterOrder = chapter?.order_index, chapterTitle = chapter?.title,
+            createdAt = nowIso(), manual = manual,
+        ))
+    }
+
+    fun updateCharacterGrowthLatest(projectId: String, characterId: String, value: String) {
+        val chain = repo.characterGrowth(projectId, characterId).toMutableList()
+        if (chain.isEmpty()) return
+        chain[chain.lastIndex] = chain.last().copy(value = value, manual = true)
+        repo.setCharacterGrowth(projectId, characterId, chain)
+    }
+
+    fun deleteCharacterGrowth(projectId: String, characterId: String, entryId: String) =
+        repo.setCharacterGrowth(projectId, characterId, repo.characterGrowth(projectId, characterId).filterNot { it.id == entryId })
 
     fun plotArcs(projectId: String): List<PlotArc> = repo.plotArcs(projectId)
     fun setPlotArcs(projectId: String, arcs: List<PlotArc>) = repo.setPlotArcs(projectId, arcs)
@@ -1342,6 +1390,79 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /** Scan a chapter's text for characters (esp. new ones not yet registered) and add the new
+     *  ones to the character manager. Returns the list of newly-added names. */
+    suspend fun agentExtractCharactersFromChapter(projectId: String, chapterId: String): List<String> {
+        val cfg = repo.activeTextModelConfig(); if (!cfg.isValid()) return emptyList()
+        val body = repo.chapterBody(chapterId)
+        val text = body.final.ifBlank { body.draft }
+        if (text.isBlank()) return emptyList()
+        val lang = _uiLanguage.value
+        val existing = repo.characters(projectId)
+        val existingNames = existing.map { it.name }.toSet()
+        return withContext(Dispatchers.IO) {
+            val messages = listOf(
+                ChatMessage("system", Prompts.charsFromOutlineSystem(lang)),
+                ChatMessage("user", buildString {
+                    appendLine(if (lang == "en") "Below is one chapter's prose. Extract the characters appearing in it — ESPECIALLY ones not yet registered — with a full profile each (role, personality, motivation, background, appearance)."
+                    else "以下是小说某一章的正文。请提取其中出场的角色——尤其是尚未登记的新角色——为每个角色尽量填写完整档案（身份、性格、动机、背景、形象）。配角也要有血有肉，不要写成工具人。")
+                    if (existingNames.isNotEmpty()) appendLine((if (lang == "en") "Already registered: " else "已登记角色：") + existingNames.joinToString("、"))
+                    appendLine()
+                    appendLine((if (lang == "en") "Chapter text:" else "章节正文：") + "\n" + text.take(6000))
+                    appendLine()
+                    append(if (lang == "en") "Output the JSON character array." else "请输出 JSON 角色数组。")
+                }),
+            )
+            val reply = runCatching { ai.chat(cfg, messages) }.getOrNull() ?: return@withContext emptyList()
+            val parsed = parseCharsFromAiText(reply).filter { it.name.isNotBlank() && it.name !in existingNames }
+            if (parsed.isNotEmpty()) repo.setCharacters(projectId, existing + parsed)
+            parsed.map { it.name }
+        }
+    }
+
+    /** Refine a chapter's plan (goal + core conflict) before writing — batch-created blank chapters
+     *  often have thin plans. Returns the refined "目标 / 冲突" summary, or null. */
+    suspend fun agentRefineChapterPlan(projectId: String, chapterId: String): String? {
+        val cfg = repo.activeTextModelConfig(); if (!cfg.isValid()) return null
+        val chapter = repo.chapters(projectId).firstOrNull { it.id == chapterId } ?: return null
+        val lang = _uiLanguage.value
+        return withContext(Dispatchers.IO) {
+            val arc = chapterArcId(projectId, chapter)?.let { aid -> repo.plotArcs(projectId).firstOrNull { it.id == aid } }
+            val ctx = buildString {
+                repo.outline(projectId).takeIf { it.isNotBlank() }?.let { append("【大纲】\n"); appendLine(it.take(1500)) }
+                arc?.let { appendLine("【所属弧线】${it.title}：${it.summary}") }
+                buildCharactersInfo(projectId)?.let { appendLine("【角色】\n$it") }
+                buildRealmSystemContext(repo.cultivationRealms(projectId), lang).takeIf { it.isNotBlank() }?.let { appendLine(it) }
+                buildPreviousChapterSummary(projectId, chapter.order_index).takeIf { it.isNotBlank() }?.let { appendLine("【前文梗概】\n$it") }
+            }
+            val messages = listOf(
+                ChatMessage("system", "你是小说章节策划。请把给定章节的『本章目标』与『核心冲突』细化得更具体、可落笔（结合大纲/弧线/角色/前文，避免空泛）。只输出 JSON：{\"goal\":\"...\",\"conflict\":\"...\"}，不要任何其它文字。"),
+                ChatMessage("user", buildString {
+                    appendLine("第${chapter.order_index}章《${chapter.title}》")
+                    appendLine("现有目标：${chapter.outline_goal.orEmpty().ifBlank { "(空)" }}")
+                    appendLine("现有冲突：${chapter.conflict.orEmpty().ifBlank { "(空)" }}")
+                    appendLine()
+                    append(ctx)
+                }),
+            )
+            val reply = runCatching { ai.chat(cfg, messages) }.getOrNull() ?: return@withContext null
+            val s = reply.replace(Regex("```(?:json)?\\s*"), "").replace("```", "").trim()
+            val start = s.indexOf('{'); val end = s.lastIndexOf('}')
+            if (start < 0 || end <= start) return@withContext null
+            val o = runCatching { Json { ignoreUnknownKeys = true }.parseToJsonElement(s.substring(start, end + 1)).jsonObject }.getOrNull()
+                ?: return@withContext null
+            fun str(k: String) = (o[k] as? kotlinx.serialization.json.JsonPrimitive)?.content?.trim()
+            val goal = str("goal"); val conflict = str("conflict")
+            if (goal.isNullOrBlank() && conflict.isNullOrBlank()) return@withContext null
+            repo.upsertChapter(projectId, chapter.copy(
+                outline_goal = goal ?: chapter.outline_goal,
+                conflict = conflict ?: chapter.conflict,
+                updated_at = nowIso(),
+            ))
+            "目标：${goal.orEmpty()}\n冲突：${conflict.orEmpty()}"
+        }
+    }
+
     suspend fun agentReviseChapter(projectId: String, chapterId: String, instruction: String, onDelta: (String) -> Unit = {}): String? {
         val cfg = repo.activeTextModelConfig(); if (!cfg.isValid()) return null
         val chapter = repo.chapters(projectId).firstOrNull { it.id == chapterId } ?: return null
@@ -1740,7 +1861,24 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         // Container guidance — soft, "evolve from here" reference state for affectsGeneration containers.
         buildContainerGuidance(projectId, lang)?.let { parts += it }
 
+        // Character growth routes — latest dev state per character (soft guidance for consistency).
+        buildCharacterGrowthGuidance(projectId, lang)?.let { parts += it }
+
         return parts.takeIf { it.isNotEmpty() }?.joinToString("\n\n")
+    }
+
+    /** Inject each character's latest growth-route entry as soft guidance for chapter generation. */
+    private fun buildCharacterGrowthGuidance(projectId: String, lang: String): String? {
+        val chars = repo.characters(projectId)
+        val lines = chars.mapNotNull { c ->
+            val latest = repo.characterGrowth(projectId, c.id).lastOrNull()?.value?.takeIf { it.isNotBlank() }
+                ?: return@mapNotNull null
+            "${c.name}：${latest.take(300)}"
+        }
+        if (lines.isEmpty()) return null
+        val header = if (lang == "en") "[Character Growth — current state, evolve naturally from here]"
+        else "【角色成长 — 当前状态，请在此基础上自然演进，保持前后一致】"
+        return header + "\n" + lines.joinToString("\n")
     }
 
     /** Inject the latest values of every affectsGeneration container as soft (non-forced) guidance. */

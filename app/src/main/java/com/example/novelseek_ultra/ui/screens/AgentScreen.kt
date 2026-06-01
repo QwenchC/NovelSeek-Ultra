@@ -1,8 +1,11 @@
 package com.example.novelseek_ultra.ui.screens
 
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -21,8 +24,13 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.automirrored.outlined.Send
+import androidx.compose.foundation.background
+import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Delete
+import androidx.compose.material.icons.outlined.Edit
+import androidx.compose.material.icons.outlined.FileDownload
 import androidx.compose.material.icons.outlined.MoreVert
+import androidx.compose.material.icons.outlined.Share
 import androidx.compose.material.icons.outlined.Stop
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
@@ -51,6 +59,12 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
+import com.example.novelseek_ultra.util.ImageShare
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -87,6 +101,8 @@ fun AgentScreen(vm: AppViewModel, onBack: () -> Unit) {
     var showRenameAgent by remember { mutableStateOf(false) }
     var showSessions by remember { mutableStateOf(false) }
     var showLockAuto by remember { mutableStateOf(false) }
+    var renamingSession by remember { mutableStateOf<com.example.novelseek_ultra.data.model.AgentSessionMeta?>(null) }
+    var fullscreenImage by remember { mutableStateOf<String?>(null) }
     val listState = rememberLazyListState()
 
     val running = status == AgentController.Status.RUNNING ||
@@ -210,10 +226,13 @@ fun AgentScreen(vm: AppViewModel, onBack: () -> Unit) {
                     )
                 }
             }
-            items(steps, key = { it.id }) { step -> StepRow(step, lang) }
+            items(steps, key = { it.id }) { step -> StepRow(step, lang, onImageClick = { fullscreenImage = it }) }
             if (streaming.isNotBlank()) {
                 item {
-                    // Live generation preview — capped height, showing the tail (near the cursor).
+                    // Live generation preview — fixed-height window that always scrolls to the
+                    // newest line (earlier lines stay put and scroll up, so nothing "reflows").
+                    val scrollState = rememberScrollState()
+                    LaunchedEffect(streaming) { scrollState.scrollTo(scrollState.maxValue) }
                     Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
                         Column(Modifier.padding(10.dp)) {
                             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -223,9 +242,9 @@ fun AgentScreen(vm: AppViewModel, onBack: () -> Unit) {
                             }
                             Spacer(Modifier.height(4.dp))
                             Text(
-                                streaming.takeLast(600),
+                                streaming,
                                 style = MaterialTheme.typography.bodySmall,
-                                modifier = Modifier.fillMaxWidth().heightIn(max = 150.dp),
+                                modifier = Modifier.fillMaxWidth().height(150.dp).verticalScroll(scrollState),
                             )
                         }
                     }
@@ -286,6 +305,9 @@ fun AgentScreen(vm: AppViewModel, onBack: () -> Unit) {
                             }
                             if (s.id == currentSessionId) Text(tx(lang, "当前", "current"),
                                 style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                            IconButton(onClick = { renamingSession = s }) {
+                                Icon(Icons.Outlined.Edit, contentDescription = tx(lang, "重命名", "Rename"), modifier = Modifier.size(18.dp))
+                            }
                             IconButton(onClick = { agent.deleteSession(s.id) }) {
                                 Icon(Icons.Outlined.Delete, contentDescription = tx(lang, "删除", "Delete"), modifier = Modifier.size(18.dp))
                             }
@@ -296,6 +318,49 @@ fun AgentScreen(vm: AppViewModel, onBack: () -> Unit) {
             confirmButton = { TextButton(onClick = { agent.newSession(); showSessions = false }) { Text(tx(lang, "新建会话", "New")) } },
             dismissButton = { TextButton(onClick = { showSessions = false }) { Text(tx(lang, "关闭", "Close")) } },
         )
+    }
+
+    renamingSession?.let { s ->
+        RenameDialog(
+            title = tx(lang, "重命名会话", "Rename session"),
+            label = tx(lang, "会话名称", "Title"),
+            initialValue = s.title,
+            confirmLabel = tx(lang, "保存", "Save"),
+            dismissLabel = tx(lang, "取消", "Cancel"),
+            onConfirm = { agent.renameSession(s.id, it) },
+            onDismiss = { renamingSession = null },
+        )
+    }
+
+    fullscreenImage?.let { path ->
+        val ctx = LocalContext.current
+        val bmp = remember(path) { runCatching { android.graphics.BitmapFactory.decodeFile(path) }.getOrNull() }
+        Dialog(onDismissRequest = { fullscreenImage = null }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+            Box(Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color.Black)) {
+                if (bmp != null) {
+                    androidx.compose.foundation.Image(
+                        bitmap = bmp.asImageBitmap(), contentDescription = null,
+                        contentScale = androidx.compose.ui.layout.ContentScale.Fit,
+                        modifier = Modifier.fillMaxSize().padding(8.dp),
+                    )
+                }
+                Row(
+                    modifier = Modifier.align(Alignment.TopEnd).padding(8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    FilledTonalButton(onClick = {
+                        val ok = ImageShare.saveToGallery(ctx, path)
+                        android.widget.Toast.makeText(ctx, if (ok) tx(lang, "已保存到相册", "Saved to gallery") else tx(lang, "保存失败", "Save failed"), android.widget.Toast.LENGTH_SHORT).show()
+                    }) { Icon(Icons.Outlined.FileDownload, contentDescription = tx(lang, "保存", "Save")); Spacer(Modifier.width(4.dp)); Text(tx(lang, "保存", "Save")) }
+                    FilledTonalButton(onClick = { ImageShare.share(ctx, path) }) {
+                        Icon(Icons.Outlined.Share, contentDescription = tx(lang, "分享", "Share")); Spacer(Modifier.width(4.dp)); Text(tx(lang, "分享", "Share"))
+                    }
+                    IconButton(onClick = { fullscreenImage = null }) {
+                        Icon(Icons.Outlined.Close, contentDescription = tx(lang, "关闭", "Close"), tint = androidx.compose.ui.graphics.Color.White)
+                    }
+                }
+            }
+        }
     }
 
     if (showLockAuto) {
@@ -351,8 +416,33 @@ fun AgentScreen(vm: AppViewModel, onBack: () -> Unit) {
 }
 
 @Composable
-private fun StepRow(step: AgentStep, lang: String) {
+private fun StepRow(step: AgentStep, lang: String, onImageClick: (String) -> Unit = {}) {
     when (step.type) {
+        AgentStep.IMAGE -> {
+            val bmp = remember(step.image) { runCatching { android.graphics.BitmapFactory.decodeFile(step.image) }.getOrNull() }
+            Column {
+                if (step.text.isNotBlank()) {
+                    Text("🖼 ${step.text}", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
+                    Spacer(Modifier.height(4.dp))
+                }
+                if (bmp != null) {
+                    androidx.compose.foundation.Image(
+                        bitmap = bmp.asImageBitmap(),
+                        contentDescription = step.text,
+                        contentScale = androidx.compose.ui.layout.ContentScale.Fit,
+                        modifier = Modifier
+                            .heightIn(max = 240.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .clickable { onImageClick(step.image) },
+                    )
+                    Text(tx(lang, "点击查看大图", "Tap to view full screen"),
+                        style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                } else {
+                    Text(tx(lang, "（图片已失效）", "(image unavailable)"),
+                        style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+        }
         AgentStep.USER, AgentStep.ANSWER -> Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
             Card(
                 shape = RoundedCornerShape(14.dp),
@@ -364,7 +454,14 @@ private fun StepRow(step: AgentStep, lang: String) {
         AgentStep.ACTION -> Text("▶ ${step.tool}  ${step.text}", style = MaterialTheme.typography.labelMedium,
             color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Medium)
         AgentStep.OBSERVATION -> Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
-            Text(step.text, Modifier.padding(10.dp).fillMaxWidth(), style = MaterialTheme.typography.bodySmall)
+            // Tool results (chapter lists / structure trees) can be hundreds of lines — cap the
+            // bubble height and let the overflow scroll inside.
+            val sc = rememberScrollState()
+            Text(
+                step.text,
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.padding(10.dp).fillMaxWidth().heightIn(max = 200.dp).verticalScroll(sc),
+            )
         }
         AgentStep.QUESTION -> Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.tertiaryContainer)) {
             Column(Modifier.padding(12.dp)) {
@@ -373,7 +470,10 @@ private fun StepRow(step: AgentStep, lang: String) {
             }
         }
         AgentStep.ERROR -> Text("⚠ ${step.text}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
-        else -> Card { Column(Modifier.padding(12.dp).fillMaxWidth()) { MarkdownText(step.text) } }
+        else -> Card {
+            val sc = rememberScrollState()
+            Column(Modifier.padding(12.dp).fillMaxWidth().heightIn(max = 280.dp).verticalScroll(sc)) { MarkdownText(step.text) }
+        }
     }
 }
 

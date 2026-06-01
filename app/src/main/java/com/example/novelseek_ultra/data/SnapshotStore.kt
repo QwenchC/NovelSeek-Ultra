@@ -28,6 +28,7 @@ object SnapshotStore {
         "entitiesByProject",
         "containersByProject",
         "volumesByProject",
+        "characterGrowthByProject",
     )
 
     /** Default number of non-manual (auto / pre_ai) snapshots retained per project. */

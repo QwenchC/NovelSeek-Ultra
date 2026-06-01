@@ -11,6 +11,7 @@ import com.example.novelseek_ultra.data.model.BackupSummary
 import com.example.novelseek_ultra.data.model.Chapter
 import com.example.novelseek_ultra.data.model.ChapterPromo
 import com.example.novelseek_ultra.data.model.Character
+import com.example.novelseek_ultra.data.model.CharacterGrowthEntry
 import com.example.novelseek_ultra.data.model.CharacterEvent
 import com.example.novelseek_ultra.data.model.CharacterRealmEvent
 import com.example.novelseek_ultra.data.model.CharacterRelationship
@@ -302,6 +303,30 @@ class AppRepository(context: Context) {
 
     fun setCharacters(projectId: String, characters: List<Character>) =
         writeListMap("charactersByProject", projectId, characters, Character.serializer())
+
+    // ── Character growth route (角色成长) — per-character, per-chapter dev chain ──
+
+    fun characterGrowth(projectId: String, characterId: String): List<CharacterGrowthEntry> {
+        val inner = (_state.value["characterGrowthByProject"] as? JsonObject)?.get(projectId) as? JsonObject
+            ?: return emptyList()
+        val arr = inner[characterId] as? JsonArray ?: return emptyList()
+        return runCatching { JSON.decodeFromJsonElement(ListSerializer(CharacterGrowthEntry.serializer()), arr) }
+            .getOrDefault(emptyList())
+    }
+
+    fun setCharacterGrowth(projectId: String, characterId: String, entries: List<CharacterGrowthEntry>) {
+        mutateState { current ->
+            val outer = (current["characterGrowthByProject"] as? JsonObject ?: JsonObject(emptyMap())).toMutableMap()
+            val inner = (outer[projectId] as? JsonObject ?: JsonObject(emptyMap())).toMutableMap()
+            inner[characterId] = JSON.encodeToJsonElement(ListSerializer(CharacterGrowthEntry.serializer()), entries) as JsonArray
+            outer[projectId] = JsonObject(inner)
+            current.with("characterGrowthByProject", JsonObject(outer))
+        }
+    }
+
+    fun appendCharacterGrowth(projectId: String, characterId: String, entry: CharacterGrowthEntry) {
+        setCharacterGrowth(projectId, characterId, characterGrowth(projectId, characterId) + entry)
+    }
 
     fun plotArcs(projectId: String): List<PlotArc> =
         readListMap("plotArcsByProject", projectId, PlotArc.serializer())

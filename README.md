@@ -195,7 +195,11 @@ cd NovelSeek-Ultra
 在**文本模型配置**区块，点击 **「+ 添加」** 新建 API 配置：
 
 - **API Base URL**：AI 文本服务地址（例如 `https://api.deepseek.com`）
+<<<<<<< HEAD
 - **API Key**：服务密钥（DeepSeek密钥获取地址`https://platform.deepseek.com/api_keys`）
+=======
+- **API Key**：服务密钥
+>>>>>>> c22f16719c2739c0db0e8c3d6ca127875713dea0
 - **模型名称**：填写你使用的模型 ID
 
 填写后点击**测试连接**，出现绿色成功提示则配置正确。

@@ -1,6 +1,6 @@
 # NovelSeek Ultra
 
-> 一款基于 AI 的 Android 小说创作助手，由桌面端项目 [NovelSeek-Pro-PC](https://github.com/QwenchC/NovelSeek-Pro-PC) 迁移而来。
+> 一款基于 AI 的 Android 小说创作助手，由桌面端项目 [NovelSeek-Ultra-PC](https://github.com/QwenchC/NovelSeek-Ultra-PC) 迁移而来，现在两者已实现机制同步，备份格式与桌面端 NovelSeek-Ultra-PC 完全互通，可无损互导。
 
 ---
 

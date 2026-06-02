@@ -685,33 +685,48 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         val lang = _uiLanguage.value
         val project = repo.project(projectId) ?: return
         val arc = repo.plotArcs(projectId).find { it.id == arcId } ?: return
-        val chapters = repo.chapters(projectId)
-        val outline = repo.outline(projectId)
-        val realmCtx = buildRealmSystemContext(repo.cultivationRealms(projectId), lang)
-        val projectOutline = if (realmCtx.isNotBlank()) "$outline\n\n$realmCtx" else outline
-        val charactersInfo = buildCharactersInfo(projectId)
-        val startChapterNumber = (chapters.maxOfOrNull { it.order_index } ?: 0) + 1
-        val prevCtx = chapters.sortedByDescending { it.order_index }.take(5).reversed()
-            .joinToString("\n") { c -> "第${c.order_index}章《${c.title}》：${c.outline_goal ?: "(无目标)"}" }
-        val messages = listOf(
-            ChatMessage("system", Prompts.arcMiniOutlineSystem(lang)),
-            ChatMessage("user", Prompts.arcMiniOutlineUser(
-                projectTitle = project.title,
-                projectOutline = projectOutline,
-                arcTitle = arc.title,
-                arcSummary = arc.summary,
-                chapterCount = arc.chapterCount.takeIf { it > 0 } ?: 8,
-                startChapterNumber = startChapterNumber,
-                prevChaptersContext = prevCtx,
-                charactersInfo = charactersInfo,
-                language = lang,
-            )),
-        )
         streamingJob?.cancel()
         _streamingText.value = ""
         _isGenerating.value = true
         streamingJob = viewModelScope.launch(Dispatchers.IO) {
             try {
+                val chapters = repo.chapters(projectId)
+                val realmCtx = buildRealmSystemContext(repo.cultivationRealms(projectId), lang)
+                val charactersInfo = buildCharactersInfo(projectId)
+                val startChapterNumber = (chapters.maxOfOrNull { it.order_index } ?: 0) + 1
+                val prevCtx = chapters.sortedByDescending { it.order_index }.take(5).reversed()
+                    .joinToString("\n") { c -> "第${c.order_index}章《${c.title}》：${c.outline_goal ?: "(无目标)"}" }
+                // Planning sources not already in the prompt's dedicated slots: 境界体系、所属副本、
+                // 全局弧线进度、角色成长、容器知识库（手动+追踪）、设置页知识库索引检索 — so the manual
+                // planner reads the same full context the agent does and won't plan blind.
+                val supplemental = buildString {
+                    if (realmCtx.isNotBlank()) { appendLine(realmCtx); appendLine() }
+                    arc.volumeId?.let { vid -> repo.volumes(projectId).firstOrNull { it.id == vid } }?.let { vol ->
+                        appendLine("【所属副本】${vol.name}" + (vol.description.takeIf { it.isNotBlank() }?.let { "：$it" } ?: "")); appendLine()
+                    }
+                    buildArcContext(repo.plotArcs(projectId), lang).takeIf { it.isNotBlank() }?.let { appendLine(it); appendLine() }
+                    buildCharacterGrowthGuidance(projectId, lang)?.let { appendLine(it); appendLine() }
+                    buildContainerKnowledgeForPlanning(projectId, lang)?.let { appendLine(it); appendLine() }
+                    buildKbIndexRetrieval(projectId, "${arc.title}\n${arc.summary}", lang)?.let { appendLine(it) }
+                }.trim()
+                val projectOutline = buildString {
+                    append(repo.outline(projectId))
+                    if (supplemental.isNotBlank()) { append("\n\n"); append(supplemental) }
+                }
+                val messages = listOf(
+                    ChatMessage("system", Prompts.arcMiniOutlineSystem(lang)),
+                    ChatMessage("user", Prompts.arcMiniOutlineUser(
+                        projectTitle = project.title,
+                        projectOutline = projectOutline,
+                        arcTitle = arc.title,
+                        arcSummary = arc.summary,
+                        chapterCount = arc.chapterCount.takeIf { it > 0 } ?: 8,
+                        startChapterNumber = startChapterNumber,
+                        prevChaptersContext = prevCtx,
+                        charactersInfo = charactersInfo,
+                        language = lang,
+                    )),
+                )
                 ai.streamChat(cfg, messages).collect { ev ->
                     when (ev) {
                         is AiService.StreamEvent.Delta -> _streamingText.value = _streamingText.value + ev.text
@@ -1428,13 +1443,14 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         val lang = _uiLanguage.value
         return withContext(Dispatchers.IO) {
             val arc = chapterArcId(projectId, chapter)?.let { aid -> repo.plotArcs(projectId).firstOrNull { it.id == aid } }
-            val ctx = buildString {
-                repo.outline(projectId).takeIf { it.isNotBlank() }?.let { append("【大纲】\n"); appendLine(it.take(1500)) }
-                arc?.let { appendLine("【所属弧线】${it.title}：${it.summary}") }
-                buildCharactersInfo(projectId)?.let { appendLine("【角色】\n$it") }
-                buildRealmSystemContext(repo.cultivationRealms(projectId), lang).takeIf { it.isNotBlank() }?.let { appendLine(it) }
-                buildPreviousChapterSummary(projectId, chapter.order_index).takeIf { it.isNotBlank() }?.let { appendLine("【前文梗概】\n$it") }
-            }
+            // Read the FULL planning context (outline/realm, volume+arc, characters+growth, prior
+            // chapters, container knowledge base, settings-page KB index) so refinement is grounded.
+            val query = listOf(chapter.title, chapter.outline_goal, chapter.conflict)
+                .filterNot { it.isNullOrBlank() }.joinToString("\n")
+            val ctx = buildPlanningContext(
+                projectId = projectId, arc = arc, query = query, lang = lang,
+                currentOrderIndex = chapter.order_index, excludeChapterId = chapter.id,
+            )
             val messages = listOf(
                 ChatMessage("system", "你是小说章节策划。请把给定章节的『本章目标』与『核心冲突』细化得更具体、可落笔（结合大纲/弧线/角色/前文，避免空泛）。只输出 JSON：{\"goal\":\"...\",\"conflict\":\"...\"}，不要任何其它文字。"),
                 ChatMessage("user", buildString {
@@ -1503,11 +1519,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         val arc = repo.plotArcs(projectId).firstOrNull { it.id == arcId } ?: return 0
         val lang = _uiLanguage.value
         return withContext(Dispatchers.IO) {
-            val ctx = buildString {
-                repo.outline(projectId).takeIf { it.isNotBlank() }?.let { append("【大纲】\n"); append(it.take(2000)) }
-                buildRealmSystemContext(repo.cultivationRealms(projectId), lang).takeIf { it.isNotBlank() }
-                    ?.let { if (isNotEmpty()) append("\n\n"); append(it) }
-            }
+            val nextOrder = (repo.chapters(projectId).maxOfOrNull { it.order_index } ?: 0) + 1
+            // Full planning context so arc chapters are planned against the whole project state.
+            val ctx = buildPlanningContext(
+                projectId = projectId, arc = arc, query = "${arc.title}\n${arc.summary}", lang = lang,
+                currentOrderIndex = nextOrder,
+            )
             val messages = listOf(
                 ChatMessage("system", "你为某条剧情弧线规划具体章节。只输出 JSON 数组：[{\"title\":\"章节名\",\"goal\":\"本章目标(1-2句)\"}]，不要任何其它文字。"),
                 ChatMessage("user", "弧线：${arc.title}\n${arc.summary}\n请规划 $count 个章节。\n参考资料：\n$ctx"),
@@ -1834,28 +1851,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
-        if (repo.knowledgeBaseEnabled()) {
-            val cfg = repo.embeddingConfig()
-            if (cfg.apiKey.isNotBlank() && cfg.apiUrl.isNotBlank() && cfg.model.isNotBlank()) {
-                val pool = repo.chunks(projectId)
-                if (pool.isNotEmpty()) {
-                    val query = listOf(chapter.title, chapter.outline_goal, chapter.conflict)
-                        .filterNot { it.isNullOrBlank() }.joinToString("\n")
-                    if (query.isNotBlank()) {
-                        runCatching {
-                            kb.retrieveTopK(
-                                query = query,
-                                pool = pool,
-                                topK = 4,
-                                excludeSourceIds = setOf(chapter.id),
-                                cfg = cfg,
-                            )
-                        }.getOrNull()?.takeIf { it.isNotEmpty() }?.let { hits ->
-                            parts += hits.toPromptContext(lang)
-                        }
-                    }
-                }
-            }
+        run {
+            val query = listOf(chapter.title, chapter.outline_goal, chapter.conflict)
+                .filterNot { it.isNullOrBlank() }.joinToString("\n")
+            buildKbIndexRetrieval(projectId, query, lang, setOf(chapter.id))?.let { parts += it }
         }
 
         // Container guidance — soft, "evolve from here" reference state for affectsGeneration containers.
@@ -1865,6 +1864,57 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         buildCharacterGrowthGuidance(projectId, lang)?.let { parts += it }
 
         return parts.takeIf { it.isNotEmpty() }?.joinToString("\n\n")
+    }
+
+    /** Settings-page knowledge base (embedding index): retrieve the top-K chunks most relevant to
+     *  [query]. Returns null when KB is disabled, unconfigured, empty, or nothing matches. */
+    private suspend fun buildKbIndexRetrieval(
+        projectId: String, query: String, lang: String, excludeSourceIds: Set<String> = emptySet(),
+    ): String? {
+        if (!repo.knowledgeBaseEnabled() || query.isBlank()) return null
+        val cfg = repo.embeddingConfig()
+        if (cfg.apiKey.isBlank() || cfg.apiUrl.isBlank() || cfg.model.isBlank()) return null
+        val pool = repo.chunks(projectId)
+        if (pool.isEmpty()) return null
+        return runCatching {
+            kb.retrieveTopK(query = query, pool = pool, topK = 4, excludeSourceIds = excludeSourceIds, cfg = cfg)
+        }.getOrNull()?.takeIf { it.isNotEmpty() }?.toPromptContext(lang)
+    }
+
+    /**
+     * Shared, full PLANNING context so neither the manual planner (generateArcMiniOutline) nor the
+     * agent planners (agentRefineChapterPlan / agentPlanArcChapters) ever plan blind. Pulls together
+     * every relevant source so the plan can't mislead generation:
+     *   - 大纲 + 境界体系
+     *   - 所属副本(volume) + 弧线 + 全局弧线进度
+     *   - 角色档案 + 角色成长路线
+     *   - 前文梗概（最近若干章正文节选）
+     *   - 容器知识库（手动条目 + 自演化最新值，含全部容器）
+     *   - 设置页知识库索引（按 [query] 语义检索 top-K）
+     * [currentOrderIndex] bounds the 前文 window; [excludeChapterId] is dropped from KB retrieval.
+     */
+    private suspend fun buildPlanningContext(
+        projectId: String,
+        arc: PlotArc?,
+        query: String,
+        lang: String,
+        currentOrderIndex: Int,
+        excludeChapterId: String? = null,
+    ): String {
+        val parts = mutableListOf<String>()
+        repo.outline(projectId).takeIf { it.isNotBlank() }?.let { parts += "【大纲】\n${it.take(2000)}" }
+        buildRealmSystemContext(repo.cultivationRealms(projectId), lang).takeIf { it.isNotBlank() }?.let { parts += it }
+        arc?.volumeId?.let { vid -> repo.volumes(projectId).firstOrNull { it.id == vid } }?.let { vol ->
+            parts += "【所属副本】${vol.name}" + (vol.description.takeIf { it.isNotBlank() }?.let { "：$it" } ?: "")
+        }
+        arc?.let { parts += "【所属弧线】${it.title}：${it.summary}" }
+        buildArcContext(repo.plotArcs(projectId), lang).takeIf { it.isNotBlank() }?.let { parts += it }
+        buildCharactersInfo(projectId)?.let { parts += "【角色】\n$it" }
+        buildCharacterGrowthGuidance(projectId, lang)?.let { parts += it }
+        buildPreviousChapterSummary(projectId, currentOrderIndex).takeIf { it.isNotBlank() }?.let { parts += "【前文梗概】\n$it" }
+        buildContainerKnowledgeForPlanning(projectId, lang)?.let { parts += it }
+        buildKbIndexRetrieval(projectId, query, lang, excludeChapterId?.let { setOf(it) } ?: emptySet())?.let { parts += it }
+        return parts.joinToString("\n\n")
     }
 
     /** Inject each character's latest growth-route entry as soft guidance for chapter generation. */
@@ -1881,10 +1931,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         return header + "\n" + lines.joinToString("\n")
     }
 
-    /** Inject the latest values of every affectsGeneration container as soft (non-forced) guidance. */
-    private fun buildContainerGuidance(projectId: String, lang: String): String? {
-        val containers = repo.containers(projectId).filter { it.affectsGeneration }
-        if (containers.isEmpty()) return null
+    /** Render each container's latest per-block values into prompt blocks (shared by generation
+     *  guidance and planning context). [recentChapters] bounds how many tail chapters a
+     *  BY_CHAPTER container contributes. */
+    private fun renderContainerBlocks(projectId: String, containers: List<Container>, recentChapters: Int): List<String> {
         val blocks = mutableListOf<String>()
         containers.forEach { c ->
             when (c.type) {
@@ -1897,7 +1947,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     if (lines.isNotEmpty()) blocks += "《${c.name}》\n" + lines.joinToString("\n")
                 }
                 Container.BY_CHAPTER -> {
-                    val recent = repo.chapters(projectId).sortedBy { it.order_index }.takeLast(3)
+                    val recent = repo.chapters(projectId).sortedBy { it.order_index }.takeLast(recentChapters)
                     val lines = recent.mapNotNull { ch ->
                         val v = repo.containerEntries(projectId, c.id, ch.id).lastOrNull()?.value?.takeIf { it.isNotBlank() }
                             ?: return@mapNotNull null
@@ -1911,11 +1961,29 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
         }
+        return blocks
+    }
+
+    /** Inject the latest values of every affectsGeneration container as soft (non-forced) guidance. */
+    private fun buildContainerGuidance(projectId: String, lang: String): String? {
+        val blocks = renderContainerBlocks(projectId, repo.containers(projectId).filter { it.affectsGeneration }, recentChapters = 3)
         if (blocks.isEmpty()) return null
         val header = if (lang == "en")
             "[Containers — reference state. Evolve naturally from here; do not contradict or regress these without an in-story reason.]"
         else
             "【资料容器 — 参考状态。请在此基础上自然演进，勿无理由跳变或倒退。】"
+        return header + "\n" + blocks.joinToString("\n\n")
+    }
+
+    /** For PLANNING: surface ALL container knowledge (manual entries + AI-evolved values), regardless
+     *  of the affectsGeneration flag, so the planner sees tracked stats / relations / items / 伏笔. */
+    private fun buildContainerKnowledgeForPlanning(projectId: String, lang: String): String? {
+        val blocks = renderContainerBlocks(projectId, repo.containers(projectId), recentChapters = 5)
+        if (blocks.isEmpty()) return null
+        val header = if (lang == "en")
+            "[Knowledge containers — manual + tracked state; use as a planning reference and keep consistent]"
+        else
+            "【资料容器 — 手动知识库与追踪状态，规划时作为依据，保持前后一致】"
         return header + "\n" + blocks.joinToString("\n\n")
     }
 

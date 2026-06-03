@@ -535,10 +535,11 @@ class AgentController(
             addImageStep("项目封面", bytes)
             "已生成封面并设为默认"
         },
-        AgentTool("create_volume", "新建副本。args: projectId?, name, description?") { a ->
+        AgentTool("create_volume", "新建副本。args: projectId?, name, description?, realmPlan?(本副本修为/境界上限的硬约束，如\"主角只突破到第一大境界巅峰，逐层稳步突破\")") { a ->
             val id = pid(a) ?: return@AgentTool "无聚焦项目"
-            val v = vm.createVolume(id, a.str("name") ?: "新副本", a.str("description").orEmpty())
-            "已创建副本《${v.name}》(id=${v.id})"
+            val realmPlan = a.str("realmPlan").orEmpty()
+            val v = vm.createVolume(id, a.str("name") ?: "新副本", a.str("description").orEmpty(), realmPlan)
+            "已创建副本《${v.name}》(id=${v.id})" + (if (realmPlan.isNotBlank()) "（已设修为上限）" else "")
         },
         AgentTool("generate_volumes", "AI 生成若干副本（不生成弧线）。args: projectId?, count, requirements?") { a ->
             val id = pid(a) ?: return@AgentTool "无聚焦项目"
@@ -693,12 +694,12 @@ class AgentController(
             })
             if (found) "已更新弧线 $arcId" else "未找到弧线"
         },
-        AgentTool("update_volume", "修改副本信息。args: projectId?, volumeId, name?, description?") { a ->
+        AgentTool("update_volume", "修改副本信息。args: projectId?, volumeId, name?, description?, realmPlan?(本副本修为/境界上限的硬约束；设定后规划与生成都会严格遵守)") { a ->
             val id = pid(a) ?: return@AgentTool "无聚焦项目"
             val vid = a.str("volumeId") ?: return@AgentTool "缺少 volumeId"
             if (repo.volumes(id).none { it.id == vid }) return@AgentTool "未找到副本"
-            vm.updateVolume(id, vid) { it.copy(name = a.str("name") ?: it.name, description = a.str("description") ?: it.description) }
-            "已更新副本 $vid"
+            vm.updateVolume(id, vid) { it.copy(name = a.str("name") ?: it.name, description = a.str("description") ?: it.description, realmPlan = a.str("realmPlan") ?: it.realmPlan) }
+            "已更新副本 $vid" + (if (a.str("realmPlan") != null) "（已更新修为上限）" else "")
         },
         AgentTool("update_chapter", "修改章节标题/目标/冲突（真正改章节名，勿把标题写进正文）。args: projectId?, chapterId, title?, goal?, conflict?") { a ->
             val id = pid(a) ?: return@AgentTool "无聚焦项目"
@@ -771,20 +772,25 @@ class AgentController(
             val id = pid(a) ?: return@AgentTool "无聚焦项目"
             vm.agentReviewConsistency(id) { _streamingText.value = it } ?: "审阅失败"
         },
-        AgentTool("generate_promo", "为某章生成推文配图。给 prompt 则用自定义画面直接生成并应用；不给则用默认机制（AI 依正文出图）。args: projectId?, chapterId, prompt?", sensitive = true) { a ->
+        AgentTool("generate_promo", "为某章生成【章节推文】＝整章头图(每章最多一张，概括全章；不同于段落插图)。仅对【已有正文】的章节生成，【已有推文的章节自动跳过】(force=true 才强制重做)。给 prompt 用自定义画面，不给则 AI 依正文出图。批量生成头图时直接对每个章节调用即可，会自动跳过空章/已有头图。args: projectId?, chapterId, prompt?, force?", sensitive = true) { a ->
             val id = pid(a) ?: return@AgentTool "无聚焦项目"
             val cid = a.str("chapterId") ?: return@AgentTool "缺少 chapterId"
             val ch = repo.chapters(id).firstOrNull { it.id == cid } ?: return@AgentTool "未找到章节"
+            // 章节推文只针对【已有正文】的章节。
+            val body = repo.chapterBody(cid); val content = body.final.ifBlank { body.draft }
+            if (content.length < 100) return@AgentTool "第${ch.order_index}章《${ch.title}》正文为空/过少，章节推文仅针对已有正文的章节，已跳过"
+            // 【已有推文则跳过】，除非显式 force=true 强制重做。
+            val existing = repo.getChapterPromo(cid)
+            if (existing?.imageBase64 != null && !a.boolOr("force", false))
+                return@AgentTool "第${ch.order_index}章《${ch.title}》已有推文，已跳过（如需重做请加 force=true）"
             val custom = a.str("prompt")
             if (custom != null) {
                 val bytes = vm.generatePortraitImage(custom, 1024, 1024) ?: return@AgentTool "推文配图生成失败"
                 repo.setChapterPromo(cid, ChapterPromo(imagePrompt = custom,
-                    summary = repo.getChapterPromo(cid)?.summary.orEmpty(), imageBase64 = Base64.encodeToString(bytes, Base64.NO_WRAP)))
+                    summary = existing?.summary.orEmpty(), imageBase64 = Base64.encodeToString(bytes, Base64.NO_WRAP)))
                 addImageStep("推文配图", bytes)
                 return@AgentTool "已用自定义提示词生成并应用推文配图"
             }
-            val body = repo.chapterBody(cid); val content = body.final.ifBlank { body.draft }
-            if (content.length < 100) return@AgentTool "章节内容太少，无法用默认机制生成推文"
             suspendCancellableCoroutine { cont ->
                 vm.generateChapterPromo(cid, ch.title, content, null, "zimage", 1024, 1024) { promo, err ->
                     if (promo != null) promo.imageBase64?.let { addImageStepFromBase64("推文配图", it) }
@@ -792,7 +798,7 @@ class AgentController(
                 }
             }
         },
-        AgentTool("generate_illustration", "为某章生成插图。给 prompt 则用自定义画面；不给则按正文节选自动出图。args: projectId?, chapterId, prompt?, paragraphIndex?(锚定第几段,默认1)", sensitive = true) { a ->
+        AgentTool("generate_illustration", "为某章生成【段落插图】＝锚定到正文【某一段】的插画(一章可多张，对应具体场景；不同于章节推文头图)。给 prompt 用自定义画面，不给则按该段正文节选自动出图。args: projectId?, chapterId, prompt?, paragraphIndex?(锚定第几段,默认1)", sensitive = true) { a ->
             val id = pid(a) ?: return@AgentTool "无聚焦项目"
             val cid = a.str("chapterId") ?: return@AgentTool "缺少 chapterId"
             val body = repo.chapterBody(cid); val content = body.final.ifBlank { body.draft }

@@ -253,18 +253,38 @@ object PdfExporter {
 
         // ── images ─────────────────────────────────────────────────────────────
 
-        private fun drawImageBlock(bmp: Bitmap, gapAfter: Float = 8f) {
-            if (bmp.width <= 0 || bmp.height <= 0) return
+        /** Lay-out size (drawW, drawH) for [bmp]: full content width, capped to one page tall. */
+        private fun imageDrawSize(bmp: Bitmap): Pair<Float, Float> {
+            if (bmp.width <= 0 || bmp.height <= 0) return CONTENT_W to 0f
             var drawW = CONTENT_W
             var drawH = bmp.height.toFloat() * CONTENT_W / bmp.width
             val maxH = PAGE_H - 2 * MARGIN
             if (drawH > maxH) { drawH = maxH; drawW = bmp.width.toFloat() * maxH / bmp.height }
+            return drawW to drawH
+        }
+
+        private fun drawImageBlock(bmp: Bitmap, gapAfter: Float = 8f) {
+            if (bmp.width <= 0 || bmp.height <= 0) return
+            val (drawW, drawH) = imageDrawSize(bmp)
             ensure(drawH)
             val img: PDImageXObject = LosslessFactory.createFromImage(doc, bmp)
             val left = MARGIN + (CONTENT_W - drawW) / 2
             val bottom = PAGE_H - (yTop + drawH)
             cs!!.drawImage(img, left, bottom, drawW, drawH)
             yTop += drawH + gapAfter
+        }
+
+        /**
+         * Draw as many queued illustrations as fit in the CURRENT page's remaining height, in order.
+         * Once the head image doesn't fit we stop — it stays queued so the following paragraphs can
+         * fill the rest of this page first (instead of leaving a big blank gap at the page bottom),
+         * and the image lands after a later paragraph / at the top of the next page once it fits.
+         */
+        private fun flushPendingImages(pending: ArrayDeque<Bitmap>) {
+            while (pending.isNotEmpty()) {
+                val (_, drawH) = imageDrawSize(pending.first())
+                if (yTop + drawH <= PAGE_H - MARGIN) drawImageBlock(pending.removeFirst()) else break
+            }
         }
 
         // ── cover ────────────────────────────────────────────────────────────────
@@ -334,9 +354,11 @@ object PdfExporter {
             yTop += 4f
             // Promo banner.
             ch.promoBase64?.let { decode(it) }?.let { drawImageBlock(it) }
-            // Promo summary — light gray, smaller than body.
+            // Promo summary — light gray, smaller than body, prefixed with "摘要：" and set slightly
+            // apart from the body that follows.
             ch.summary?.takeIf { it.isNotBlank() }?.let {
-                paragraph(it, SUMMARY_SIZE, gray = 0.45f)
+                paragraph("摘要：$it", SUMMARY_SIZE, gray = 0.45f)
+                yTop += 6f   // extra gap between the summary and the chapter body
             }
             // Body + inline illustrations anchored per paragraph (1-based).
             // Chinese paragraphs get a two-full-width-space first-line indent.
@@ -345,12 +367,19 @@ object PdfExporter {
                 paragraph(indentIfChinese(ch.body), BODY_SIZE)
             } else {
                 val byAnchor = ch.illus.groupBy { it.anchorIndex }
+                // Pending-illustration queue: when an image is taller than the current page's
+                // remaining height we DON'T break to a new page immediately (that would leave a big
+                // blank gap at the bottom). Instead it stays queued while following paragraphs fill
+                // this page, and is drawn once it fits — landing after a later paragraph / atop the
+                // next page. (Trades exact per-paragraph anchoring for a gap-free layout.)
+                val pending = ArrayDeque<Bitmap>()
                 paras.forEachIndexed { idx, para ->
                     paragraph(indentIfChinese(para), BODY_SIZE)
-                    byAnchor[idx + 1]?.forEach { ill ->
-                        decode(ill.base64)?.let { drawImageBlock(it) }
-                    }
+                    byAnchor[idx + 1]?.forEach { ill -> decode(ill.base64)?.let { pending.addLast(it) } }
+                    flushPendingImages(pending)
                 }
+                // No more body text to fill with → draw whatever's left (paging as needed).
+                while (pending.isNotEmpty()) drawImageBlock(pending.removeFirst())
             }
         }
 

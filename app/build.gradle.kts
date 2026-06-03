@@ -16,8 +16,8 @@ android {
         applicationId = "com.example.novelseek_ultra"
         minSdk = 24
         targetSdk = 36
-        versionCode = 10
-        versionName = "1.5.3"
+        versionCode = 11
+        versionName = "1.5.4"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }

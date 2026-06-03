@@ -82,9 +82,11 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -179,6 +181,15 @@ fun EditorScreen(
     var showInsertDialog by remember { mutableStateOf(false) }
     var reviseSelection by remember { mutableStateOf("") }
     var reviseInProgress by remember { mutableStateOf(false) }
+    // Selection-based polish (mirror of PC editors): the Final editor uses a TextFieldValue so we can
+    // read the user's text selection; a contextual "润色" button polishes just that span in place.
+    var finalTfv by remember(chapterId) { mutableStateOf(TextFieldValue(finalText)) }
+    var inlineRevising by remember { mutableStateOf(false) }
+    // Keep the editor's TextFieldValue in sync when finalText changes from OUTSIDE the editor
+    // (streaming generation, body reload). User typing keeps them equal, so this won't clobber the caret.
+    LaunchedEffect(finalText) {
+        if (finalText != finalTfv.text) finalTfv = finalTfv.copy(text = finalText, selection = TextRange(finalText.length))
+    }
     var showAiFill by remember { mutableStateOf(false) }
     var pendingTitleFromFill by remember { mutableStateOf<String?>(null) }
     var showRealmDialog by remember { mutableStateOf(false) }
@@ -653,24 +664,59 @@ fun EditorScreen(
             Card(modifier = Modifier.fillMaxWidth().weight(1f).padding(top = 4.dp)) {
                 when (tab) {
                     EditorTab.Final -> Column(modifier = Modifier.fillMaxSize()) {
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .weight(1f)
-                                .verticalScroll(rememberScrollState())
-                                .padding(horizontal = 12.dp)
-                                .padding(top = 12.dp, bottom = 6.dp),
-                        ) {
-                            BasicTextField(
-                                value = finalText,
-                                onValueChange = { finalText = it },
-                                textStyle = TextStyle(
-                                    fontSize = 15.sp,
-                                    fontFamily = FontFamily.Serif,
-                                    color = MaterialTheme.colorScheme.onSurface,
-                                ),
-                                modifier = Modifier.fillMaxWidth(),
-                            )
+                        Box(modifier = Modifier.fillMaxWidth().weight(1f)) {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .verticalScroll(rememberScrollState())
+                                    .padding(horizontal = 12.dp)
+                                    .padding(top = 12.dp, bottom = 6.dp),
+                            ) {
+                                BasicTextField(
+                                    value = finalTfv,
+                                    onValueChange = { finalTfv = it; finalText = it.text },
+                                    textStyle = TextStyle(
+                                        fontSize = 15.sp,
+                                        fontFamily = FontFamily.Serif,
+                                        color = MaterialTheme.colorScheme.onSurface,
+                                    ),
+                                    modifier = Modifier.fillMaxWidth(),
+                                )
+                            }
+                            // Contextual polish button — appears when a non-empty span is selected, and
+                            // rewrites just that span in place (mirrors the PC editors' floating polish button).
+                            val selStart = minOf(finalTfv.selection.start, finalTfv.selection.end)
+                            val selEnd = maxOf(finalTfv.selection.start, finalTfv.selection.end)
+                            val hasSel = selEnd > selStart &&
+                                finalTfv.text.substring(selStart, selEnd).isNotBlank() && !isGenerating
+                            if (hasSel) {
+                                FilledTonalButton(
+                                    onClick = {
+                                        if (inlineRevising) return@FilledTonalButton
+                                        val passage = finalTfv.text.substring(selStart, selEnd)
+                                        inlineRevising = true
+                                        scope.launch {
+                                            val r = vm.reviseSelection(passage, null)
+                                            if (r != null) {
+                                                val merged = finalTfv.text.substring(0, selStart) + r + finalTfv.text.substring(selEnd)
+                                                finalText = merged
+                                                finalTfv = TextFieldValue(merged, selection = TextRange(selStart + r.length))
+                                            }
+                                            inlineRevising = false
+                                        }
+                                    },
+                                    modifier = Modifier.align(Alignment.TopEnd).padding(8.dp),
+                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                                ) {
+                                    if (inlineRevising) {
+                                        CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
+                                    } else {
+                                        Icon(Icons.Outlined.AutoAwesome, null, modifier = Modifier.size(16.dp))
+                                    }
+                                    Spacer(Modifier.width(4.dp))
+                                    Text(tx(lang, "润色选中", "Polish"), style = MaterialTheme.typography.labelMedium)
+                                }
+                            }
                         }
                         // Fixed word-count footer — always visible, no overlap, no wasted gap.
                         Row(

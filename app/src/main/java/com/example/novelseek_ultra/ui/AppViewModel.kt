@@ -35,6 +35,7 @@ import com.example.novelseek_ultra.data.model.TextModelConfig
 import com.example.novelseek_ultra.data.model.TextModelProfile
 import com.example.novelseek_ultra.data.nowIso
 import com.example.novelseek_ultra.util.buildRealmSystemContext
+import com.example.novelseek_ultra.util.buildVolumeRealmConstraint
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -375,9 +376,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun arcsForVolume(projectId: String, volumeId: String): List<PlotArc> =
         repo.plotArcs(projectId).filter { it.volumeId == volumeId }.sortedBy { it.order }
 
-    fun createVolume(projectId: String, name: String, description: String): Volume {
+    fun createVolume(projectId: String, name: String, description: String, realmPlan: String = ""): Volume {
         val order = (repo.volumes(projectId).maxOfOrNull { it.order } ?: -1) + 1
-        val v = Volume(id = "vol-${System.currentTimeMillis()}", name = name, description = description, order = order, createdAt = nowIso())
+        val v = Volume(id = "vol-${System.currentTimeMillis()}", name = name, description = description, order = order, createdAt = nowIso(), realmPlan = realmPlan)
         repo.setVolumes(projectId, repo.volumes(projectId) + v)
         return v
     }
@@ -549,10 +550,19 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         val arcs = repo.plotArcs(projectId)
         val arcContext = buildArcContext(arcs, lang)
         val realmCtx = buildRealmSystemContext(repo.cultivationRealms(projectId), lang)
+        // Per-volume realm ceiling (hard limit) for THIS chapter's owning volume — prevents over-leveling /
+        // skips / drops across the volume. Goes right after the realm ladder so it reads as the binding rule.
+        val ownerArc = chapter.arcId?.let { aid -> arcs.firstOrNull { it.id == aid } }
+            ?: arcs.firstOrNull { (it.builtChapterIds ?: emptyList()).contains(chapter.id) }
+        val volRealmConstraint = ownerArc?.volumeId
+            ?.let { vid -> repo.volumes(projectId).firstOrNull { it.id == vid } }
+            ?.let { vol -> buildVolumeRealmConstraint(vol.realmPlan, vol.name, lang, phase = "generate") }
+            ?.takeIf { it.isNotBlank() }
         val worldSettingRaw = repo.worldSetting(projectId).ifBlank { repo.outline(projectId) }
         val worldParts = listOfNotNull(
             arcContext.takeIf { it.isNotBlank() },
             realmCtx.takeIf { it.isNotBlank() },
+            volRealmConstraint,
             worldSettingRaw.takeIf { it.isNotBlank() },
         )
         val worldSetting = worldParts.joinToString("\n\n").takeIf { it.isNotBlank() }
@@ -703,6 +713,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     if (realmCtx.isNotBlank()) { appendLine(realmCtx); appendLine() }
                     arc.volumeId?.let { vid -> repo.volumes(projectId).firstOrNull { it.id == vid } }?.let { vol ->
                         appendLine("【所属副本】${vol.name}" + (vol.description.takeIf { it.isNotBlank() }?.let { "：$it" } ?: "")); appendLine()
+                        // Per-volume realm ceiling: the mini-outline sets the whole arc's breakthrough pacing.
+                        buildVolumeRealmConstraint(vol.realmPlan, vol.name, lang, phase = "plan").takeIf { it.isNotBlank() }?.let { appendLine(it); appendLine() }
                     }
                     buildArcContext(repo.plotArcs(projectId), lang).takeIf { it.isNotBlank() }?.let { appendLine(it); appendLine() }
                     buildCharacterGrowthGuidance(projectId, lang)?.let { appendLine(it); appendLine() }
@@ -1224,6 +1236,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 buildRealmSystemContext(repo.cultivationRealms(projectId), lang).takeIf { it.isNotBlank() }?.let {
                     if (isNotEmpty()) append("\n\n"); append(it)
                 }
+                // Per-volume realm ceiling: keep the generated arcs' breakthrough pacing within this volume's limit.
+                buildVolumeRealmConstraint(volume.realmPlan, volume.name, lang, phase = "plan").takeIf { it.isNotBlank() }?.let {
+                    if (isNotEmpty()) append("\n\n"); append(it)
+                }
                 containerGuidanceFor(projectId, lang) { it.affectsArcGeneration }.takeIf { it.isNotBlank() }?.let {
                     if (isNotEmpty()) append("\n\n"); append(it)
                 }
@@ -1371,10 +1387,19 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         val chapter = repo.chapters(projectId).firstOrNull { it.id == chapterId } ?: return null
         val lang = _uiLanguage.value
         return withContext(Dispatchers.IO) {
-            val arcContext = buildArcContext(repo.plotArcs(projectId), lang)
+            val arcs = repo.plotArcs(projectId)
+            val arcContext = buildArcContext(arcs, lang)
             val realmCtx = buildRealmSystemContext(repo.cultivationRealms(projectId), lang)
+            // Per-volume realm ceiling (hard limit) for THIS chapter's owning volume — same enforcement the
+            // manual generateChapter() path applies, so agent-written chapters can't drift past the limit either.
+            val ownerArc = chapter.arcId?.let { aid -> arcs.firstOrNull { it.id == aid } }
+                ?: arcs.firstOrNull { (it.builtChapterIds ?: emptyList()).contains(chapter.id) }
+            val volRealmConstraint = ownerArc?.volumeId
+                ?.let { vid -> repo.volumes(projectId).firstOrNull { it.id == vid } }
+                ?.let { vol -> buildVolumeRealmConstraint(vol.realmPlan, vol.name, lang, phase = "generate") }
+                ?.takeIf { it.isNotBlank() }
             val worldRaw = repo.worldSetting(projectId).ifBlank { repo.outline(projectId) }
-            val worldSetting = listOfNotNull(arcContext.ifBlank { null }, realmCtx.ifBlank { null }, worldRaw.ifBlank { null })
+            val worldSetting = listOfNotNull(arcContext.ifBlank { null }, realmCtx.ifBlank { null }, volRealmConstraint, worldRaw.ifBlank { null })
                 .joinToString("\n\n").ifBlank { null }
             val kbAug = buildKbAugmentation(projectId, chapter, lang)
             val messages = listOf(
@@ -1906,6 +1931,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         buildRealmSystemContext(repo.cultivationRealms(projectId), lang).takeIf { it.isNotBlank() }?.let { parts += it }
         arc?.volumeId?.let { vid -> repo.volumes(projectId).firstOrNull { it.id == vid } }?.let { vol ->
             parts += "【所属副本】${vol.name}" + (vol.description.takeIf { it.isNotBlank() }?.let { "：$it" } ?: "")
+            // Per-volume realm ceiling (hard limit) — prevents over-leveling / skips / drops while PLANNING.
+            buildVolumeRealmConstraint(vol.realmPlan, vol.name, lang, phase = "plan").takeIf { it.isNotBlank() }?.let { parts += it }
         }
         arc?.let { parts += "【所属弧线】${it.title}：${it.summary}" }
         buildArcContext(repo.plotArcs(projectId), lang).takeIf { it.isNotBlank() }?.let { parts += it }

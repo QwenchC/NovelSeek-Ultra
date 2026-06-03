@@ -160,6 +160,12 @@ data class Volume(
     val description: String = "",
     val order: Int = 0,
     val createdAt: String = "",
+    /**
+     * 本副本的修为/境界规划与上限（用户填写）。作为硬约束注入本副本的章节规划与生成，防止跨副本越级、
+     * 重复突破、忽高忽低。例："主角只突破到微尘境·巅峰，在微尘境内逐层稳步突破，不进入下一大境界"。
+     * 与 NovelSeek-Pro-PC 的 `Volume.realmPlan` 对齐，确保备份往返不丢该字段。
+     */
+    val realmPlan: String = "",
 )
 
 @Serializable

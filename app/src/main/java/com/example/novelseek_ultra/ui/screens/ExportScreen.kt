@@ -403,6 +403,25 @@ private fun writePdfFile(
         y += drawH + gapAfter
     }
 
+    // Height drawImage() will use for [bmp] — lets us check fit before committing to a page break.
+    fun imageDrawHeight(bmp: Bitmap): Int {
+        if (bmp.width <= 0 || bmp.height <= 0) return 0
+        var drawH = (bmp.height.toFloat() * maxWidth / bmp.width).toInt()
+        val maxH = pageHeight - 2 * margin
+        if (drawH > maxH) drawH = maxH
+        return drawH
+    }
+
+    // Draw queued illustrations that fit the current page's remaining height, in order. The first
+    // one that doesn't fit stays queued so following paragraphs fill this page first (no big blank
+    // gap at the bottom); it's drawn after a later paragraph / atop the next page once it fits.
+    fun flushPending(pending: ArrayDeque<Bitmap>) {
+        while (pending.isNotEmpty()) {
+            if (y + imageDrawHeight(pending.first()) <= pageHeight - margin) drawImage(pending.removeFirst())
+            else break
+        }
+    }
+
     // ── Cover page ──────────────────────────────────────────────────────
     coverBase64?.let { base64ToBitmap(it) }?.let { bmp ->
         drawImage(bmp)
@@ -433,14 +452,17 @@ private fun writePdfFile(
             wrapAndDraw(ch.body)
         } else {
             val byAnchor = ch.illustrations.groupBy { it.anchorIndex }
+            // Pending-illustration queue: defer images that don't fit the remaining page height so
+            // following paragraphs can fill the page first, avoiding a blank gap at the bottom.
+            val pending = ArrayDeque<Bitmap>()
             paragraphs.forEachIndexed { idx, para ->
                 wrapAndDraw(para)
                 y += 4
                 // anchorIndex is 1-based → paragraph at list index idx is anchor idx+1
-                byAnchor[idx + 1]?.forEach { ill ->
-                    base64ToBitmap(ill.base64)?.let { drawImage(it) }
-                }
+                byAnchor[idx + 1]?.forEach { ill -> base64ToBitmap(ill.base64)?.let { pending.addLast(it) } }
+                flushPending(pending)
             }
+            while (pending.isNotEmpty()) drawImage(pending.removeFirst())
         }
         finishPage()
     }

@@ -795,11 +795,11 @@ fun LongNovelScreen(
     // Create / edit / delete volume + AI generate volumes
     if (showCreateVolume) {
         VolumeDialog(lang = lang, initial = null, onDismiss = { showCreateVolume = false },
-            onSave = { name, desc -> vm.createVolume(projectId, name, desc); showCreateVolume = false })
+            onSave = { name, desc, realmPlan -> vm.createVolume(projectId, name, desc, realmPlan); showCreateVolume = false })
     }
     editingVolume?.let { vol ->
         VolumeDialog(lang = lang, initial = vol, onDismiss = { editingVolume = null },
-            onSave = { name, desc -> vm.updateVolume(projectId, vol.id) { it.copy(name = name, description = desc) }; editingVolume = null })
+            onSave = { name, desc, realmPlan -> vm.updateVolume(projectId, vol.id) { it.copy(name = name, description = desc, realmPlan = realmPlan) }; editingVolume = null })
     }
     deletingVolume?.let { vol ->
         ConfirmDialog(
@@ -1235,9 +1235,10 @@ private fun VolumeCard(
 }
 
 @Composable
-private fun VolumeDialog(lang: String, initial: Volume?, onDismiss: () -> Unit, onSave: (name: String, description: String) -> Unit) {
+private fun VolumeDialog(lang: String, initial: Volume?, onDismiss: () -> Unit, onSave: (name: String, description: String, realmPlan: String) -> Unit) {
     var name by remember { mutableStateOf(initial?.name.orEmpty()) }
     var desc by remember { mutableStateOf(initial?.description.orEmpty()) }
+    var realmPlan by remember { mutableStateOf(initial?.realmPlan.orEmpty()) }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text(if (initial == null) tx(lang, "新建副本", "New Volume") else tx(lang, "编辑副本", "Edit Volume")) },
@@ -1247,10 +1248,22 @@ private fun VolumeDialog(lang: String, initial: Volume?, onDismiss: () -> Unit, 
                     singleLine = true, modifier = Modifier.fillMaxWidth())
                 OutlinedTextField(desc, { desc = it }, label = { Text(tx(lang, "副本描述", "Description")) },
                     minLines = 3, modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(realmPlan, { realmPlan = it },
+                    label = { Text(tx(lang, "本副本修为/境界规划（硬约束）", "Cultivation realm plan (hard limit)")) },
+                    placeholder = { Text(tx(lang,
+                        "例：主角只突破到「微尘境·巅峰」，在微尘境内逐层稳步突破，本副本不进入下一大境界。",
+                        "e.g. Protagonist only reaches the peak of the first major realm, stepping steadily through its sub-realms; no next major realm this volume."),
+                        style = MaterialTheme.typography.bodySmall) },
+                    minLines = 2, modifier = Modifier.fillMaxWidth())
+                Text(tx(lang,
+                    "会作为最高优先级硬约束注入本副本的章节规划与正文生成，防止越级、跳级、跌落、忽高忽低。",
+                    "Injected as a top-priority hard limit into this volume's planning & generation to prevent over-leveling, skips, drops, or erratic jumps."),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.outline)
             }
         },
         confirmButton = {
-            TextButton(enabled = name.isNotBlank(), onClick = { onSave(name.trim(), desc.trim()) }) { Text(tx(lang, "保存", "Save")) }
+            TextButton(enabled = name.isNotBlank(), onClick = { onSave(name.trim(), desc.trim(), realmPlan.trim()) }) { Text(tx(lang, "保存", "Save")) }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text(tx(lang, "取消", "Cancel")) } },
     )

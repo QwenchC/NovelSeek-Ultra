@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -23,6 +24,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -103,6 +105,7 @@ import com.example.novelseek_ultra.data.model.CoverImageConfig
 import com.example.novelseek_ultra.data.model.CoverImageItem
 import com.example.novelseek_ultra.data.model.PlotArc
 import com.example.novelseek_ultra.ui.AppViewModel
+import com.example.novelseek_ultra.ui.isLandscape
 import com.example.novelseek_ultra.util.tx
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -132,6 +135,7 @@ fun LongNovelScreen(
     val isGenerating by vm.isGenerating.collectAsState()
     val streaming by vm.streamingText.collectAsState()
     val scope = rememberCoroutineScope()
+    val landscape = isLandscape()
 
     var showArcDialog by remember { mutableStateOf<PlotArc?>(null) }
     var createArcVolumeId by remember { mutableStateOf<String?>(null) }   // manual add arc → which volume
@@ -167,6 +171,9 @@ fun LongNovelScreen(
     var batchPromoRunning by remember { mutableStateOf(false) }
     var batchPromoProgress by remember { mutableStateOf("") }
     val lazyListState = rememberLazyListState()
+    // Landscape only: the left pane (stats / toolbar / volumes) scrolls independently of the
+    // chapter list, which keeps using lazyListState (right pane) so chapter nav/paging is intact.
+    val leftListState = rememberLazyListState()
     val snackbarHost = remember { SnackbarHostState() }
 
     // ── Chapter pagination ──────────────────────────────────────────────────────
@@ -194,7 +201,10 @@ fun LongNovelScreen(
 
     LaunchedEffect(pendingScrollPos, safePage) {
         val pos = pendingScrollPos ?: return@LaunchedEffect
-        lazyListState.animateScrollToItem((firstChapterItemIndex + pos).coerceAtLeast(0))
+        // In landscape the chapter list is its own LazyColumn (right pane): the chapter header is
+        // item 0 and chapter cards start at 1. In portrait chapters trail the stats/volume items.
+        val base = if (landscape) 1 else firstChapterItemIndex
+        lazyListState.animateScrollToItem((base + pos).coerceAtLeast(0))
         pendingScrollPos = null
     }
 
@@ -257,13 +267,8 @@ fun LongNovelScreen(
         },
         snackbarHost = { SnackbarHost(hostState = snackbarHost) },
     ) { padding ->
-        Box(modifier = Modifier.fillMaxSize().padding(padding)) {
-        LazyColumn(
-            state = lazyListState,
-            modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
-            contentPadding = PaddingValues(vertical = 16.dp),
-        ) {
+        // Section builders shared by the portrait single column and the landscape two-pane layout.
+        val statsAndToolbar: LazyListScope.() -> Unit = {
             item {
                 // Full-width tappable stats card → opens markdown outline preview. fillMaxWidth so
                 // the card spans the list even when the description is short.
@@ -388,7 +393,8 @@ fun LongNovelScreen(
                     }
                 }
             }
-
+        }
+        val volumesSection: LazyListScope.() -> Unit = {
             // ── 副本 (Volumes) section — each volume holds its plot arcs ─────
             item {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -474,7 +480,8 @@ fun LongNovelScreen(
                     }
                 }
             }
-
+        }
+        val chaptersSection: LazyListScope.() -> Unit = {
             // ── Chapters section ────────────────────────────────────────
             item {
                 Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
@@ -562,26 +569,65 @@ fun LongNovelScreen(
                     }
                 }
             }
-        } // end LazyColumn
+        } // end chaptersSection
 
-        // Scroll arrows — visible while scrolling, auto-hide 1s after stop
-        AnimatedVisibility(
-            visible = showScrollArrows,
-            enter = fadeIn(),
-            exit = fadeOut(),
-            modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 16.dp),
-        ) {
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                SmallFloatingActionButton(
-                    onClick = { scope.launch { lazyListState.animateScrollToItem(0) } },
-                    elevation = FloatingActionButtonDefaults.elevation(4.dp),
-                ) { Icon(Icons.Outlined.KeyboardArrowUp, contentDescription = null) }
-                SmallFloatingActionButton(
-                    onClick = { scope.launch { lazyListState.animateScrollToItem(lazyListState.layoutInfo.totalItemsCount - 1) } },
-                    elevation = FloatingActionButtonDefaults.elevation(4.dp),
-                ) { Icon(Icons.Outlined.KeyboardArrowDown, contentDescription = null) }
+        Box(modifier = Modifier.fillMaxSize().padding(padding)) {
+            if (landscape) {
+                // Landscape: left = stats / toolbar / volumes & arcs, right = chapter list.
+                Row(
+                    modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp),
+                    horizontalArrangement = Arrangement.spacedBy(16.dp),
+                ) {
+                    LazyColumn(
+                        state = leftListState,
+                        modifier = Modifier.weight(1f).fillMaxHeight(),
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
+                        contentPadding = PaddingValues(vertical = 16.dp),
+                    ) {
+                        statsAndToolbar()
+                        volumesSection()
+                    }
+                    LazyColumn(
+                        state = lazyListState,
+                        modifier = Modifier.weight(1f).fillMaxHeight(),
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
+                        contentPadding = PaddingValues(vertical = 16.dp),
+                    ) {
+                        chaptersSection()
+                    }
+                }
+            } else {
+                LazyColumn(
+                    state = lazyListState,
+                    modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                    contentPadding = PaddingValues(vertical = 16.dp),
+                ) {
+                    statsAndToolbar()
+                    volumesSection()
+                    chaptersSection()
+                }
             }
-        }
+
+            // Scroll arrows — visible while scrolling, auto-hide 1s after stop. Drives the chapter
+            // list (the right pane in landscape; the whole list in portrait).
+            AnimatedVisibility(
+                visible = showScrollArrows,
+                enter = fadeIn(),
+                exit = fadeOut(),
+                modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 16.dp),
+            ) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    SmallFloatingActionButton(
+                        onClick = { scope.launch { lazyListState.animateScrollToItem(0) } },
+                        elevation = FloatingActionButtonDefaults.elevation(4.dp),
+                    ) { Icon(Icons.Outlined.KeyboardArrowUp, contentDescription = null) }
+                    SmallFloatingActionButton(
+                        onClick = { scope.launch { lazyListState.animateScrollToItem(lazyListState.layoutInfo.totalItemsCount - 1) } },
+                        elevation = FloatingActionButtonDefaults.elevation(4.dp),
+                    ) { Icon(Icons.Outlined.KeyboardArrowDown, contentDescription = null) }
+                }
+            }
         } // end Box
     }
 

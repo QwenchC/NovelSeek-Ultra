@@ -57,6 +57,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.material3.AlertDialog
 import com.example.novelseek_ultra.data.model.Project
 import com.example.novelseek_ultra.ui.AppViewModel
+import com.example.novelseek_ultra.ui.isLandscape
 import com.example.novelseek_ultra.ui.components.ConfirmDialog
 import com.example.novelseek_ultra.ui.components.EditProjectDialog
 import com.example.novelseek_ultra.util.tx
@@ -65,6 +66,7 @@ import com.example.novelseek_ultra.util.tx
 @Composable
 fun HomeScreen(vm: AppViewModel, onOpen: (projectId: String) -> Unit = {}) {
     val lang by vm.uiLanguage.collectAsState()
+    val landscape = isLandscape()
     val allProjects by vm.projects.collectAsState()
     val state by vm.state.collectAsState()
     val projects = remember(allProjects, state) {
@@ -123,13 +125,33 @@ fun HomeScreen(vm: AppViewModel, onOpen: (projectId: String) -> Unit = {}) {
                 verticalArrangement = Arrangement.spacedBy(12.dp),
                 contentPadding = PaddingValues(vertical = 16.dp),
             ) {
-                items(projects, key = { it.id }) { p ->
-                    ProjectCard(
-                        p, lang, vm,
-                        onOpen = { onOpen(p.id) },
-                        onRename = { renamingProject = p },
-                        onDelete = { deletingProject = p },
-                    )
+                if (landscape) {
+                    // Landscape: two cards per row. Same LazyColumn + scroll/FAB logic; each row
+                    // is one list item holding up to two equal-width cards.
+                    items(projects.chunked(2), key = { it.first().id }) { rowItems ->
+                        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                            rowItems.forEach { p ->
+                                Box(Modifier.weight(1f)) {
+                                    ProjectCard(
+                                        p, lang, vm,
+                                        onOpen = { onOpen(p.id) },
+                                        onRename = { renamingProject = p },
+                                        onDelete = { deletingProject = p },
+                                    )
+                                }
+                            }
+                            if (rowItems.size == 1) Spacer(Modifier.weight(1f))
+                        }
+                    }
+                } else {
+                    items(projects, key = { it.id }) { p ->
+                        ProjectCard(
+                            p, lang, vm,
+                            onOpen = { onOpen(p.id) },
+                            onRename = { renamingProject = p },
+                            onDelete = { deletingProject = p },
+                        )
+                    }
                 }
             }
         }

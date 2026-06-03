@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -18,6 +19,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
@@ -66,6 +68,7 @@ import com.example.novelseek_ultra.data.model.Chapter
 import com.example.novelseek_ultra.data.model.CoverImageConfig
 import com.example.novelseek_ultra.data.model.CoverImageItem
 import com.example.novelseek_ultra.ui.AppViewModel
+import com.example.novelseek_ultra.ui.isLandscape
 import com.example.novelseek_ultra.ui.components.ConfirmDialog
 import com.example.novelseek_ultra.ui.components.RenameDialog
 import com.example.novelseek_ultra.util.tx
@@ -104,7 +107,11 @@ fun ProjectScreen(
     var batchPromoRunning by remember { mutableStateOf(false) }
     var batchPromoProgress by remember { mutableStateOf("") }
 
+    val landscape = isLandscape()
     val lazyListState = rememberLazyListState()
+    // Landscape only: the left pane (stats / toolbar) scrolls independently; the chapter list keeps
+    // using lazyListState (right pane) so the FAB-hide rule below is unchanged.
+    val leftListState = rememberLazyListState()
     // Hide the FAB only when the list is BOTH scrolled past the top AND the last item is fully
     // visible. Brand-new projects whose content doesn't fill a screen can't scroll backward at
     // all, so the FAB stays visible — "already-at-top" wins over "also-at-bottom".
@@ -156,12 +163,8 @@ fun ProjectScreen(
             }
         },
     ) { padding ->
-        LazyColumn(
-            state = lazyListState,
-            modifier = Modifier.fillMaxSize().padding(padding).padding(horizontal = 16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
-            contentPadding = PaddingValues(vertical = 16.dp),
-        ) {
+        // Section builders shared by the portrait single column and the landscape two-pane layout.
+        val statsAndToolbar: LazyListScope.() -> Unit = {
             item {
                 // Full-width (fillMaxWidth) so the card spans the list even when the description
                 // is short — otherwise the Card shrink-wraps to its narrow text content.
@@ -250,6 +253,8 @@ fun ProjectScreen(
                     }
                 }
             }
+        }
+        val chaptersSection: LazyListScope.() -> Unit = {
             item {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
@@ -285,6 +290,41 @@ fun ProjectScreen(
                         onDelete = { deletingChapter = ch },
                     )
                 }
+            }
+        }
+
+        if (landscape) {
+            // Landscape: left = stats / action buttons, right = chapter list.
+            Row(
+                modifier = Modifier.fillMaxSize().padding(padding).padding(horizontal = 16.dp),
+                horizontalArrangement = Arrangement.spacedBy(16.dp),
+            ) {
+                LazyColumn(
+                    state = leftListState,
+                    modifier = Modifier.weight(1f).fillMaxHeight(),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                    contentPadding = PaddingValues(vertical = 16.dp),
+                ) {
+                    statsAndToolbar()
+                }
+                LazyColumn(
+                    state = lazyListState,
+                    modifier = Modifier.weight(1f).fillMaxHeight(),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                    contentPadding = PaddingValues(vertical = 16.dp),
+                ) {
+                    chaptersSection()
+                }
+            }
+        } else {
+            LazyColumn(
+                state = lazyListState,
+                modifier = Modifier.fillMaxSize().padding(padding).padding(horizontal = 16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+                contentPadding = PaddingValues(vertical = 16.dp),
+            ) {
+                statsAndToolbar()
+                chaptersSection()
             }
         }
     }

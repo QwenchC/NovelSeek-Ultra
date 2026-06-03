@@ -1,5 +1,6 @@
 package com.example.novelseek_ultra.ui
 
+import android.content.res.Configuration
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.AutoAwesome
@@ -15,16 +16,23 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.WindowInsetsSides
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.systemBars
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.ScaffoldDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import com.example.novelseek_ultra.ui.theme.NovelSeekTheme
@@ -35,6 +43,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavDestination.Companion.hierarchy
@@ -117,35 +126,63 @@ private fun AppRootBody(vm: AppViewModel) {
     val currentRoute = backStack?.destination?.route
 
     val isTabRoot = TABS.any { it.route == currentRoute }
+    val isLandscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
 
-    Scaffold(
-        bottomBar = {
-            if (isTabRoot) {
-                AgentBottomBar(
-                    currentRoute = currentRoute,
-                    lang = lang,
-                    onTab = { route ->
-                        if (currentRoute != route) {
-                            nav.navigate(route) {
-                                popUpTo(nav.graph.startDestinationId) { saveState = true }
-                                launchSingleTop = true
-                                restoreState = true
-                            }
-                        }
-                    },
-                    onAgent = { nav.navigate(Routes.AGENT) },
-                )
+    val onTab: (String) -> Unit = { route ->
+        if (currentRoute != route) {
+            nav.navigate(route) {
+                popUpTo(nav.graph.startDestinationId) { saveState = true }
+                launchSingleTop = true
+                restoreState = true
             }
         }
-    ) { innerPadding ->
-        NavHost(
-            navController = nav,
-            startDestination = Tab.LongHome.route,   // default to the long-novel list (short novels rarely used now)
-            modifier = Modifier.padding(innerPadding),
-        ) {
-            tabRoutes(nav, vm)
-            detailRoutes(nav, vm)
+    }
+    val onAgent: () -> Unit = { nav.navigate(Routes.AGENT) }
+
+    if (isLandscape) {
+        // Landscape: replace the bottom bar with a side navigation rail so the short
+        // landscape height isn't eaten by a horizontal bar. The portrait branch below
+        // is left exactly as it was, so portrait layout is unaffected.
+        Row(Modifier.fillMaxSize()) {
+            if (isTabRoot) {
+                AgentNavRail(currentRoute = currentRoute, lang = lang, onTab = onTab, onAgent = onAgent)
+            }
+            Scaffold(
+                modifier = Modifier.weight(1f).fillMaxHeight(),
+                // The rail already pads/paints the start system inset (cutout / side nav bar),
+                // so the content area only needs top + end + bottom insets. When no rail is
+                // shown (detail screens) fall back to full system-bar insets.
+                contentWindowInsets = if (isTabRoot)
+                    WindowInsets.systemBars.only(
+                        WindowInsetsSides.Top + WindowInsetsSides.End + WindowInsetsSides.Bottom
+                    )
+                else ScaffoldDefaults.contentWindowInsets,
+            ) { innerPadding ->
+                AppNavHost(nav, vm, Modifier.padding(innerPadding))
+            }
         }
+    } else {
+        Scaffold(
+            bottomBar = {
+                if (isTabRoot) {
+                    AgentBottomBar(currentRoute = currentRoute, lang = lang, onTab = onTab, onAgent = onAgent)
+                }
+            }
+        ) { innerPadding ->
+            AppNavHost(nav, vm, Modifier.padding(innerPadding))
+        }
+    }
+}
+
+@Composable
+private fun AppNavHost(nav: NavHostController, vm: AppViewModel, modifier: Modifier) {
+    NavHost(
+        navController = nav,
+        startDestination = Tab.LongHome.route,   // default to the long-novel list (short novels rarely used now)
+        modifier = modifier,
+    ) {
+        tabRoutes(nav, vm)
+        detailRoutes(nav, vm)
     }
 }
 
@@ -278,6 +315,69 @@ private fun AgentBottomBar(
                 Icon(Icons.Outlined.AutoAwesome, contentDescription = tx(lang, "智能体", "Agent"), modifier = Modifier.size(28.dp))
             }
         }
+    }
+}
+
+/**
+ * Landscape counterpart of [AgentBottomBar]: a vertical rail on the start side with the
+ * four tabs split 2 + 2 around the central agent button. Only shown in landscape; portrait
+ * keeps the original bottom bar untouched.
+ */
+@Composable
+private fun AgentNavRail(
+    currentRoute: String?,
+    lang: String,
+    onTab: (String) -> Unit,
+    onAgent: () -> Unit,
+) {
+    Surface(tonalElevation = 3.dp) {
+        Column(
+            modifier = Modifier
+                .fillMaxHeight()
+                // Pad/paint around the status bar (top), the gesture/nav bar and the display
+                // cutout on the start side — mirroring what the bottom bar does at the bottom.
+                .windowInsetsPadding(
+                    WindowInsets.systemBars.only(WindowInsetsSides.Start + WindowInsetsSides.Vertical)
+                )
+                .width(80.dp)
+                .padding(vertical = 12.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            // 2 + center + 2, distributed over the available height so it scales with the
+            // (short) landscape height instead of clipping on smaller screens.
+            verticalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                RailTab(TABS[0], currentRoute, lang, onTab)
+                Spacer(Modifier.height(8.dp))
+                RailTab(TABS[1], currentRoute, lang, onTab)
+            }
+            FloatingActionButton(
+                onClick = onAgent,
+                containerColor = MaterialTheme.colorScheme.primary,
+                contentColor = MaterialTheme.colorScheme.onPrimary,
+                modifier = Modifier.size(58.dp),
+            ) {
+                Icon(Icons.Outlined.AutoAwesome, contentDescription = tx(lang, "智能体", "Agent"), modifier = Modifier.size(28.dp))
+            }
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                RailTab(TABS[2], currentRoute, lang, onTab)
+                Spacer(Modifier.height(8.dp))
+                RailTab(TABS[3], currentRoute, lang, onTab)
+            }
+        }
+    }
+}
+
+@Composable
+private fun RailTab(tab: Tab, currentRoute: String?, lang: String, onTab: (String) -> Unit) {
+    val selected = currentRoute == tab.route
+    val color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+    Column(
+        modifier = Modifier.clickable { onTab(tab.route) }.padding(vertical = 6.dp, horizontal = 8.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Icon(tab.icon, contentDescription = null, tint = color, modifier = Modifier.size(24.dp))
+        Text(if (lang == "en") tab.en else tab.zh, style = MaterialTheme.typography.labelSmall, color = color)
     }
 }
 

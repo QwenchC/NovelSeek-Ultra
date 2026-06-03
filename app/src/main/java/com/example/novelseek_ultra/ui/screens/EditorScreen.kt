@@ -9,6 +9,7 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -102,6 +103,7 @@ import com.example.novelseek_ultra.data.model.Character
 import com.example.novelseek_ultra.data.model.Illustration
 import com.example.novelseek_ultra.data.model.PlotArc
 import com.example.novelseek_ultra.ui.AppViewModel
+import com.example.novelseek_ultra.ui.isLandscape
 import com.example.novelseek_ultra.ui.components.AppTopBar
 import com.example.novelseek_ultra.ui.components.RenameDialog
 import com.example.novelseek_ultra.util.tx
@@ -129,6 +131,7 @@ fun EditorScreen(
     val status by vm.statusMessage.collectAsState()
     val scope = rememberCoroutineScope()
     val snackbarHost = remember { SnackbarHostState() }
+    val landscape = isLandscape()
 
     if (chapter == null) {
         // The chapter was deleted (e.g. by the agent) while open → leave this page automatically.
@@ -348,9 +351,8 @@ fun EditorScreen(
         },
         snackbarHost = { SnackbarHost(hostState = snackbarHost) },
     ) { padding ->
-        Column(
-            modifier = Modifier.fillMaxSize().padding(padding).padding(horizontal = 12.dp),
-        ) {
+        // Section builders shared by portrait (single column) and landscape (two panes).
+        val planningCard: @Composable () -> Unit = {
             // ── Planning card ────────────────────────────────────────────
             Card(modifier = Modifier.fillMaxWidth().padding(top = 6.dp)) {
                 Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
@@ -576,7 +578,8 @@ fun EditorScreen(
                     }
                 }
             }
-
+        }
+        val tabsRow: @Composable () -> Unit = {
             // ── Arc status + Final/Draft tabs on the SAME row (saves a full row of vertical
             // space vs. the old stacked layout). Ratio 1:2 — arc pill on the left, tabs on the
             // right. Whole row uses labelSmall to match the arc banner's original size. For long
@@ -641,7 +644,8 @@ fun EditorScreen(
                     }
                 }
             }
-
+        }
+        val editorBody: @Composable ColumnScope.() -> Unit = {
             // Editor body — claims ALL remaining vertical space right down to the window's
             // bottom inset. Renders one of two views based on the selected tab:
             //   - Final: classic full-screen prose editor with word-count footer
@@ -717,6 +721,33 @@ fun EditorScreen(
                         },
                     )
                 }
+            }
+        }
+
+        if (landscape) {
+            // Landscape: left = planning card, right = format tabs + editor body. The wide editor
+            // body gets the larger share so there's more room for prose.
+            Row(
+                modifier = Modifier.fillMaxSize().padding(padding).padding(horizontal = 12.dp),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Column(
+                    modifier = Modifier.weight(1f).fillMaxHeight().verticalScroll(rememberScrollState()),
+                ) {
+                    planningCard()
+                }
+                Column(modifier = Modifier.weight(1.3f).fillMaxHeight()) {
+                    tabsRow()
+                    editorBody()
+                }
+            }
+        } else {
+            Column(
+                modifier = Modifier.fillMaxSize().padding(padding).padding(horizontal = 12.dp),
+            ) {
+                planningCard()
+                tabsRow()
+                editorBody()
             }
         }
     }

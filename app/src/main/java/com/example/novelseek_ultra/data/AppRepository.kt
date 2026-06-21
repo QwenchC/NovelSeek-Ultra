@@ -492,6 +492,27 @@ class AppRepository(context: Context) {
         mutateState { it.with("entitiesEnabled", JsonPrimitive(enabled)) }
     }
 
+    // ── Chapter generation toggles ──────────────────────────────────────────
+    // Stepwise (logic-chain) chapter generation: instead of one giant 3000+ word call, the AI first
+    // drafts a beat-by-beat blueprint (bound to this chapter's plan / realm system / containers /
+    // prior context), then writes each beat in sequence. Reduces long-form logic errors. Off by
+    // default — the legacy one-shot path is preserved and the user can switch back any time.
+    fun stepwiseChapterGen(): Boolean =
+        (_state.value["stepwiseChapterGen"] as? JsonPrimitive)?.booleanOrNull ?: false
+
+    fun setStepwiseChapterGen(enabled: Boolean) {
+        mutateState { it.with("stepwiseChapterGen", JsonPrimitive(enabled)) }
+    }
+
+    // When on AND the chapter draft is non-empty, the user's draft is injected into generation as a
+    // strong reference. Off by default.
+    fun useDraftReference(): Boolean =
+        (_state.value["useDraftReference"] as? JsonPrimitive)?.booleanOrNull ?: false
+
+    fun setUseDraftReference(enabled: Boolean) {
+        mutateState { it.with("useDraftReference", JsonPrimitive(enabled)) }
+    }
+
     // ── Chapter promo (stored in promoByChapter map in state) ────────────────────────────────
 
     fun getChapterPromo(chapterId: String): ChapterPromo? {

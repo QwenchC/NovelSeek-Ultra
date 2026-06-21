@@ -67,6 +67,7 @@ import com.example.novelseek_ultra.ui.screens.OutlineScreen
 import com.example.novelseek_ultra.ui.screens.ProjectScreen
 import com.example.novelseek_ultra.ui.screens.NovelQaScreen
 import com.example.novelseek_ultra.ui.screens.SettingsScreen
+import com.example.novelseek_ultra.ui.screens.TutorialScreen
 import com.example.novelseek_ultra.ui.screens.VersionHistoryScreen
 
 private sealed class Tab(val route: String, val zh: String, val en: String, val icon: ImageVector) {
@@ -91,6 +92,7 @@ object Routes {
     const val NOVEL_QA = "novel_qa/{id}"
     const val AGENT = "agent"
     const val CONTAINER = "container/{id}"
+    const val TUTORIAL = "tutorial"
 
     fun project(id: String) = "project/$id"
     fun outline(id: String) = "outline/$id"
@@ -188,10 +190,18 @@ private fun AppNavHost(nav: NavHostController, vm: AppViewModel, modifier: Modif
 
 private fun NavGraphBuilder.tabRoutes(nav: NavHostController, vm: AppViewModel) {
     composable(Tab.Home.route) {
-        HomeScreen(vm, onOpen = { id -> nav.navigate(Routes.project(id)) })
+        HomeScreen(
+            vm,
+            onOpen = { id -> nav.navigate(Routes.project(id)) },
+            onOpenTutorial = { nav.navigate(Routes.TUTORIAL) },
+        )
     }
     composable(Tab.LongHome.route) {
-        LongNovelsHomeScreen(vm, onOpen = { id -> nav.navigate(Routes.longProject(id)) })
+        LongNovelsHomeScreen(
+            vm,
+            onOpen = { id -> nav.navigate(Routes.longProject(id)) },
+            onOpenTutorial = { nav.navigate(Routes.TUTORIAL) },
+        )
     }
     composable(Tab.Listen.route) { ListenScreen(vm) }
     composable(Tab.Settings.route) { SettingsScreen(vm) }
@@ -277,6 +287,9 @@ private fun NavGraphBuilder.detailRoutes(nav: NavHostController, vm: AppViewMode
     }
     composable(Routes.AGENT) {
         AgentScreen(vm = vm, onBack = { nav.popBackStack() })
+    }
+    composable(Routes.TUTORIAL) {
+        TutorialScreen(vm = vm, onBack = { nav.popBackStack() })
     }
 }
 

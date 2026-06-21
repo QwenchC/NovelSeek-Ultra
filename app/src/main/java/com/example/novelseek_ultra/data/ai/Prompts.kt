@@ -495,6 +495,9 @@ Style:
         // KB-augmentation context (book/arc summaries, open foreshadowing, RAG-retrieved
         // long-range memory). Emitted as its own labeled block when non-null.
         kbAugmentation: String? = null,
+        // The user's own draft of this chapter (from the editor's Draft tab), injected as a strong
+        // reference when the "use draft" switch is on and the draft is non-empty.
+        draftReference: String? = null,
     ): String = buildString {
         if (language == "en") {
             chapterList?.takeIf { it.isNotBlank() }?.let { appendLine("[Novel Chapter Structure]\n$it\n") }
@@ -509,6 +512,9 @@ Style:
             }
             charactersInfo?.takeIf { it.isNotBlank() }?.let {
                 appendLine("[Important: Character Bible - follow strictly]\nKeep identity/personality/background/motivation consistent:\n\n$it\n")
+            }
+            draftReference?.takeIf { it.isNotBlank() }?.let {
+                appendLine("[Author's draft reference — the user's own draft/outline of THIS chapter]\nBuild on it: adopt its plot direction, key events and intent, then expand and polish it into full prose. Stay consistent with the world/timeline/character/realm settings above. Do not copy it verbatim, and do not deviate from its core arrangement.\n\n$it\n")
             }
             if (isContinuation) {
                 prevSummary?.takeIf { it.isNotBlank() }?.let {
@@ -539,6 +545,9 @@ Style:
             charactersInfo?.takeIf { it.isNotBlank() }?.let {
                 appendLine("【重要：角色设定 - 必须严格遵守】\n以下是本小说的角色设定，生成内容时必须保持角色身份、性格、背景完全一致，不得擅自更改：\n\n$it\n")
             }
+            draftReference?.takeIf { it.isNotBlank() }?.let {
+                appendLine("【作者草稿参考 — 用户已起草的本章内容/要点】\n请据此创作：在保持上述世界观/时间线/角色/境界设定一致的前提下，充分采纳草稿的情节走向、关键事件与写作意图，对其润色、扩写、补全为完整正文；不要照抄草稿，也不要偏离草稿的核心安排。\n\n$it\n")
+            }
             if (isContinuation) {
                 prevSummary?.takeIf { it.isNotBlank() }?.let {
                     appendLine("【前几章结尾内容（仅供衔接参考，正文中绝对不能出现\"第X章\"或任何章节标记）】\n$it\n")
@@ -554,6 +563,132 @@ Style:
             charactersInfo?.takeIf { it.isNotBlank() }?.let {
                 appendLine("\n\n【动笔前强制核对 — 以下角色设定绝对不可更改，如与上文任何内容矛盾，以此处为准】\n$it\n\n立即开始写作，直接输出正文，不要添加任何说明：")
             }
+        }
+    }
+
+    // ── Stepwise (logic-chain) chapter generation ──────────────────────────────────────────────
+    // Two-stage path used when the "stepwise" switch is on: (1) blueprint = an ordered list of
+    // writing beats bound to this chapter's plan/realm/containers/prior context; (2) per-beat prose.
+
+    /** Delimiter the blueprint uses between beats — language-agnostic so parsing is trivial. */
+    const val BEAT_DELIM = "@@BEAT@@"
+
+    fun chapterBlueprintSystem(language: String) = if (language == "en") {
+        """You are a meticulous fiction story planner. Given a chapter's goal, the world/timeline/character/realm settings and prior context, break THIS chapter into an ordered list of writing beats that a writer will later expand one by one.
+
+Rules:
+- Each beat is a concrete narrative unit (a scene/turn/event), in chronological order, forming one coherent logic chain for the chapter.
+- For each beat note: what happens, which characters are involved, the binding constraints to obey (realm/power level, world rules, timeline, established facts), and how it connects to the previous beat and to any open foreshadowing.
+- Do NOT write prose. Output the plan only.
+- Separate every beat with a line containing exactly: $BEAT_DELIM
+- Output 4 to 7 beats."""
+    } else {
+        """你是一位严谨的小说剧情策划。给定本章目标、世界观/时间线/角色/境界设定以及前情，请把【本章】拆解为有序的写作节拍清单，供作者随后逐拍扩写。
+
+规则：
+- 每个节拍是一个具体的叙事单元（一个场景/转折/事件），按时间顺序排列，串成本章一条连贯的逻辑链。
+- 每个节拍需写明：发生什么、涉及哪些角色、必须遵守的硬约束（境界/战力上限、世界观规则、时间线、既定事实），以及它与上一拍、与未回收伏笔的衔接关系。
+- 不要写正文，只输出节拍规划。
+- 每个节拍之间用单独一行的精确分隔符隔开：$BEAT_DELIM
+- 输出 4 到 7 个节拍。"""
+    }
+
+    fun chapterBlueprintUser(
+        chapterTitle: String,
+        outlineGoal: String,
+        conflict: String?,
+        prevSummary: String?,
+        currentContent: String?,
+        chapterList: String?,
+        charactersInfo: String?,
+        worldSetting: String?,
+        timeline: String?,
+        kbAugmentation: String?,
+        draftReference: String?,
+        targetWords: Int,
+        isContinuation: Boolean,
+        language: String,
+    ): String = buildString {
+        if (language == "en") {
+            chapterList?.takeIf { it.isNotBlank() }?.let { appendLine("[Novel Chapter Structure]\n$it\n") }
+            kbAugmentation?.takeIf { it.isNotBlank() }?.let { appendLine("[Knowledge Base Augmentation]\n$it\n") }
+            worldSetting?.takeIf { it.isNotBlank() }?.let { appendLine("[World Building]\n$it\n") }
+            timeline?.takeIf { it.isNotBlank() }?.let { appendLine("[Timeline]\n$it\n") }
+            charactersInfo?.takeIf { it.isNotBlank() }?.let { appendLine("[Character Bible]\n$it\n") }
+            prevSummary?.takeIf { it.isNotBlank() }?.let { appendLine("[Previous chapters tail — context only]\n$it\n") }
+            draftReference?.takeIf { it.isNotBlank() }?.let { appendLine("[Author's draft of this chapter — base the beats on it]\n$it\n") }
+            if (isContinuation) currentContent?.takeIf { it.isNotBlank() }?.let { appendLine("[Already-written content of this chapter so far]\n${it.takeLast(2000)}\n") }
+            appendLine("Plan the beats for this chapter.\nTitle: $chapterTitle\nGoal: $outlineGoal\nCore conflict: ${conflict.orEmpty()}\nThe full chapter should total about $targetWords words across all beats.")
+            append("Output the beat plan now, separating each beat with a line of exactly $BEAT_DELIM :")
+        } else {
+            chapterList?.takeIf { it.isNotBlank() }?.let { appendLine("【小说章节结构】\n$it\n") }
+            kbAugmentation?.takeIf { it.isNotBlank() }?.let { appendLine("【知识库增强 — 全书梗概/弧线进度/未回收伏笔/长程记忆】\n$it\n") }
+            worldSetting?.takeIf { it.isNotBlank() }?.let { appendLine("【世界观设定】\n$it\n") }
+            timeline?.takeIf { it.isNotBlank() }?.let { appendLine("【时间线】\n$it\n") }
+            charactersInfo?.takeIf { it.isNotBlank() }?.let { appendLine("【角色设定】\n$it\n") }
+            prevSummary?.takeIf { it.isNotBlank() }?.let { appendLine("【前几章结尾（仅供衔接参考）】\n$it\n") }
+            draftReference?.takeIf { it.isNotBlank() }?.let { appendLine("【作者本章草稿 — 请据此规划节拍】\n$it\n") }
+            if (isContinuation) currentContent?.takeIf { it.isNotBlank() }?.let { appendLine("【本章已写内容】\n${it.takeLast(2000)}\n") }
+            appendLine("请规划本章的写作节拍。\n章节标题：$chapterTitle\n本章目标：$outlineGoal\n核心冲突：${conflict.orEmpty()}\n全章各节拍合计约${targetWords}字。")
+            append("现在输出节拍规划，每个节拍之间用单独一行的精确分隔符隔开：$BEAT_DELIM ")
+        }
+    }
+
+    fun chapterSegmentSystem(language: String) = if (language == "en") {
+        """You are a skilled fiction writer executing a pre-approved chapter blueprint. You will be given the full blueprint, the prose written so far, and the SINGLE beat to write now. Write ONLY that beat as polished prose.
+
+Hard rules:
+1. Strictly obey world building, timeline, character bible, and realm/power constraints.
+2. Continue seamlessly from the prose so far — no repetition, no recap.
+3. Write ONLY the current beat; do not jump ahead to later beats.
+4. Output plain prose only — no Markdown, no beat numbers, no headings, no notes."""
+    } else {
+        """你是一位优秀的小说作者，正在按既定的本章写作蓝图逐拍执行。你会收到完整蓝图、目前已写好的正文，以及【当前要写的这一拍】。只写这一拍，输出打磨好的正文。
+
+硬性规则：
+1. 严格遵守世界观、时间线、角色设定与境界/战力约束。
+2. 与已写正文无缝衔接——不重复、不复述前文。
+3. 只写当前这一拍，不要提前写后面的节拍。
+4. 只输出纯正文——不要 markdown、不要节拍编号、不要小标题、不要任何说明。"""
+    }
+
+    fun chapterSegmentUser(
+        chapterTitle: String,
+        blueprint: String,
+        currentBeat: String,
+        beatIndex: Int,
+        beatTotal: Int,
+        writtenTail: String?,
+        charactersInfo: String?,
+        worldSetting: String?,
+        timeline: String?,
+        kbAugmentation: String?,
+        draftReference: String?,
+        targetWords: Int,
+        language: String,
+    ): String = buildString {
+        if (language == "en") {
+            worldSetting?.takeIf { it.isNotBlank() }?.let { appendLine("[World Building — obey strictly]\n$it\n") }
+            timeline?.takeIf { it.isNotBlank() }?.let { appendLine("[Timeline — obey strictly]\n$it\n") }
+            charactersInfo?.takeIf { it.isNotBlank() }?.let { appendLine("[Character Bible — obey strictly]\n$it\n") }
+            kbAugmentation?.takeIf { it.isNotBlank() }?.let { appendLine("[Knowledge Base Augmentation]\n$it\n") }
+            draftReference?.takeIf { it.isNotBlank() }?.let { appendLine("[Author's draft of this chapter — honor its intent]\n$it\n") }
+            appendLine("[Full chapter blueprint]\n$blueprint\n")
+            writtenTail?.takeIf { it.isNotBlank() }?.let { appendLine("[Prose written so far — continue from its end, do not repeat]\n$it\n") }
+            appendLine("Chapter: $chapterTitle")
+            appendLine("Now write beat $beatIndex of $beatTotal ONLY:\n$currentBeat")
+            append("Write about $targetWords words for this beat. ${if (beatIndex == beatTotal) "This is the final beat — bring the chapter to a natural close." else "Do not conclude the chapter yet; leave a smooth handoff to the next beat."} Output plain prose only:")
+        } else {
+            worldSetting?.takeIf { it.isNotBlank() }?.let { appendLine("【世界观设定 — 必须遵守】\n$it\n") }
+            timeline?.takeIf { it.isNotBlank() }?.let { appendLine("【时间线 — 必须遵守】\n$it\n") }
+            charactersInfo?.takeIf { it.isNotBlank() }?.let { appendLine("【角色设定 — 必须遵守】\n$it\n") }
+            kbAugmentation?.takeIf { it.isNotBlank() }?.let { appendLine("【知识库增强】\n$it\n") }
+            draftReference?.takeIf { it.isNotBlank() }?.let { appendLine("【作者本章草稿 — 尊重其意图】\n$it\n") }
+            appendLine("【本章完整蓝图】\n$blueprint\n")
+            writtenTail?.takeIf { it.isNotBlank() }?.let { appendLine("【目前已写正文（请从其结尾自然续写，不要重复）】\n$it\n") }
+            appendLine("章节标题：$chapterTitle")
+            appendLine("现在只写第 $beatIndex / $beatTotal 拍：\n$currentBeat")
+            append("本拍约写${targetWords}字。${if (beatIndex == beatTotal) "这是最后一拍，请把本章自然收束。" else "本章尚未结束，请为下一拍留下顺畅的衔接，不要提前收尾。"}只输出纯正文：")
         }
     }
 

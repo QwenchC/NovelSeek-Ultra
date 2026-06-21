@@ -121,6 +121,21 @@ private fun renderInline(text: String): AnnotatedString = buildAnnotatedString {
     var i = 0
     while (i < text.length) {
         val ch = text[i]
+        // Drop the image marker '!' so "![alt](url)" renders as just its alt text (block-level
+        // images are handled by the caller, e.g. the tutorial screen).
+        if (ch == '!' && i + 1 < text.length && text[i + 1] == '[') { i += 1; continue }
+        // Links "[text](url)" → render only the text (this lightweight renderer has no navigation).
+        if (ch == '[') {
+            val closeBracket = text.indexOf(']', i + 1)
+            if (closeBracket > i && closeBracket + 1 < text.length && text[closeBracket + 1] == '(') {
+                val closeParen = text.indexOf(')', closeBracket + 2)
+                if (closeParen > closeBracket) {
+                    append(text.substring(i + 1, closeBracket))
+                    i = closeParen + 1
+                    continue
+                }
+            }
+        }
         if (ch == '*') {
             // Greedy: try ** (bold) first, then * (italic)
             if (i + 1 < text.length && text[i + 1] == '*') {

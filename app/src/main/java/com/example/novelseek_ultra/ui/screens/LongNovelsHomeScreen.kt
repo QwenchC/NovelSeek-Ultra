@@ -27,6 +27,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.MenuBook
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.AutoStories
 import androidx.compose.material.icons.outlined.Delete
@@ -63,7 +64,11 @@ import com.example.novelseek_ultra.util.tx
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun LongNovelsHomeScreen(vm: AppViewModel, onOpen: (projectId: String) -> Unit) {
+fun LongNovelsHomeScreen(
+    vm: AppViewModel,
+    onOpen: (projectId: String) -> Unit,
+    onOpenTutorial: () -> Unit = {},
+) {
     val lang by vm.uiLanguage.collectAsState()
     val landscape = isLandscape()
     val projects by vm.projects.collectAsState()
@@ -89,13 +94,21 @@ fun LongNovelsHomeScreen(vm: AppViewModel, onOpen: (projectId: String) -> Unit) 
     Scaffold(
         contentWindowInsets = androidx.compose.foundation.layout.WindowInsets(0),
         topBar = {
-            AppTopBar(title = {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Outlined.AutoStories, contentDescription = null)
-                    Spacer(Modifier.width(8.dp))
-                    Text(tx(lang, "长篇小说", "Long Novels"), style = MaterialTheme.typography.titleLarge)
-                }
-            })
+            AppTopBar(
+                title = {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Outlined.AutoStories, contentDescription = null)
+                        Spacer(Modifier.width(8.dp))
+                        Text(tx(lang, "长篇小说", "Long Novels"), style = MaterialTheme.typography.titleLarge)
+                    }
+                },
+                actions = {
+                    IconButton(onClick = onOpenTutorial) {
+                        Icon(Icons.AutoMirrored.Outlined.MenuBook,
+                            contentDescription = tx(lang, "使用教程", "Tutorial"))
+                    }
+                },
+            )
         },
         floatingActionButton = {
             AnimatedVisibility(

@@ -537,6 +537,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         projectId: String,
         chapter: Chapter,
         currentContent: String? = null,  // full existing final text; null → fresh generation
+        stepwise: Boolean = false,       // logic-chain path: blueprint → per-beat prose (off = legacy one-shot)
+        draftReference: String? = null,  // user's chapter draft (from the Draft tab), injected as a strong reference
     ) {
         val cfg = repo.activeTextModelConfig()
         if (!cfg.isValid()) {
@@ -580,30 +582,51 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             // Each layer respects its own enable flag and silently no-ops if config is missing.
             val kbAugmentation = buildKbAugmentation(projectId, chapter, lang)
 
-            val messages = listOf(
-                ChatMessage("system", Prompts.chapterSystem(lang)),
-                ChatMessage("user", Prompts.chapterUser(
-                    chapterTitle = chapter.title,
-                    outlineGoal = chapter.outline_goal.orEmpty(),
-                    conflict = chapter.conflict,
-                    prevSummary = prevSummary.takeIf { it.isNotBlank() },
-                    currentContent = if (isContinuation) currentContent!!.takeLast(2000) else null,
-                    chapterList = chapterList.takeIf { it.isNotBlank() },
-                    charactersInfo = charactersInfo,
-                    worldSetting = worldSetting,
-                    timeline = timeline,
-                    targetWords = TARGET_WORDS,
-                    isContinuation = isContinuation,
-                    language = lang,
-                    kbAugmentation = kbAugmentation,
-                )),
-            )
             try {
-                ai.streamChat(cfg, messages).collect { ev ->
-                    when (ev) {
-                        is AiService.StreamEvent.Delta -> _streamingText.value = _streamingText.value + ev.text
-                        AiService.StreamEvent.Done -> {}
-                        is AiService.StreamEvent.Error -> _statusMessage.value = "生成失败：${ev.message}"
+                if (stepwise) {
+                    // Logic-chain path: first draft a beat-by-beat blueprint bound to this chapter's
+                    // plan/realm/containers/prior context, then write each beat in sequence. Each beat
+                    // streams into _streamingText, so the UI updates live just like the one-shot path.
+                    generateChapterStepwise(
+                        cfg = cfg,
+                        chapter = chapter,
+                        currentContent = currentContent,
+                        isContinuation = isContinuation,
+                        lang = lang,
+                        chapterList = chapterList.takeIf { it.isNotBlank() },
+                        charactersInfo = charactersInfo,
+                        worldSetting = worldSetting,
+                        timeline = timeline,
+                        prevSummary = prevSummary.takeIf { it.isNotBlank() },
+                        kbAugmentation = kbAugmentation,
+                        draftReference = draftReference,
+                    )
+                } else {
+                    val messages = listOf(
+                        ChatMessage("system", Prompts.chapterSystem(lang)),
+                        ChatMessage("user", Prompts.chapterUser(
+                            chapterTitle = chapter.title,
+                            outlineGoal = chapter.outline_goal.orEmpty(),
+                            conflict = chapter.conflict,
+                            prevSummary = prevSummary.takeIf { it.isNotBlank() },
+                            currentContent = if (isContinuation) currentContent!!.takeLast(2000) else null,
+                            chapterList = chapterList.takeIf { it.isNotBlank() },
+                            charactersInfo = charactersInfo,
+                            worldSetting = worldSetting,
+                            timeline = timeline,
+                            targetWords = TARGET_WORDS,
+                            isContinuation = isContinuation,
+                            language = lang,
+                            kbAugmentation = kbAugmentation,
+                            draftReference = draftReference,
+                        )),
+                    )
+                    ai.streamChat(cfg, messages).collect { ev ->
+                        when (ev) {
+                            is AiService.StreamEvent.Delta -> _streamingText.value = _streamingText.value + ev.text
+                            AiService.StreamEvent.Done -> {}
+                            is AiService.StreamEvent.Error -> _statusMessage.value = "生成失败：${ev.message}"
+                        }
                     }
                 }
                 val final = _streamingText.value
@@ -630,6 +653,128 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             } finally {
                 _isGenerating.value = false
                 _isChapterGenerating.value = false
+            }
+        }
+    }
+
+    /**
+     * Logic-chain chapter generation. Runs inside the same streaming job as [generateChapter]:
+     *   1) one-shot [AiService.chat] drafts a beat-by-beat blueprint bound to the chapter plan,
+     *      realm system, containers and prior context;
+     *   2) each beat is then written with a streamed call, accumulating into [_streamingText].
+     * If the blueprint comes back empty (model/network hiccup), falls back to a single one-shot
+     * streamed generation so the user still gets a chapter.
+     * The caller owns _streamingText init, the generating flags, and persistence of the final text.
+     */
+    private suspend fun generateChapterStepwise(
+        cfg: TextModelConfig,
+        chapter: Chapter,
+        currentContent: String?,
+        isContinuation: Boolean,
+        lang: String,
+        chapterList: String?,
+        charactersInfo: String?,
+        worldSetting: String?,
+        timeline: String?,
+        prevSummary: String?,
+        kbAugmentation: String?,
+        draftReference: String?,
+    ) {
+        // Stage 1 — blueprint (non-streaming, internal; not shown verbatim to the user).
+        // Use try/catch (not runCatching) so a CancellationException from stopGenerating() during the
+        // blueprint call propagates instead of being swallowed — otherwise an empty blueprint would
+        // wrongly fall through to the one-shot fallback after the user already asked to stop.
+        val blueprint = try {
+            ai.chat(cfg, listOf(
+                ChatMessage("system", Prompts.chapterBlueprintSystem(lang)),
+                ChatMessage("user", Prompts.chapterBlueprintUser(
+                    chapterTitle = chapter.title,
+                    outlineGoal = chapter.outline_goal.orEmpty(),
+                    conflict = chapter.conflict,
+                    prevSummary = prevSummary,
+                    currentContent = if (isContinuation) currentContent?.takeLast(2000) else null,
+                    chapterList = chapterList,
+                    charactersInfo = charactersInfo,
+                    worldSetting = worldSetting,
+                    timeline = timeline,
+                    kbAugmentation = kbAugmentation,
+                    draftReference = draftReference,
+                    targetWords = TARGET_WORDS,
+                    isContinuation = isContinuation,
+                    language = lang,
+                )),
+            )).trim()
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (_: Throwable) {
+            ""
+        }
+
+        val beats = blueprint.split(Prompts.BEAT_DELIM).map { it.trim() }.filter { it.isNotBlank() }
+
+        // Fallback: no usable blueprint → one-shot streamed generation (legacy behavior).
+        if (beats.size < 2) {
+            val messages = listOf(
+                ChatMessage("system", Prompts.chapterSystem(lang)),
+                ChatMessage("user", Prompts.chapterUser(
+                    chapterTitle = chapter.title,
+                    outlineGoal = chapter.outline_goal.orEmpty(),
+                    conflict = chapter.conflict,
+                    prevSummary = prevSummary,
+                    currentContent = if (isContinuation) currentContent?.takeLast(2000) else null,
+                    chapterList = chapterList,
+                    charactersInfo = charactersInfo,
+                    worldSetting = worldSetting,
+                    timeline = timeline,
+                    targetWords = TARGET_WORDS,
+                    isContinuation = isContinuation,
+                    language = lang,
+                    kbAugmentation = kbAugmentation,
+                    draftReference = draftReference,
+                )),
+            )
+            ai.streamChat(cfg, messages).collect { ev ->
+                when (ev) {
+                    is AiService.StreamEvent.Delta -> _streamingText.value = _streamingText.value + ev.text
+                    AiService.StreamEvent.Done -> {}
+                    is AiService.StreamEvent.Error -> _statusMessage.value = "生成失败：${ev.message}"
+                }
+            }
+            return
+        }
+
+        // Stage 2 — write each beat, streaming into the same _streamingText buffer.
+        val perBeatWords = (TARGET_WORDS / beats.size).coerceAtLeast(300)
+        beats.forEachIndexed { i, beat ->
+            // Separate beats (and separate from any pre-existing continuation text) with a blank line.
+            val cur = _streamingText.value
+            if (cur.isNotEmpty() && !cur.endsWith("\n\n")) {
+                _streamingText.value = if (cur.endsWith("\n")) cur + "\n" else cur + "\n\n"
+            }
+            val messages = listOf(
+                ChatMessage("system", Prompts.chapterSegmentSystem(lang)),
+                ChatMessage("user", Prompts.chapterSegmentUser(
+                    chapterTitle = chapter.title,
+                    blueprint = blueprint,
+                    currentBeat = beat,
+                    beatIndex = i + 1,
+                    beatTotal = beats.size,
+                    writtenTail = _streamingText.value.takeLast(1500).takeIf { it.isNotBlank() },
+                    charactersInfo = charactersInfo,
+                    worldSetting = worldSetting,
+                    timeline = timeline,
+                    kbAugmentation = kbAugmentation,
+                    draftReference = draftReference,
+                    targetWords = perBeatWords,
+                    language = lang,
+                )),
+            )
+            ai.streamChat(cfg, messages).collect { ev ->
+                when (ev) {
+                    is AiService.StreamEvent.Delta -> _streamingText.value = _streamingText.value + ev.text
+                    AiService.StreamEvent.Done -> {}
+                    is AiService.StreamEvent.Error -> _statusMessage.value = "生成失败：${ev.message}"
+                }
             }
         }
     }
@@ -2068,6 +2213,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun setSummariesEnabled(b: Boolean) = repo.setSummariesEnabled(b)
     fun entitiesEnabled(): Boolean = repo.entitiesEnabled()
     fun setEntitiesEnabled(b: Boolean) = repo.setEntitiesEnabled(b)
+
+    // ── Chapter generation toggles (editor switches) ───────────────────────
+    fun stepwiseChapterGen(): Boolean = repo.stepwiseChapterGen()
+    fun setStepwiseChapterGen(b: Boolean) = repo.setStepwiseChapterGen(b)
+    fun useDraftReference(): Boolean = repo.useDraftReference()
+    fun setUseDraftReference(b: Boolean) = repo.setUseDraftReference(b)
 
     /** Bumps whenever the vector-chunk store changes — Settings KB stats observe this to refresh. */
     val kbRevision = repo.kbRevision

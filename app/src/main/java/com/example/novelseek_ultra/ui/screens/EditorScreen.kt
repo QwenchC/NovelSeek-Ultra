@@ -30,6 +30,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.outlined.AutoAwesome
+import androidx.compose.material.icons.outlined.Check
 import androidx.compose.material.icons.outlined.ChevronLeft
 import androidx.compose.material.icons.outlined.ChevronRight
 import androidx.compose.material.icons.outlined.Clear
@@ -58,6 +59,7 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -190,6 +192,16 @@ fun EditorScreen(
     LaunchedEffect(finalText) {
         if (finalText != finalTfv.text) finalTfv = finalTfv.copy(text = finalText, selection = TextRange(finalText.length))
     }
+    // Draft editor (the new "草稿" tab) — its own TextFieldValue, synced with draftText the same way
+    // as finalTfv so body-reload updates land in the field without clobbering the caret.
+    var draftTfv by remember(chapterId) { mutableStateOf(TextFieldValue(draftText)) }
+    LaunchedEffect(draftText) {
+        if (draftText != draftTfv.text) draftTfv = draftTfv.copy(text = draftText, selection = TextRange(draftText.length))
+    }
+    // Generation switches (persisted via the VM): stepwise logic-chain generation, and whether to
+    // feed the draft as a reference. Initial value from saved prefs; toggling writes back.
+    var stepwiseGen by remember { mutableStateOf(vm.stepwiseChapterGen()) }
+    var useDraftRef by remember { mutableStateOf(vm.useDraftReference()) }
     var showAiFill by remember { mutableStateOf(false) }
     var pendingTitleFromFill by remember { mutableStateOf<String?>(null) }
     var showRealmDialog by remember { mutableStateOf(false) }
@@ -231,9 +243,15 @@ fun EditorScreen(
         if (wasChapterGenerating && !isChapterGenerating) {
             val body = vm.chapterBody(chapterId)
             savedFinal = body.final
-            savedDraft = body.draft
             finalText = body.final
-            draftText = body.draft
+            // Generation only writes `final`; the disk `draft` is the last *saved* draft. The new
+            // Draft tab is editable, so only realign draft when there are NO unsaved draft edits —
+            // otherwise the user's just-typed (and possibly draft-referenced) draft would be
+            // silently overwritten by the stale disk value.
+            if (draftText == savedDraft) {
+                savedDraft = body.draft
+                draftText = body.draft
+            }
         }
         wasChapterGenerating = isChapterGenerating
     }
@@ -427,6 +445,24 @@ fun EditorScreen(
                         horizontalArrangement = Arrangement.spacedBy(6.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
+                        // Left-most: two persisted generation switches. 分步 = logic-chain stepwise
+                        // generation (blueprint → per-beat); 参考草稿 = feed the Draft tab as a reference.
+                        FilterChip(
+                            selected = stepwiseGen,
+                            onClick = { stepwiseGen = !stepwiseGen; vm.setStepwiseChapterGen(stepwiseGen) },
+                            label = { Text(tx(lang, "分步", "Stepwise"), style = MaterialTheme.typography.labelMedium) },
+                            leadingIcon = if (stepwiseGen) {
+                                { Icon(Icons.Outlined.Check, null, modifier = Modifier.size(16.dp)) }
+                            } else null,
+                        )
+                        FilterChip(
+                            selected = useDraftRef,
+                            onClick = { useDraftRef = !useDraftRef; vm.setUseDraftReference(useDraftRef) },
+                            label = { Text(tx(lang, "参考草稿", "Use draft"), style = MaterialTheme.typography.labelMedium) },
+                            leadingIcon = if (useDraftRef) {
+                                { Icon(Icons.Outlined.Check, null, modifier = Modifier.size(16.dp)) }
+                            } else null,
+                        )
                         FilledTonalButton(
                             enabled = !isGenerating,
                             onClick = {
@@ -437,6 +473,8 @@ fun EditorScreen(
                                         conflict = conflict.ifBlank { null },
                                     ),
                                     currentContent = null,
+                                    stepwise = stepwiseGen,
+                                    draftReference = if (useDraftRef && draftText.isNotBlank()) draftText else null,
                                 )
                                 planExpanded = false
                             },
@@ -455,6 +493,8 @@ fun EditorScreen(
                                         conflict = conflict.ifBlank { null },
                                     ),
                                     currentContent = finalText,
+                                    stepwise = stepwiseGen,
+                                    draftReference = if (useDraftRef && draftText.isNotBlank()) draftText else null,
                                 )
                                 planExpanded = false
                             },
@@ -632,25 +672,33 @@ fun EditorScreen(
                         )
                     }
                     Spacer(Modifier.width(6.dp))
-                    SingleChoiceSegmentedButtonRow(modifier = Modifier.weight(2f)) {
+                    SingleChoiceSegmentedButtonRow(modifier = Modifier.weight(3f)) {
                         SegmentedButton(
                             selected = tab == EditorTab.Final, onClick = { tab = EditorTab.Final },
-                            shape = SegmentedButtonDefaults.itemShape(index = 0, count = 2),
+                            shape = SegmentedButtonDefaults.itemShape(index = 0, count = 3),
                         ) { Text(tx(lang, "正文", "Final"), style = MaterialTheme.typography.labelSmall) }
                         SegmentedButton(
+                            selected = tab == EditorTab.Draft, onClick = { tab = EditorTab.Draft },
+                            shape = SegmentedButtonDefaults.itemShape(index = 1, count = 3),
+                        ) { Text(tx(lang, "草稿", "Draft"), style = MaterialTheme.typography.labelSmall) }
+                        SegmentedButton(
                             selected = tab == EditorTab.Illustration, onClick = { tab = EditorTab.Illustration },
-                            shape = SegmentedButtonDefaults.itemShape(index = 1, count = 2),
+                            shape = SegmentedButtonDefaults.itemShape(index = 2, count = 3),
                         ) { Text(tx(lang, "插图", "Illustration"), style = MaterialTheme.typography.labelSmall) }
                     }
                 } else {
                     SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
                         SegmentedButton(
                             selected = tab == EditorTab.Final, onClick = { tab = EditorTab.Final },
-                            shape = SegmentedButtonDefaults.itemShape(index = 0, count = 2),
+                            shape = SegmentedButtonDefaults.itemShape(index = 0, count = 3),
                         ) { Text(tx(lang, "正文", "Final"), style = MaterialTheme.typography.labelSmall) }
                         SegmentedButton(
+                            selected = tab == EditorTab.Draft, onClick = { tab = EditorTab.Draft },
+                            shape = SegmentedButtonDefaults.itemShape(index = 1, count = 3),
+                        ) { Text(tx(lang, "草稿", "Draft"), style = MaterialTheme.typography.labelSmall) }
+                        SegmentedButton(
                             selected = tab == EditorTab.Illustration, onClick = { tab = EditorTab.Illustration },
-                            shape = SegmentedButtonDefaults.itemShape(index = 1, count = 2),
+                            shape = SegmentedButtonDefaults.itemShape(index = 2, count = 3),
                         ) { Text(tx(lang, "插图", "Illustration"), style = MaterialTheme.typography.labelSmall) }
                     }
                 }
@@ -727,6 +775,53 @@ fun EditorScreen(
                         ) {
                             Text(
                                 "${countWords(finalText)} ${tx(lang, "字", "words")}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+
+                    EditorTab.Draft -> Column(modifier = Modifier.fillMaxSize()) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .weight(1f)
+                                .verticalScroll(rememberScrollState())
+                                .padding(horizontal = 12.dp)
+                                .padding(top = 12.dp, bottom = 6.dp),
+                        ) {
+                            BasicTextField(
+                                value = draftTfv,
+                                onValueChange = { draftTfv = it; draftText = it.text },
+                                textStyle = TextStyle(
+                                    fontSize = 15.sp,
+                                    fontFamily = FontFamily.Serif,
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                ),
+                                decorationBox = { inner ->
+                                    if (draftTfv.text.isEmpty()) {
+                                        Text(
+                                            tx(lang,
+                                                "在此自由起草本章内容或要点。开启上方「参考草稿」后，生成/续写本章时会参考这里的文字。",
+                                                "Draft this chapter's content or key points here. With 'Use draft' on, generation references this text."),
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                    }
+                                    inner()
+                                },
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                        }
+                        // Word-count footer (mirrors the Final tab).
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 12.dp, vertical = 4.dp),
+                            horizontalArrangement = Arrangement.End,
+                        ) {
+                            Text(
+                                "${countWords(draftText)} ${tx(lang, "字", "words")}",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
@@ -1188,7 +1283,7 @@ private fun ChapterSwitcherDialog(
     )
 }
 
-private enum class EditorTab { Final, Illustration }
+private enum class EditorTab { Final, Draft, Illustration }
 
 // PC parity: model / width / height / style — written verbatim into the Pollinations request.
 private data class IllustrationConfig(

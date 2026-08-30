@@ -43,6 +43,7 @@ class KbService {
         // us from per-call boilerplate. 90s covers DashScope's slowest embedding response while
         // still failing fast on hangs.
         .callTimeout(90, TimeUnit.SECONDS)
+        .followSslRedirects(false)
         .build()
 
     /** Embed a single text string. Returns the raw vector. */
@@ -68,6 +69,7 @@ class KbService {
     }
 
     private suspend fun embedBatchSingle(texts: List<String>, cfg: EmbeddingConfig): List<FloatArray> {
+        ApiEndpointPolicy.requireAllowed(cfg.apiUrl, cfg.apiKey)
         val payload = buildJsonObject {
             put("model", cfg.model)
             // `input` can be string or array per OpenAI spec; we always send an array.
@@ -78,7 +80,11 @@ class KbService {
 
         val request = Request.Builder()
             .url("${cfg.apiUrl.trimEnd('/')}/embeddings")
-            .addHeader("Authorization", "Bearer ${cfg.apiKey}")
+            .apply {
+                if (cfg.apiKey.isNotBlank()) {
+                    addHeader("Authorization", "Bearer ${cfg.apiKey}")
+                }
+            }
             .addHeader("Content-Type", "application/json")
             .post(payload.toRequestBody("application/json".toMediaType()))
             .build()

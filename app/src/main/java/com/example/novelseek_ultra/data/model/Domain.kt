@@ -130,6 +130,7 @@ data class CharacterGrowthEntry(
     val chapterTitle: String? = null,
     val createdAt: String = "",
     val manual: Boolean = false,
+    val isStale: Boolean = false,
 )
 
 @Serializable
@@ -224,6 +225,12 @@ data class TextModelConfig(
     val apiUrl: String = "",
     val model: String = "",
     val temperature: Double = 0.7,
+    /** DeepSeek V4 thinking toggle. Auto preserves provider defaults for custom endpoints. */
+    val thinkingMode: String = TextModelThinkingModes.AUTO,
+    /** Provider/model context capacity used by the deterministic request budget guard. */
+    val contextWindowTokens: Int = 64_000,
+    /** Maximum completion allowance; also reserved before input prompt compilation. */
+    val maxOutputTokens: Int = 8_000,
 )
 
 @Serializable
@@ -235,9 +242,24 @@ data class TextModelProfile(
     val apiUrl: String = "",
     val model: String = "",
     val temperature: Double = 0.7,
+    val thinkingMode: String = TextModelThinkingModes.AUTO,
+    val contextWindowTokens: Int = 64_000,
+    val maxOutputTokens: Int = 8_000,
     val builtIn: Boolean = false,
     val keyUrl: String? = null,
 )
+
+object TextModelThinkingModes {
+    const val AUTO = "auto"
+    const val DISABLED = "disabled"
+    const val ENABLED = "enabled"
+
+    fun normalize(value: String): String = when (value.lowercase()) {
+        DISABLED -> DISABLED
+        ENABLED -> ENABLED
+        else -> AUTO
+    }
+}
 
 @Serializable
 data class EmbeddingConfig(

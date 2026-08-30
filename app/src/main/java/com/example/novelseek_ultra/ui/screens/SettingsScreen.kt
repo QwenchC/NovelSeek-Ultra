@@ -49,13 +49,22 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import com.example.novelseek_ultra.ui.components.AppTopBar
+import com.example.novelseek_ultra.data.ai.ApiEndpointPolicy
+import com.example.novelseek_ultra.data.ai.TextModelRequestPolicy
+import com.example.novelseek_ultra.data.ai.isDirectDeepSeek
+import com.example.novelseek_ultra.data.ai.isUsableApiConfig
+import com.example.novelseek_ultra.data.model.AgentReasoningLevels
+import com.example.novelseek_ultra.data.model.TextModelConfig
 import com.example.novelseek_ultra.data.model.TextModelProfile
+import com.example.novelseek_ultra.data.model.TextModelThinkingModes
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -78,10 +87,15 @@ fun SettingsScreen(vm: AppViewModel) {
     val context = LocalContext.current
     val lang by vm.uiLanguage.collectAsState()
     val theme by vm.theme.collectAsState()
+    val appState by vm.state.collectAsState()
+    val agentEngine = remember(appState) { vm.agentEngine() }
+    val dualAgentReasoningLevel = remember(appState) { vm.dualAgentReasoningLevel() }
     val importPreview by vm.importPreview.collectAsState()
     val status by vm.statusMessage.collectAsState()
     val scope = rememberCoroutineScope()
     var includeAppSettings by remember { mutableStateOf(false) }
+    var includeSecretsInExport by remember { mutableStateOf(false) }
+    var showSecretExportConfirmation by remember { mutableStateOf(false) }
 
     val pickFileLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument(),
@@ -106,12 +120,28 @@ fun SettingsScreen(vm: AppViewModel) {
     ) { uri: Uri? ->
         uri ?: return@rememberLauncherForActivityResult
         scope.launch {
-            withContext(Dispatchers.IO) {
-                context.contentResolver.openOutputStream(uri, "w")?.use { out ->
-                    out.write(vm.buildBackupJson().toByteArray(Charsets.UTF_8))
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    val json = vm.buildBackupJson(includeSecretsInExport)
+                    val stream = context.contentResolver.openOutputStream(uri, "w")
+                        ?: error("无法打开导出文件 / Unable to open export file")
+                    stream.use { out ->
+                        out.write(json.toByteArray(Charsets.UTF_8))
+                    }
                 }
             }
+            result.onSuccess {
+                vm.showStatus(tx(lang, "备份导出完成。", "Backup exported."))
+                includeSecretsInExport = false
+            }.onFailure { error ->
+                vm.showStatus(tx(lang, "备份导出失败：", "Backup export failed: ") + error.message)
+            }
         }
+    }
+
+    val launchBackupDocument = {
+        val stamp = SimpleDateFormat("yyyy-MM-dd-HH-mm-ss", Locale.US).format(Date())
+        createFileLauncher.launch("novelseek-backup-$stamp.json")
     }
 
     Scaffold(
@@ -177,6 +207,15 @@ fun SettingsScreen(vm: AppViewModel) {
             // ── Text model profiles ───────────────────────────────────
             TextModelProfilesSection(vm, lang)
 
+            // ── Embedded agent engine ─────────────────────────────────
+            AgentEngineSection(
+                lang = lang,
+                selectedEngine = agentEngine,
+                selectedReasoningLevel = dualAgentReasoningLevel,
+                onSelectEngine = vm::setAgentEngine,
+                onSelectReasoningLevel = vm::setDualAgentReasoningLevel,
+            )
+
             // ── Image generation engine (Pollinations / ComfyUI) ──────
             ImageEngineSection(vm, lang)
 
@@ -202,24 +241,39 @@ fun SettingsScreen(vm: AppViewModel) {
                 Text(
                     tx(
                         lang,
-                        "导出文件与 PC 版完全兼容。⚠ 章节正文不在备份里（按 PC 版约定，正文存在 SQLite 中由应用管理）。" +
-                                "导入时 API Key 会安全地写入 Android Keystore，而不是明文 SharedPreferences。",
-                        "Exports are 100% compatible with the PC build. ⚠ Chapter bodies are not in the backup " +
-                                "(per PC convention, they live in SQLite). On import, API keys are routed into the " +
-                                "Android Keystore instead of plain SharedPreferences."
+                        "备份包含项目元数据、章节正文、配图、小说问答与智能体会话；PC 版会忽略 Android 扩展字段。" +
+                            "默认不导出 API Key。导入旧备份中的 Key 时会写入 Android Keystore。",
+                        "The backup includes project metadata, chapter bodies, illustrations, novel chat, and agent sessions; " +
+                            "the PC build ignores Android extension fields. API keys are excluded by default and imported " +
+                            "legacy keys are stored in Android Keystore."
                     ),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
 
-                Spacer(Modifier.height(12.dp))
+                Spacer(Modifier.height(10.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(
+                        checked = includeSecretsInExport,
+                        onCheckedChange = { includeSecretsInExport = it },
+                    )
+                    Text(
+                        tx(
+                            lang,
+                            "在导出中包含 API Key（明文，仅用于迁移设备）",
+                            "Include API keys in plaintext (device migration only)",
+                        ),
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                }
+
+                Spacer(Modifier.height(8.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     OutlinedButton(
                         onClick = {
-                            val stamp = SimpleDateFormat(
-                                "yyyy-MM-dd-HH-mm-ss", Locale.US
-                            ).format(Date())
-                            createFileLauncher.launch("novelseek-backup-$stamp.json")
+                            vm.clearStatus()
+                            if (includeSecretsInExport) showSecretExportConfirmation = true
+                            else launchBackupDocument()
                         },
                         modifier = Modifier.weight(1f),
                     ) {
@@ -252,11 +306,20 @@ fun SettingsScreen(vm: AppViewModel) {
                 Text(
                     tx(
                         lang,
-                        "⚠ 安全提示：导出文件包含你的 API Key 和所有项目内容。不要分享给不信任的人。",
-                        "⚠ Security: the export contains your API keys and all project content. Don't share it with anyone you don't trust."
+                        if (includeSecretsInExport) {
+                            "⚠ 当前导出会包含明文 API Key 和全部创作内容，请仅保存到可信位置。"
+                        } else {
+                            "安全提示：默认备份不含 API Key，但仍包含全部创作内容，请妥善保管。"
+                        },
+                        if (includeSecretsInExport) {
+                            "⚠ This export will contain plaintext API keys and all writing data. Save it only to a trusted location."
+                        } else {
+                            "Security: the default backup excludes API keys but still contains all writing data. Store it safely."
+                        }
                     ),
                     style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.error,
+                    color = if (includeSecretsInExport) MaterialTheme.colorScheme.error
+                    else MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
         }
@@ -296,8 +359,8 @@ fun SettingsScreen(vm: AppViewModel) {
                             Text(
                                 tx(
                                     lang,
-                                    "同时导入应用设置（含 API Key、模型 profile 等）",
-                                    "Also import app settings (API keys, model profiles, …)",
+                                    "同时导入应用设置（模型 Profile；若源文件含 Key，也会安全导入）",
+                                    "Also import app settings (model profiles and any keys present in the source)",
                                 ),
                                 style = MaterialTheme.typography.bodyMedium,
                             )
@@ -317,6 +380,153 @@ fun SettingsScreen(vm: AppViewModel) {
             },
         )
     }
+
+    if (showSecretExportConfirmation) {
+        AlertDialog(
+            onDismissRequest = { showSecretExportConfirmation = false },
+            title = { Text(tx(lang, "确认导出明文密钥", "Export plaintext keys?")) },
+            text = {
+                Text(
+                    tx(
+                        lang,
+                        "这份 JSON 会包含文本模型、Embedding 与图像服务的 API Key。任何拿到文件的人都可能使用这些额度。仅在迁移到你自己的设备时使用。",
+                        "This JSON will contain API keys for text, embedding, and image services. Anyone with the file may use those credentials. Use this only to migrate to your own device.",
+                    ),
+                )
+            },
+            confirmButton = {
+                Button(onClick = {
+                    showSecretExportConfirmation = false
+                    launchBackupDocument()
+                }) { Text(tx(lang, "仍然导出", "Export anyway")) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showSecretExportConfirmation = false }) {
+                    Text(tx(lang, "取消", "Cancel"))
+                }
+            },
+        )
+    }
+}
+
+@Composable
+private fun AgentEngineSection(
+    lang: String,
+    selectedEngine: String,
+    selectedReasoningLevel: String,
+    onSelectEngine: (String) -> Unit,
+    onSelectReasoningLevel: (String) -> Unit,
+) {
+    SectionCard {
+        Text(
+            tx(lang, "智能体引擎", "Agent Engine"),
+            style = MaterialTheme.typography.titleMedium,
+        )
+        Spacer(Modifier.height(6.dp))
+        Text(
+            tx(
+                lang,
+                "选择内嵌智能体的默认运行结构。新建或空白智能体会话时生效；已有内容的会话不会热切换。",
+                "Choose the embedded agent's default runtime. It applies to new or blank agent sessions; sessions with existing content do not switch engines.",
+            ),
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
+        Spacer(Modifier.height(12.dp))
+        FilterChip(
+            selected = selectedEngine == "classic",
+            onClick = { onSelectEngine("classic") },
+            label = { Text(tx(lang, "经典单智能体（ReAct）", "Classic single agent (ReAct)")) },
+        )
+        Text(
+            tx(
+                lang,
+                "一个智能体边分析边调用工具，保留原有的工作流与兼容性。",
+                "One ReAct agent reasons and calls tools step by step, preserving the original workflow and compatibility.",
+            ),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(start = 4.dp),
+        )
+
+        Spacer(Modifier.height(10.dp))
+        FilterChip(
+            selected = selectedEngine == "dual",
+            onClick = { onSelectEngine("dual") },
+            label = { Text(tx(lang, "双智能体（规划 + 执行）", "Dual agents (planner + executor)")) },
+        )
+        Text(
+            tx(
+                lang,
+                "规划智能体先拆解目标，执行智能体再调用工具，更适合较长、步骤较多的任务。",
+                "A planner first breaks down the goal, then an executor calls tools; best suited to longer, multi-step tasks.",
+            ),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(start = 4.dp),
+        )
+
+        if (selectedEngine == "dual") {
+            Spacer(Modifier.height(14.dp))
+            Text(
+                tx(lang, "双智能体推理级别", "Dual-agent reasoning level"),
+                style = MaterialTheme.typography.titleSmall,
+            )
+            Spacer(Modifier.height(6.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                listOf(
+                    AgentReasoningLevels.LOW to tx(lang, "低", "Low"),
+                    AgentReasoningLevels.MEDIUM to tx(lang, "中", "Medium"),
+                    AgentReasoningLevels.HIGH to tx(lang, "高", "High"),
+                ).forEach { (level, label) ->
+                    FilterChip(
+                        selected = selectedReasoningLevel == level,
+                        onClick = { onSelectReasoningLevel(level) },
+                        label = { Text(label) },
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+            }
+            val description = when (selectedReasoningLevel) {
+                AgentReasoningLevels.LOW -> tx(
+                    lang,
+                    "快速直接，计划最多 6 步，保留较短执行记录，适合简单任务。",
+                    "Fast and direct; up to 6 plan steps with shorter history for simple tasks.",
+                )
+                AgentReasoningLevels.HIGH -> tx(
+                    lang,
+                    "深度核对依赖、风险、恢复与完成证据，计划最多 20 步，适合复杂长任务。",
+                    "Deep dependency, risk, recovery and evidence checks; up to 20 steps for complex work.",
+                )
+                else -> tx(
+                    lang,
+                    "平衡成本与验证深度，计划最多 12 步，适合大多数小说项目任务。",
+                    "Balances cost and verification depth; up to 12 steps for most novel projects.",
+                )
+            }
+            Text(
+                description,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 4.dp, start = 4.dp),
+            )
+            Text(
+                tx(
+                    lang,
+                    "这里设置新建或空白会话的默认级别；已有双智能体会话可在智能体页面发送按钮左侧调整。它不改变文本模型的 Thinking 开关。",
+                    "This sets the default for new or blank sessions; adjust an existing dual-agent session beside the Send button. It does not change the model Thinking switch.",
+                ),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 4.dp, start = 4.dp),
+            )
+        }
+    }
+
 }
 
 @Composable
@@ -429,6 +639,7 @@ private fun CollapsibleProjectSelector(
 @Composable
 private fun TextModelProfilesSection(vm: AppViewModel, lang: String) {
     val state by vm.state.collectAsState()
+    val usage by vm.textUsageStats.collectAsState()
     val profiles = remember(state) { vm.textModelProfiles() }
     val activeId = state["activeTextModelProfileId"]?.let {
         (it as? kotlinx.serialization.json.JsonPrimitive)?.content
@@ -438,6 +649,12 @@ private fun TextModelProfilesSection(vm: AppViewModel, lang: String) {
     var testing by remember { mutableStateOf(false) }
     var testResult by remember { mutableStateOf<Pair<Boolean, String>?>(null) }
     val scope = rememberCoroutineScope()
+    val activeConnectionIdentity = profiles.firstOrNull { it.id == activeId }
+    val latestConnectionIdentity by rememberUpdatedState(activeConnectionIdentity)
+
+    LaunchedEffect(activeConnectionIdentity) {
+        testResult = null
+    }
 
     SectionCard {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -458,6 +675,39 @@ private fun TextModelProfilesSection(vm: AppViewModel, lang: String) {
             style = MaterialTheme.typography.labelMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+        if (usage.cacheObservedRequests > 0) {
+            val cacheTotal = if (Long.MAX_VALUE - usage.cacheHitTokens < usage.cacheMissTokens) {
+                Long.MAX_VALUE
+            } else {
+                usage.cacheHitTokens + usage.cacheMissTokens
+            }
+            val hitPercent = if (cacheTotal > 0) {
+                (usage.cacheHitTokens.toDouble() * 100.0 / cacheTotal.toDouble()).toInt()
+            } else {
+                0
+            }
+            Spacer(Modifier.height(4.dp))
+            Text(
+                tx(
+                    lang,
+                    "本次运行缓存命中：${usage.cacheHitTokens} / $cacheTotal tokens（$hitPercent%）",
+                    "Session cache hits: ${usage.cacheHitTokens} / $cacheTotal tokens ($hitPercent%)",
+                ),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.primary,
+            )
+        } else {
+            Spacer(Modifier.height(4.dp))
+            Text(
+                tx(
+                    lang,
+                    "DeepSeek 直连生成后会在这里显示前缀缓存命中率。",
+                    "Direct DeepSeek requests will show prefix-cache hits here after generation.",
+                ),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
         Spacer(Modifier.height(8.dp))
         if (profiles.isEmpty()) {
             Text(
@@ -468,7 +718,10 @@ private fun TextModelProfilesSection(vm: AppViewModel, lang: String) {
             profiles.forEach { p ->
                 Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
                     AssistChip(
-                        onClick = { vm.setActiveProfile(p.id) },
+                        onClick = {
+                            testResult = null
+                            vm.setActiveProfile(p.id)
+                        },
                         label = { Text(p.name) },
                         colors = AssistChipDefaults.assistChipColors(
                             containerColor = if (activeId == p.id) MaterialTheme.colorScheme.primaryContainer
@@ -486,7 +739,10 @@ private fun TextModelProfilesSection(vm: AppViewModel, lang: String) {
                         Icon(Icons.Outlined.Add, contentDescription = null)
                     }
                     if (!p.builtIn) {
-                        IconButton(onClick = { vm.deleteTextModelProfile(p.id) }) {
+                        IconButton(onClick = {
+                            testResult = null
+                            vm.deleteTextModelProfile(p.id)
+                        }) {
                             Icon(Icons.Outlined.Delete, contentDescription = null)
                         }
                     }
@@ -498,12 +754,19 @@ private fun TextModelProfilesSection(vm: AppViewModel, lang: String) {
             OutlinedButton(onClick = {
                 testing = true
                 testResult = null
+                val testedIdentity = activeConnectionIdentity
                 scope.launch {
                     val ok = vm.testTextConnection()
-                    testResult = ok to if (ok)
-                        tx(lang, "✓ 连接成功", "✓ Connection OK")
-                    else
-                        tx(lang, "✗ 连接失败，请检查 API Key / URL / 模型名", "✗ Connection failed — check API key / URL / model")
+                    if (TextModelRequestPolicy.canPublishConnectionTestResult(
+                            testedIdentity,
+                            latestConnectionIdentity,
+                        )
+                    ) {
+                        testResult = ok to if (ok)
+                            tx(lang, "✓ 连接成功", "✓ Connection OK")
+                        else
+                            tx(lang, "✗ 连接失败，请检查 API Key / URL / 模型名", "✗ Connection failed — check API key / URL / model")
+                    }
                     testing = false
                 }
             }, enabled = !testing) {
@@ -525,6 +788,7 @@ private fun TextModelProfilesSection(vm: AppViewModel, lang: String) {
         ProfileDialog(lang = lang, initial = null,
             onDismiss = { showCreate = false },
             onSave = { saved ->
+                testResult = null
                 vm.saveTextModelProfile(saved.copy(id = "custom-${System.currentTimeMillis()}"))
                 showCreate = false
             })
@@ -533,6 +797,7 @@ private fun TextModelProfilesSection(vm: AppViewModel, lang: String) {
         ProfileDialog(lang = lang, initial = p,
             onDismiss = { editing = null },
             onSave = { saved ->
+                testResult = null
                 vm.saveTextModelProfile(saved)
                 editing = null
             })
@@ -552,6 +817,20 @@ private fun ProfileDialog(
     var model by remember { mutableStateOf(initial?.model.orEmpty()) }
     var apiKey by remember { mutableStateOf(initial?.apiKey.orEmpty()) }
     var temp by remember { mutableStateOf((initial?.temperature ?: 0.7).toString()) }
+    var thinkingMode by remember {
+        mutableStateOf(TextModelThinkingModes.normalize(initial?.thinkingMode.orEmpty()))
+    }
+    var contextTokens by remember { mutableStateOf((initial?.contextWindowTokens ?: 64_000).toString()) }
+    var outputTokens by remember { mutableStateOf((initial?.maxOutputTokens ?: 8_000).toString()) }
+    val endpointAssessment = if (apiUrl.isBlank()) null else ApiEndpointPolicy.assess(apiUrl, apiKey)
+    val parsedTemperature = temp.toDoubleOrNull()
+    val temperatureValid = TextModelRequestPolicy.isValidTemperature(parsedTemperature)
+    val parsedOutputTokens = outputTokens.toIntOrNull()
+    val directDeepSeek = isDirectDeepSeek(
+        TextModelConfig(provider = provider, apiUrl = apiUrl),
+    )
+    val outputTokensValid = parsedOutputTokens != null && parsedOutputTokens >= 256 &&
+        (!directDeepSeek || parsedOutputTokens <= TextModelRequestPolicy.DEEPSEEK_V4_MAX_OUTPUT_TOKENS)
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -561,23 +840,109 @@ private fun ProfileDialog(
                 OutlinedTextField(name, { name = it }, label = { Text(tx(lang, "名称", "Name")) }, singleLine = true)
                 OutlinedTextField(provider, { provider = it }, label = { Text(tx(lang, "Provider", "Provider")) }, singleLine = true)
                 OutlinedTextField(apiUrl, { apiUrl = it }, label = { Text("API URL") }, singleLine = true)
+                endpointAssessment?.takeUnless { it.allowed }?.message?.let { message ->
+                    Text(
+                        message,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
                 OutlinedTextField(model, { model = it }, label = { Text(tx(lang, "模型名", "Model")) }, singleLine = true)
+                Text(
+                    tx(lang, "推理模式（DeepSeek V4）", "Thinking mode (DeepSeek V4)"),
+                    style = MaterialTheme.typography.labelMedium,
+                )
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    listOf(
+                        TextModelThinkingModes.AUTO to tx(lang, "自动", "Auto"),
+                        TextModelThinkingModes.DISABLED to tx(lang, "非推理", "Off"),
+                        TextModelThinkingModes.ENABLED to tx(lang, "推理", "On"),
+                    ).forEach { (value, label) ->
+                        FilterChip(
+                            selected = thinkingMode == value,
+                            onClick = { thinkingMode = value },
+                            label = { Text(label) },
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
+                }
                 ApiKeyField(value = apiKey, onValueChange = { apiKey = it }, label = "API Key")
                 initial?.keyUrl?.takeIf { it.isNotBlank() }?.let { ApiKeyLink(it, lang) }
-                OutlinedTextField(temp, { temp = it }, label = { Text("Temperature") }, singleLine = true)
+                OutlinedTextField(
+                    temp,
+                    { temp = it },
+                    label = { Text("Temperature (0–2)") },
+                    singleLine = true,
+                    isError = !temperatureValid,
+                    supportingText = if (!temperatureValid) {
+                        {
+                            Text(
+                                tx(
+                                    lang,
+                                    "请输入 0 到 2 之间的有限数值",
+                                    "Enter a finite value from 0 to 2",
+                                ),
+                            )
+                        }
+                    } else {
+                        null
+                    },
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        contextTokens,
+                        { contextTokens = it.filter(Char::isDigit) },
+                        label = { Text(tx(lang, "上下文 tokens", "Context tokens")) },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f),
+                    )
+                    OutlinedTextField(
+                        outputTokens,
+                        { outputTokens = it.filter(Char::isDigit) },
+                        label = { Text(tx(lang, "最大输出 tokens", "Max output tokens")) },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f),
+                        isError = !outputTokensValid,
+                        supportingText = if (
+                            directDeepSeek && parsedOutputTokens != null &&
+                            parsedOutputTokens > TextModelRequestPolicy.DEEPSEEK_V4_MAX_OUTPUT_TOKENS
+                        ) {
+                            {
+                                Text(
+                                    tx(
+                                        lang,
+                                        "DeepSeek V4 上限 384000",
+                                        "DeepSeek V4 limit: 384000",
+                                    ),
+                                )
+                            }
+                        } else {
+                            null
+                        },
+                    )
+                }
             }
         },
         confirmButton = {
-            TextButton(enabled = name.isNotBlank() && apiUrl.isNotBlank() && model.isNotBlank(), onClick = {
+            TextButton(
+                enabled = name.isNotBlank() && apiUrl.isNotBlank() && model.isNotBlank() &&
+                    endpointAssessment?.allowed == true && temperatureValid && outputTokensValid,
+                onClick = {
                 onSave(
                     TextModelProfile(
                         id = initial?.id ?: "",
                         name = name,
                         provider = provider,
-                        apiUrl = apiUrl,
-                        model = model,
+                        apiUrl = apiUrl.trim(),
+                        model = model.trim(),
                         apiKey = apiKey,
-                        temperature = temp.toDoubleOrNull() ?: 0.7,
+                        temperature = parsedTemperature ?: 0.7,
+                        thinkingMode = thinkingMode,
+                        contextWindowTokens = contextTokens.toIntOrNull()?.coerceAtLeast(4_096) ?: 64_000,
+                        maxOutputTokens = parsedOutputTokens ?: 8_000,
                         builtIn = initial?.builtIn ?: false,
                         keyUrl = initial?.keyUrl,
                     )
@@ -718,11 +1083,26 @@ private fun PollinationsKeySection(vm: AppViewModel, lang: String) {
 @Composable
 private fun KnowledgeBaseSection(vm: AppViewModel, lang: String) {
     val state by vm.state.collectAsState()
-    var enabled by remember(state) { mutableStateOf(vm.knowledgeBaseEnabled()) }
-    var cfg by remember(state) { mutableStateOf(vm.embeddingConfig()) }
+    val enabled = remember(state) { vm.knowledgeBaseEnabled() }
+    val persistedCfg = remember(state) { vm.embeddingConfig() }
+    var appliedCfg by remember(persistedCfg) { mutableStateOf(persistedCfg) }
+    var cfg by remember(persistedCfg) { mutableStateOf(persistedCfg) }
     var testing by remember { mutableStateOf(false) }
     var testResult by remember { mutableStateOf<Boolean?>(null) }
+    var applying by remember { mutableStateOf(false) }
+    var applyMessage by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
+    val normalizedCfg = cfg.copy(apiUrl = cfg.apiUrl.trim(), model = cfg.model.trim())
+    val dirty = normalizedCfg != appliedCfg
+    val vectorSpaceChanged = normalizedCfg.copy(apiKey = "") != appliedCfg.copy(apiKey = "")
+    val endpointAssessment = if (cfg.apiUrl.isBlank()) null
+    else ApiEndpointPolicy.assess(cfg.apiUrl, cfg.apiKey)
+
+    fun editConfig(next: com.example.novelseek_ultra.data.model.EmbeddingConfig) {
+        cfg = next
+        testResult = null
+        applyMessage = null
+    }
 
     SectionCard {
         Text(
@@ -742,7 +1122,7 @@ private fun KnowledgeBaseSection(vm: AppViewModel, lang: String) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Checkbox(
                 checked = enabled,
-                onCheckedChange = { enabled = it; vm.setKnowledgeBaseEnabled(it) },
+                onCheckedChange = vm::setKnowledgeBaseEnabled,
             )
             Text(tx(lang, "启用本地知识库", "Enable local knowledge base"))
         }
@@ -766,23 +1146,30 @@ private fun KnowledgeBaseSection(vm: AppViewModel, lang: String) {
         Spacer(Modifier.height(8.dp))
         ApiKeyField(
             value = cfg.apiKey,
-            onValueChange = { cfg = cfg.copy(apiKey = it); vm.saveEmbeddingConfig(cfg) },
+            onValueChange = { editConfig(cfg.copy(apiKey = it)) },
             label = "API Key",
-            enabled = enabled,
             modifier = Modifier.fillMaxWidth(),
         )
         Spacer(Modifier.height(6.dp))
         OutlinedTextField(
-            value = cfg.apiUrl, onValueChange = { cfg = cfg.copy(apiUrl = it); vm.saveEmbeddingConfig(cfg) },
-            enabled = enabled,
+            value = cfg.apiUrl,
+            onValueChange = { editConfig(cfg.copy(apiUrl = it)) },
             label = { Text("API URL") }, singleLine = true,
             modifier = Modifier.fillMaxWidth(),
         )
+        endpointAssessment?.takeUnless { it.allowed }?.message?.let { message ->
+            Spacer(Modifier.height(4.dp))
+            Text(
+                message,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
         Spacer(Modifier.height(6.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             OutlinedTextField(
-                value = cfg.model, onValueChange = { cfg = cfg.copy(model = it); vm.saveEmbeddingConfig(cfg) },
-                enabled = enabled,
+                value = cfg.model,
+                onValueChange = { editConfig(cfg.copy(model = it)) },
                 label = { Text(tx(lang, "模型", "Model")) }, singleLine = true,
                 modifier = Modifier.weight(2f),
             )
@@ -790,41 +1177,84 @@ private fun KnowledgeBaseSection(vm: AppViewModel, lang: String) {
                 value = cfg.dimensions?.toString().orEmpty(),
                 onValueChange = {
                     val n = it.filter { c -> c.isDigit() }.toIntOrNull()
-                    cfg = cfg.copy(dimensions = if (n != null && n > 0) n else null)
-                    vm.saveEmbeddingConfig(cfg)
+                    editConfig(cfg.copy(dimensions = if (n != null && n > 0) n else null))
                 },
-                enabled = enabled,
                 label = { Text(tx(lang, "维度", "Dim")) }, singleLine = true,
                 modifier = Modifier.weight(1f),
             )
         }
 
+        if (dirty && vectorSpaceChanged) {
+            Spacer(Modifier.height(6.dp))
+            Text(
+                tx(
+                    lang,
+                    "应用 URL、模型或维度变更会清空旧向量，并将已有章节标记为待重建。",
+                    "Applying URL, model, or dimension changes clears old vectors and marks existing chapters for rebuild.",
+                ),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
+
         Spacer(Modifier.height(10.dp))
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             OutlinedButton(
-                enabled = enabled && !testing && cfg.apiKey.isNotBlank()
-                          && cfg.apiUrl.isNotBlank() && cfg.model.isNotBlank(),
+                enabled = !testing && !applying && normalizedCfg.isUsableApiConfig(),
                 onClick = {
                     testing = true; testResult = null
                     scope.launch {
-                        val ok = vm.testEmbeddingConnection()
+                        val ok = vm.testEmbeddingConnection(normalizedCfg)
                         testResult = ok
                         testing = false
                     }
                 },
+                modifier = Modifier.weight(1f),
             ) {
                 if (testing) CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-                else Text(tx(lang, "测试 Embedding 连接", "Test Embedding"))
+                else Text(tx(lang, "测试草稿", "Test draft"))
             }
-            when (testResult) {
-                true -> Text(tx(lang, "✓ 连接成功", "✓ Connected"),
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.primary)
-                false -> Text(tx(lang, "✕ 连接失败", "✕ Failed"),
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.error)
-                null -> {}
+            Button(
+                enabled = dirty && !testing && !applying && normalizedCfg.isUsableApiConfig(),
+                onClick = {
+                    applying = true
+                    applyMessage = null
+                    scope.launch {
+                        val result = withContext(Dispatchers.IO) {
+                            runCatching { vm.saveEmbeddingConfig(normalizedCfg) }
+                        }
+                        result.onSuccess {
+                            appliedCfg = normalizedCfg
+                            cfg = normalizedCfg
+                            applyMessage = tx(lang, "✓ 配置已应用", "✓ Configuration applied")
+                        }.onFailure { error ->
+                            applyMessage = tx(lang, "应用失败：", "Apply failed: ") + error.message
+                        }
+                        applying = false
+                    }
+                },
+                modifier = Modifier.weight(1f),
+            ) {
+                if (applying) CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                else Text(tx(lang, "应用配置", "Apply"))
             }
+        }
+        when (testResult) {
+            true -> Text(tx(lang, "✓ 草稿连接成功，尚未应用", "✓ Draft connected; not applied yet"),
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.primary)
+            false -> Text(tx(lang, "✕ 草稿连接失败", "✕ Draft connection failed"),
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.error)
+            null -> {}
+        }
+        applyMessage?.let { message ->
+            Text(
+                message,
+                style = MaterialTheme.typography.labelMedium,
+                color = if (message.startsWith("✓")) MaterialTheme.colorScheme.primary
+                else MaterialTheme.colorScheme.error,
+            )
         }
     }
 }
@@ -852,6 +1282,13 @@ private fun ProjectKbManagementSection(vm: AppViewModel, lang: String) {
     }
     val entityCount = remember(state, selectedProjectId) {
         if (selectedProjectId.isNotBlank()) vm.entitiesOf(selectedProjectId).size else 0
+    }
+    val evidenceCoverage = remember(state, selectedProjectId) {
+        if (selectedProjectId.isNotBlank()) {
+            vm.factEvidenceCoverageOf(selectedProjectId)
+        } else {
+            com.example.novelseek_ultra.ui.FactEvidenceCoverage(0, 0, 0)
+        }
     }
 
     SectionCard {
@@ -898,8 +1335,8 @@ private fun ProjectKbManagementSection(vm: AppViewModel, lang: String) {
             // layers are actually firing on chapter save / generation.
             Text(
                 tx(lang,
-                    "已生成章节摘要：$summaryCount 篇 · 已抽取实体：$entityCount 个",
-                    "Chapter summaries: $summaryCount · Entities extracted: $entityCount"),
+                    "章节摘要：$summaryCount 篇 · 实体：$entityCount 个 · 事实证据：${evidenceCoverage.claims} 条，覆盖 ${evidenceCoverage.coveredChapters} / ${evidenceCoverage.eligibleChapters} 章",
+                    "Chapter summaries: $summaryCount · Entities: $entityCount · Fact evidence: ${evidenceCoverage.claims} claims, ${evidenceCoverage.coveredChapters} / ${evidenceCoverage.eligibleChapters} chapters covered"),
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -966,14 +1403,16 @@ private fun AugmentationLayersSection(vm: AppViewModel, lang: String) {
     val projects by vm.projects.collectAsState()
     var selectedProjectId by remember(projects) { mutableStateOf(projects.firstOrNull()?.id.orEmpty()) }
     var buildingSummaries by remember { mutableStateOf(false) }
+    var buildingEvidence by remember { mutableStateOf(false) }
     var buildingBook by remember { mutableStateOf(false) }
     var summariesProgress by remember { mutableStateOf("") }
+    var evidenceProgress by remember { mutableStateOf("") }
     var bookProgress by remember { mutableStateOf("") }
     val scope = rememberCoroutineScope()
 
     SectionCard {
         Text(
-            tx(lang, "增强层（分层摘要 + 实体抽取）", "Augmentation Layers (Summaries + Entities)"),
+            tx(lang, "增强层（分层摘要 + 事实证据）", "Augmentation Layers (Summaries + Fact Evidence)"),
             style = MaterialTheme.typography.titleMedium,
         )
         Spacer(Modifier.height(4.dp))
@@ -1018,8 +1457,8 @@ private fun AugmentationLayersSection(vm: AppViewModel, lang: String) {
                     "Enable entity extraction (characters / foreshadowing / locations / events / items)"))
                 Text(
                     tx(lang,
-                        "保存章节时自动结构化抽取，并在提示词里追加「未回收伏笔」清单，避免长篇写飞。",
-                        "Structured extraction on save; the 'open foreshadowing' list is added to the prompt to keep long arcs coherent."),
+                        "保存章节时自动抽取实体，并把可验证的原文摘录写入逐章事实账本；生成时只读取目标章节之前的证据。",
+                        "Extracts entities and stores verified chapter excerpts in a fact ledger; generation reads only evidence before the target chapter."),
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -1080,8 +1519,58 @@ private fun AugmentationLayersSection(vm: AppViewModel, lang: String) {
         }
 
         Spacer(Modifier.height(12.dp))
-        Text(tx(lang, "步骤 2：生成「全书梗概」",
-            "Step 2: Build book summary"),
+        Text(tx(lang, "步骤 2：重建逐章事实账本",
+            "Step 2: Rebuild chapter fact ledger"),
+            style = MaterialTheme.typography.titleSmall)
+        Text(tx(lang,
+            "为旧项目逐章抽取可验证事实；每章会调用一次文本模型并按平台计费。成功但无事实的章节也会计入覆盖率。",
+            "Extracts verified facts for existing chapters. This makes one billed text-model call per chapter; successful empty results still count as covered."),
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Spacer(Modifier.height(4.dp))
+        OutlinedButton(
+            enabled = selectedProjectId.isNotBlank() && !buildingEvidence,
+            onClick = {
+                buildingEvidence = true
+                evidenceProgress = tx(lang, "加载章节中…", "Loading chapters…")
+                vm.rebuildFactEvidenceForAll(
+                    projectId = selectedProjectId,
+                    onProgress = { i, total, title ->
+                        evidenceProgress = tx(
+                            lang,
+                            "抽取事实 $i / $total：$title",
+                            "Extracting facts $i / $total: $title",
+                        )
+                    },
+                    onDone = { ok, errors ->
+                        evidenceProgress = tx(
+                            lang,
+                            "完成：$ok 章已写入事实账本，$errors 章失败。",
+                            "Done: $ok chapters recorded, $errors failed.",
+                        )
+                        buildingEvidence = false
+                    },
+                )
+            },
+        ) {
+            if (buildingEvidence) {
+                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+            } else {
+                Text(tx(lang, "重建事实账本", "Rebuild Fact Ledger"))
+            }
+        }
+        if (evidenceProgress.isNotBlank()) {
+            Spacer(Modifier.height(4.dp))
+            Text(
+                evidenceProgress,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+
+        Spacer(Modifier.height(12.dp))
+        Text(tx(lang, "步骤 3：生成「全书梗概」",
+            "Step 3: Build book summary"),
             style = MaterialTheme.typography.titleSmall)
         Text(tx(lang,
             "基于已有章节/弧线摘要汇总。建议每 5-10 章手动刷新一次。",

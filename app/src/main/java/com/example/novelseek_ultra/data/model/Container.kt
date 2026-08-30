@@ -49,6 +49,7 @@ data class ContainerEntry(
     val sourceChapterTitle: String? = null,
     val createdAt: String = "",
     val manual: Boolean = false,
+    val isStale: Boolean = false,
 )
 
 /** Persisted shape of one project's containers (the value of `containersByProject[projectId]`). */

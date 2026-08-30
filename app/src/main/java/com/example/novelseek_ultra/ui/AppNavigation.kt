@@ -286,7 +286,15 @@ private fun NavGraphBuilder.detailRoutes(nav: NavHostController, vm: AppViewMode
         ContainerScreen(vm = vm, projectId = id, onBack = { nav.popBackStack() })
     }
     composable(Routes.AGENT) {
-        AgentScreen(vm = vm, onBack = { nav.popBackStack() })
+        AgentScreen(
+            vm = vm,
+            onBack = { nav.popBackStack() },
+            onOpenChapterReview = { projectId, chapterId ->
+                nav.navigate(Routes.editor(projectId, chapterId)) {
+                    launchSingleTop = true
+                }
+            },
+        )
     }
     composable(Routes.TUTORIAL) {
         TutorialScreen(vm = vm, onBack = { nav.popBackStack() })

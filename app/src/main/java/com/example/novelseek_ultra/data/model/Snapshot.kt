@@ -27,7 +27,7 @@ data class SnapshotMeta(
     val wordCount: Int = 0,
     val chapterCount: Int = 0,
     val sizeBytes: Long = 0,
-    /** sha1 over chapter list + per-chapter content hashes + project maps; used for dedup. */
+    /** Stable sha1 over every restorable project payload field; used for auto-snapshot dedup. */
     val contentSig: String = "",
 ) {
     companion object {
@@ -56,4 +56,6 @@ data class ProjectSnapshot(
 data class RestoreResult(
     val staleChapterIds: List<String> = emptyList(),
     val prunedOrphanChunks: Int = 0,
+    val success: Boolean = true,
+    val errorMessage: String? = null,
 )

@@ -1,5 +1,6 @@
 package com.example.novelseek_ultra.ui.screens
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
@@ -101,17 +102,36 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.example.novelseek_ultra.data.AppRepository
+import com.example.novelseek_ultra.data.model.CandidateAdoptionResult
+import com.example.novelseek_ultra.data.model.CandidateChapter
 import com.example.novelseek_ultra.data.model.Chapter
 import com.example.novelseek_ultra.data.model.ChapterPromo
 import com.example.novelseek_ultra.data.model.Character
 import com.example.novelseek_ultra.data.model.Illustration
+import com.example.novelseek_ultra.data.model.GenerationRun
 import com.example.novelseek_ultra.data.model.PlotArc
 import com.example.novelseek_ultra.ui.AppViewModel
 import com.example.novelseek_ultra.ui.isLandscape
 import com.example.novelseek_ultra.ui.components.AppTopBar
 import com.example.novelseek_ultra.ui.components.RenameDialog
 import com.example.novelseek_ultra.util.tx
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import kotlin.math.roundToInt
+
+private fun formatTelemetryDuration(millis: Long): String {
+    if (millis < 1_000L) return "${millis}ms"
+    val whole = millis / 1_000L
+    val tenth = (millis % 1_000L) / 100L
+    return "${whole}.${tenth}s"
+}
+
+private fun formatTelemetryCount(value: Long): String =
+    java.text.NumberFormat.getIntegerInstance().format(value)
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
@@ -133,7 +153,9 @@ fun EditorScreen(
     val aiFillText by vm.aiFillText.collectAsState()
     val isAiFilling by vm.isAiFilling.collectAsState()
     val status by vm.statusMessage.collectAsState()
+    val generationRunRevision by vm.generationRunRevision.collectAsState()
     val scope = rememberCoroutineScope()
+    val bodyWriteMutex = remember(chapterId) { Mutex() }
     val snackbarHost = remember { SnackbarHostState() }
     val landscape = isLandscape()
 
@@ -164,6 +186,16 @@ fun EditorScreen(
     var finalText by remember(chapterId) { mutableStateOf(vm.chapterBody(chapterId).final) }
     var goal by remember(chapterId) { mutableStateOf(chapter.outline_goal.orEmpty()) }
     var conflict by remember(chapterId) { mutableStateOf(chapter.conflict.orEmpty()) }
+    val reviewRun = remember(generationRunRevision, projectId, chapterId) {
+        vm.latestReviewableGenerationRun(projectId, chapterId)
+    }
+    val reviewCandidates = remember(reviewRun) {
+        reviewRun?.candidates.orEmpty()
+            .filter { it.status == CandidateChapter.STATUS_COMPLETED }
+            .sortedBy { it.slot }
+    }
+    val hasReviewableCandidate = reviewCandidates.isNotEmpty()
+    var previewCandidateId by remember(chapterId) { mutableStateOf<String?>(null) }
 
     // ── Dirty tracking ────────────────────────────────────────────────────────
     // Snapshot what's on disk so we can detect unsaved edits.
@@ -171,6 +203,11 @@ fun EditorScreen(
     var savedFinal by remember(chapterId) { mutableStateOf(finalText) }
     var savedGoal by remember(chapterId) { mutableStateOf(goal) }
     var savedConflict by remember(chapterId) { mutableStateOf(conflict) }
+    // Lightweight body checkpoints protect long edits from process death without putting the
+    // chapter text into a saved-state Bundle. They intentionally do not clear full-save dirty
+    // state: leaving the editor must still update metadata and derived KB data.
+    var checkpointDraft by remember(chapterId) { mutableStateOf(draftText) }
+    var checkpointFinal by remember(chapterId) { mutableStateOf(finalText) }
     val isDirty by remember {
         derivedStateOf {
             draftText != savedDraft || finalText != savedFinal ||
@@ -188,12 +225,12 @@ fun EditorScreen(
     var finalTfv by remember(chapterId) { mutableStateOf(TextFieldValue(finalText)) }
     var inlineRevising by remember { mutableStateOf(false) }
     // Keep the editor's TextFieldValue in sync when finalText changes from OUTSIDE the editor
-    // (streaming generation, body reload). User typing keeps them equal, so this won't clobber the caret.
+    // (for example, after accepting a candidate). User typing keeps them equal, so this won't clobber the caret.
     LaunchedEffect(finalText) {
         if (finalText != finalTfv.text) finalTfv = finalTfv.copy(text = finalText, selection = TextRange(finalText.length))
     }
     // Draft editor (the new "草稿" tab) — its own TextFieldValue, synced with draftText the same way
-    // as finalTfv so body-reload updates land in the field without clobbering the caret.
+    // as finalTfv so explicit state updates land in the field without clobbering the caret.
     var draftTfv by remember(chapterId) { mutableStateOf(TextFieldValue(draftText)) }
     LaunchedEffect(draftText) {
         if (draftText != draftTfv.text) draftTfv = draftTfv.copy(text = draftText, selection = TextRange(draftText.length))
@@ -231,78 +268,215 @@ fun EditorScreen(
     var showPromoConfig by remember { mutableStateOf(false) }
     var promoExpanded by remember { mutableStateOf(false) }
 
-    // Only update finalText from streaming when chapter generation is running
-    LaunchedEffect(streaming, isChapterGenerating) {
-        if (isChapterGenerating && streaming.isNotEmpty()) finalText = streaming
-    }
+    // Streaming prose is a read-only preview. It never enters draftText/finalText, so generation
+    // finishing cannot overwrite unsaved editor changes and save/back/switch persist only edits.
 
-    // When chapter generation finishes, the ViewModel auto-saves the new text to disk. Re-align
-    // the saved snapshot so the dirty asterisk doesn't linger on freshly generated content.
-    var wasChapterGenerating by remember(chapterId) { mutableStateOf(false) }
-    LaunchedEffect(isChapterGenerating) {
-        if (wasChapterGenerating && !isChapterGenerating) {
-            val body = vm.chapterBody(chapterId)
-            savedFinal = body.final
-            finalText = body.final
-            // Generation only writes `final`; the disk `draft` is the last *saved* draft. The new
-            // Draft tab is editable, so only realign draft when there are NO unsaved draft edits —
-            // otherwise the user's just-typed (and possibly draft-referenced) draft would be
-            // silently overwritten by the stale disk value.
-            if (draftText == savedDraft) {
-                savedDraft = body.draft
-                draftText = body.draft
+    // Debounced body-only checkpoint. Full metadata/KB work remains tied to an explicit save or
+    // leaving the editor, so ordinary typing cannot fan out expensive AI jobs.
+    LaunchedEffect(
+        chapterId,
+        draftText,
+        finalText,
+        isChapterGenerating,
+        hasReviewableCandidate,
+    ) {
+        if (
+            isChapterGenerating ||
+            hasReviewableCandidate ||
+            (draftText == checkpointDraft && finalText == checkpointFinal)
+        ) return@LaunchedEffect
+
+        delay(1_200)
+        val draftSnapshot = draftText
+        val finalSnapshot = finalText
+        val ok = withContext(Dispatchers.IO) {
+            bodyWriteMutex.withLock {
+                runCatching {
+                    vm.saveChapterBody(
+                        chapterId,
+                        AppRepository.ChapterBody(draft = draftSnapshot, final = finalSnapshot),
+                    )
+                }.isSuccess
             }
         }
-        wasChapterGenerating = isChapterGenerating
+        if (ok) {
+            checkpointDraft = draftSnapshot
+            checkpointFinal = finalSnapshot
+        }
     }
 
-    // ── Save action — emits a Snackbar on success/failure ─────────────────────
-    val save: () -> Unit = {
+    var isSaving by remember(chapterId) { mutableStateOf(false) }
+
+    suspend fun persistCurrentChapter(): Boolean {
+        val draftSnapshot = draftText
+        val finalSnapshot = finalText
+        val goalSnapshot = goal
+        val conflictSnapshot = conflict
+        val ok = withContext(Dispatchers.IO) {
+            bodyWriteMutex.withLock {
+                runCatching {
+                    vm.saveChapterBody(
+                        chapterId,
+                        AppRepository.ChapterBody(draft = draftSnapshot, final = finalSnapshot),
+                    )
+                    vm.upsertChapter(
+                        projectId,
+                        chapter.copy(
+                            outline_goal = goalSnapshot.ifBlank { null },
+                            conflict = conflictSnapshot.ifBlank { null },
+                            word_count = countWords(finalSnapshot.ifBlank { draftSnapshot }),
+                        ),
+                    )
+                }.isSuccess
+            }
+        }
+        if (ok) {
+            savedDraft = draftSnapshot
+            savedFinal = finalSnapshot
+            savedGoal = goalSnapshot
+            savedConflict = conflictSnapshot
+            checkpointDraft = draftSnapshot
+            checkpointFinal = finalSnapshot
+            vm.onChapterSaved(
+                projectId,
+                chapterId,
+                chapter.title,
+                finalSnapshot.ifBlank { draftSnapshot },
+            )
+        }
+        return ok
+    }
+
+    /**
+     * Persist the exact editor baseline before starting AI, without launching derived-memory jobs
+     * that could mutate the prompt snapshot while the stream is still running. The ordinary dirty
+     * state remains until accept/reject/save, so a rejected or failed run is still fully saved on
+     * navigation and refreshes its derived data through [persistCurrentChapter].
+     */
+    suspend fun persistGenerationBaseline(): Chapter? {
+        val draftSnapshot = draftText
+        val finalSnapshot = finalText
+        val requestedChapter = chapter.copy(
+            outline_goal = goal.ifBlank { null },
+            conflict = conflict.ifBlank { null },
+            word_count = countWords(finalSnapshot.ifBlank { draftSnapshot }),
+        )
+        val ok = withContext(Dispatchers.IO) {
+            bodyWriteMutex.withLock {
+                runCatching {
+                    vm.saveChapterBody(
+                        chapterId,
+                        AppRepository.ChapterBody(draft = draftSnapshot, final = finalSnapshot),
+                    )
+                    vm.upsertChapter(projectId, requestedChapter)
+                }.isSuccess
+            }
+        }
+        if (!ok) return null
+        checkpointDraft = draftSnapshot
+        checkpointFinal = finalSnapshot
+        return requestedChapter
+    }
+
+    fun startChapterGeneration(continuation: Boolean) {
+        if (isSaving || isGenerating || hasReviewableCandidate) return
+        val finalSnapshot = finalText
+        val draftSnapshot = draftText
+        val stepwiseSnapshot = stepwiseGen
+        val useDraftSnapshot = useDraftRef
+        isSaving = true
         scope.launch {
-            val ok = runCatching {
-                vm.saveChapterBody(chapterId, AppRepository.ChapterBody(draft = draftText, final = finalText))
-                val wc = countWords(finalText.ifBlank { draftText })
-                vm.upsertChapter(projectId, chapter.copy(
-                    outline_goal = goal.ifBlank { null },
-                    conflict = conflict.ifBlank { null },
-                    word_count = wc,
-                ))
-            }.isSuccess
-            if (ok) {
-                savedDraft = draftText; savedFinal = finalText
-                savedGoal = goal; savedConflict = conflict
-                snackbarHost.showSnackbar(tx(lang, "已保存", "Saved"))
-                // KB hooks — fan out re-index / summary / entity jobs if their toggles are on.
-                // Each one is fire-and-forget on the VM coroutine scope; UI does not block.
-                vm.onChapterSaved(projectId, chapterId, chapter.title, finalText.ifBlank { draftText })
-            } else {
-                snackbarHost.showSnackbar(tx(lang, "保存失败", "Save failed"))
+            try {
+                val requestedChapter = persistGenerationBaseline()
+                if (requestedChapter == null) {
+                    snackbarHost.showSnackbar(
+                        tx(lang, "保存失败，无法开始生成", "Save failed; generation was not started"),
+                    )
+                    return@launch
+                }
+                vm.generateChapter(
+                    projectId = projectId,
+                    chapter = requestedChapter,
+                    currentContent = finalSnapshot.takeIf { continuation && it.isNotBlank() },
+                    stepwise = stepwiseSnapshot,
+                    draftReference = draftSnapshot.takeIf { useDraftSnapshot && it.isNotBlank() },
+                )
+                planExpanded = false
+            } finally {
+                isSaving = false
             }
         }
     }
 
-    // Navigate to another chapter; auto-save current first if dirty.
-    val gotoChapter: (String) -> Unit = { targetId ->
-        if (isDirty) {
-            // Fire-and-forget save (no Snackbar — navigation will tear down host anyway).
-            vm.saveChapterBody(chapterId, AppRepository.ChapterBody(draft = draftText, final = finalText))
-            val wc = countWords(finalText.ifBlank { draftText })
-            vm.upsertChapter(projectId, chapter.copy(
-                outline_goal = goal.ifBlank { null },
-                conflict = conflict.ifBlank { null },
-                word_count = wc,
-            ))
+    fun saveFailureMessage(): String =
+        tx(lang, "保存失败，已留在当前页", "Save failed; staying on this page")
+
+    val save: () -> Unit = {
+        if (!isSaving) {
+            isSaving = true
+            scope.launch {
+                val ok = try {
+                    persistCurrentChapter()
+                } finally {
+                    isSaving = false
+                }
+                snackbarHost.showSnackbar(if (ok) tx(lang, "已保存", "Saved") else saveFailureMessage())
+            }
         }
-        onNavigateToChapter(targetId)
     }
+
+    val leaveEditor: () -> Unit = {
+        if (!isSaving) {
+            if (!isDirty) {
+                onBack()
+            } else {
+                isSaving = true
+                scope.launch {
+                    val ok = try {
+                        persistCurrentChapter()
+                    } finally {
+                        isSaving = false
+                    }
+                    if (ok) onBack() else snackbarHost.showSnackbar(saveFailureMessage())
+                }
+            }
+        }
+    }
+
+    // Navigate to another chapter only after the current one is durably saved.
+    val gotoChapter: (String) -> Unit = { targetId ->
+        if (!isSaving && targetId != chapterId) {
+            if (!isDirty) {
+                onNavigateToChapter(targetId)
+            } else {
+                isSaving = true
+                scope.launch {
+                    val ok = try {
+                        persistCurrentChapter()
+                    } finally {
+                        isSaving = false
+                    }
+                    if (ok) onNavigateToChapter(targetId)
+                    else snackbarHost.showSnackbar(saveFailureMessage())
+                }
+            }
+        }
+    }
+
+    // Keep this handler enabled while saving: otherwise a second system-back press would fall
+    // through to NavHost and reintroduce the cancellation race.
+    BackHandler(onBack = leaveEditor)
 
     Scaffold(
         contentWindowInsets = androidx.compose.foundation.layout.WindowInsets(0),
         topBar = {
             AppTopBar(
                 navigationIcon = {
-                    IconButton(onClick = { if (isDirty) save(); onBack() }) {
-                        Icon(Icons.AutoMirrored.Outlined.ArrowBack, contentDescription = null)
+                    IconButton(onClick = leaveEditor, enabled = !isSaving) {
+                        Icon(
+                            Icons.AutoMirrored.Outlined.ArrowBack,
+                            contentDescription = tx(lang, "返回", "Back"),
+                        )
                     }
                 },
                 title = {
@@ -338,20 +512,32 @@ fun EditorScreen(
                     if (isLongNovel) {
                         IconButton(
                             onClick = { prevChapter?.let { gotoChapter(it.id) } },
-                            enabled = prevChapter != null,
+                            enabled = prevChapter != null && !isSaving,
                         ) {
                             Icon(Icons.Outlined.ChevronLeft,
                                 contentDescription = tx(lang, "上一章", "Previous chapter"))
                         }
                         IconButton(
                             onClick = { nextChapter?.let { gotoChapter(it.id) } },
-                            enabled = nextChapter != null,
+                            enabled = nextChapter != null && !isSaving,
                         ) {
                             Icon(Icons.Outlined.ChevronRight,
                                 contentDescription = tx(lang, "下一章", "Next chapter"))
                         }
                     }
-                    IconButton(onClick = save) { Icon(Icons.Outlined.Save, contentDescription = null) }
+                    IconButton(onClick = save, enabled = !isSaving) {
+                        if (isSaving) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(18.dp),
+                                strokeWidth = 2.dp,
+                            )
+                        } else {
+                            Icon(
+                                Icons.Outlined.Save,
+                                contentDescription = tx(lang, "保存", "Save"),
+                            )
+                        }
+                    }
                     // Overflow menu: collapses 问答 / 容器 / 境界 so the title keeps its space.
                     Box {
                         IconButton(onClick = { showOverflowMenu = true }) {
@@ -464,40 +650,19 @@ fun EditorScreen(
                             } else null,
                         )
                         FilledTonalButton(
-                            enabled = !isGenerating,
-                            onClick = {
-                                vm.generateChapter(
-                                    projectId = projectId,
-                                    chapter = chapter.copy(
-                                        outline_goal = goal.ifBlank { null },
-                                        conflict = conflict.ifBlank { null },
-                                    ),
-                                    currentContent = null,
-                                    stepwise = stepwiseGen,
-                                    draftReference = if (useDraftRef && draftText.isNotBlank()) draftText else null,
-                                )
-                                planExpanded = false
-                            },
+                            enabled = !isGenerating && !isSaving && !hasReviewableCandidate,
+                            onClick = { startChapterGeneration(continuation = false) },
                         ) {
                             Icon(Icons.Outlined.AutoAwesome, null, modifier = Modifier.size(16.dp))
                             Spacer(Modifier.width(4.dp))
                             Text(tx(lang, "生成", "Generate"), style = MaterialTheme.typography.labelMedium)
                         }
                         FilledTonalButton(
-                            enabled = !isGenerating && finalText.isNotBlank(),
-                            onClick = {
-                                vm.generateChapter(
-                                    projectId = projectId,
-                                    chapter = chapter.copy(
-                                        outline_goal = goal.ifBlank { null },
-                                        conflict = conflict.ifBlank { null },
-                                    ),
-                                    currentContent = finalText,
-                                    stepwise = stepwiseGen,
-                                    draftReference = if (useDraftRef && draftText.isNotBlank()) draftText else null,
-                                )
-                                planExpanded = false
-                            },
+                            enabled = !isGenerating &&
+                                !isSaving &&
+                                !hasReviewableCandidate &&
+                                finalText.isNotBlank(),
+                            onClick = { startChapterGeneration(continuation = true) },
                         ) {
                             Icon(Icons.Outlined.PlayArrow, null, modifier = Modifier.size(16.dp))
                             Spacer(Modifier.width(4.dp))
@@ -559,6 +724,326 @@ fun EditorScreen(
                             color = MaterialTheme.colorScheme.primary,
                             modifier = Modifier.padding(top = 2.dp),
                         )
+                    }
+
+                    if (isChapterGenerating && streaming.isNotBlank()) {
+                        Card(
+                            modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                            colors = CardDefaults.cardColors(
+                                containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                            ),
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                                verticalArrangement = Arrangement.spacedBy(4.dp),
+                            ) {
+                                Text(
+                                    tx(lang, "实时生成预览（尚未保存）", "Live generation preview (not saved)"),
+                                    style = MaterialTheme.typography.titleSmall,
+                                )
+                                Text(
+                                    streaming.takeLast(1_200),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    maxLines = 10,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                        }
+                    }
+
+                    reviewCandidates.firstOrNull()?.let { candidate ->
+                        val report = candidate.qualityReport
+                        val warningCount = report?.findings
+                            .orEmpty()
+                            .count { it.severity != "info" }
+                        val run = reviewRun
+                        val telemetry = run?.telemetry
+                        val sourceLabel = when {
+                            run == null || run.initiator != GenerationRun.INITIATOR_AGENT -> {
+                                tx(lang, "编辑器", "Editor")
+                            }
+                            run.agentEngine == "dual" -> tx(lang, "双智能体", "Dual agent")
+                            else -> tx(lang, "经典智能体", "Classic agent")
+                        }
+                        val operationLabel = when (run?.operation) {
+                            GenerationRun.OPERATION_GENERATE -> tx(lang, "生成", "Generate")
+                            GenerationRun.OPERATION_CONTINUE -> tx(lang, "续写", "Continue")
+                            GenerationRun.OPERATION_REVISE -> tx(lang, "整章修订", "Revise")
+                            GenerationRun.OPERATION_REPLACE -> tx(lang, "精确替换", "Replace")
+                            GenerationRun.OPERATION_EDIT_PARAGRAPH -> {
+                                tx(lang, "段落编辑", "Edit paragraph")
+                            }
+                            GenerationRun.OPERATION_SET_BODY -> tx(lang, "设置正文", "Set body")
+                            else -> run?.operation.orEmpty().ifBlank {
+                                tx(lang, "生成", "Generate")
+                            }
+                        }
+                        Card(
+                            modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                            colors = CardDefaults.cardColors(
+                                containerColor = MaterialTheme.colorScheme.tertiaryContainer,
+                            ),
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                                verticalArrangement = Arrangement.spacedBy(6.dp),
+                            ) {
+                                Text(
+                                    tx(lang, "AI 候选稿待审核", "AI candidate awaiting review"),
+                                    style = MaterialTheme.typography.titleSmall,
+                                    color = MaterialTheme.colorScheme.onTertiaryContainer,
+                                )
+                                Text(
+                                    tx(
+                                        lang,
+                                        "来源：$sourceLabel · 操作：$operationLabel",
+                                        "Source: $sourceLabel · Operation: $operationLabel",
+                                    ),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onTertiaryContainer,
+                                )
+                                telemetry?.let { metrics ->
+                                    val providerLabel = when (metrics.model.provider) {
+                                        "deepseek" -> "DeepSeek"
+                                        "openai" -> "OpenAI"
+                                        "openrouter" -> "OpenRouter"
+                                        "gemini" -> "Gemini"
+                                        "local" -> tx(lang, "本地", "Local")
+                                        else -> tx(lang, "兼容接口", "Compatible API")
+                                    }
+                                    if (metrics.model.provider == "local") {
+                                        Text(
+                                            tx(
+                                                lang,
+                                                "执行：本地确定性变更 · 未调用文本模型",
+                                                "Execution: deterministic local change · no text-model call",
+                                            ),
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onTertiaryContainer,
+                                        )
+                                    } else {
+                                        Text(
+                                            tx(
+                                                lang,
+                                                "模型：$providerLabel / ${metrics.model.model} · 提示契约：${metrics.promptContract}",
+                                                "Model: $providerLabel / ${metrics.model.model} · prompt contract: ${metrics.promptContract}",
+                                            ),
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onTertiaryContainer,
+                                        )
+                                        val firstOutput = metrics.firstOutputMillis?.let {
+                                            formatTelemetryDuration(it)
+                                        } ?: tx(lang, "未观测", "not observed")
+                                        Text(
+                                            tx(
+                                                lang,
+                                                "${metrics.requestCount} 次请求 · 首字 $firstOutput · 总耗时 ${formatTelemetryDuration(metrics.totalMillis)}",
+                                                "${metrics.requestCount} requests · first text $firstOutput · total ${formatTelemetryDuration(metrics.totalMillis)}",
+                                            ),
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onTertiaryContainer,
+                                        )
+                                        val inputTokens = metrics.promptTokens()
+                                        val outputTokens = metrics.completionTokens()
+                                        val totalTokens = metrics.totalTokens()
+                                        if (inputTokens != null || outputTokens != null || totalTokens != null) {
+                                            Text(
+                                                tx(
+                                                    lang,
+                                                    "Token：输入 ${inputTokens?.let(::formatTelemetryCount) ?: "—"}（${metrics.promptTokensReportedRequests()}/${metrics.requestCount}） · 输出 ${outputTokens?.let(::formatTelemetryCount) ?: "—"}（${metrics.completionTokensReportedRequests()}/${metrics.requestCount}） · 总计 ${totalTokens?.let(::formatTelemetryCount) ?: "—"}（${metrics.totalTokensReportedRequests()}/${metrics.requestCount}）",
+                                                    "Tokens: input ${inputTokens?.let(::formatTelemetryCount) ?: "—"} (${metrics.promptTokensReportedRequests()}/${metrics.requestCount}) · output ${outputTokens?.let(::formatTelemetryCount) ?: "—"} (${metrics.completionTokensReportedRequests()}/${metrics.requestCount}) · total ${totalTokens?.let(::formatTelemetryCount) ?: "—"} (${metrics.totalTokensReportedRequests()}/${metrics.requestCount})",
+                                                ),
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onTertiaryContainer,
+                                            )
+                                        } else {
+                                            Text(
+                                                tx(
+                                                    lang,
+                                                    "服务商未返回 Token 统计",
+                                                    "The provider did not return token usage",
+                                                ),
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onTertiaryContainer,
+                                            )
+                                        }
+                                        val failedRequests = metrics.failedRequestCount()
+                                        if (failedRequests > 0) {
+                                            Text(
+                                                tx(
+                                                    lang,
+                                                    "内部子请求失败 $failedRequests 次，已自动回退并完成候选稿",
+                                                    "$failedRequests internal request(s) failed; fallback completed the candidate",
+                                                ),
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.tertiary,
+                                            )
+                                        }
+                                        val cacheRate = metrics.cacheHitRate()
+                                        val observedCache = metrics.cacheObservedTokens()
+                                        if (cacheRate != null && observedCache != null) {
+                                            val (hit, miss) = observedCache
+                                            val cacheTotal = if (Long.MAX_VALUE - hit < miss) {
+                                                Long.MAX_VALUE
+                                            } else {
+                                                hit + miss
+                                            }
+                                            Text(
+                                                tx(
+                                                    lang,
+                                                    "前缀缓存：命中 ${formatTelemetryCount(hit)} / ${formatTelemetryCount(cacheTotal)} · ${(cacheRate * 100).roundToInt()}% · 覆盖 ${metrics.cacheReportedRequests()}/${metrics.requestCount}",
+                                                    "Prefix cache: ${formatTelemetryCount(hit)} / ${formatTelemetryCount(cacheTotal)} · ${(cacheRate * 100).roundToInt()}% · coverage ${metrics.cacheReportedRequests()}/${metrics.requestCount}",
+                                                ),
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onTertiaryContainer,
+                                            )
+                                        } else {
+                                            Text(
+                                                tx(
+                                                    lang,
+                                                    "服务商未返回可计算的缓存命中统计",
+                                                    "The provider did not return usable cache-hit metrics",
+                                                ),
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onTertiaryContainer,
+                                            )
+                                        }
+                                    }
+                                }
+                                Text(
+                                    tx(
+                                        lang,
+                                        "${candidate.wordCount} 字" +
+                                            if (warningCount > 0) " · $warningCount 项检查提示" else " · 硬性检查通过",
+                                        "${candidate.wordCount} words" +
+                                            if (warningCount > 0) " · $warningCount findings" else " · hard checks passed",
+                                    ),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = if (report?.blocking == true) {
+                                        MaterialTheme.colorScheme.error
+                                    } else {
+                                        MaterialTheme.colorScheme.onTertiaryContainer
+                                    },
+                                )
+                                report?.findings.orEmpty().take(2).forEach { finding ->
+                                    Text(
+                                        "• ${finding.message}",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = if (finding.severity == "error") {
+                                            MaterialTheme.colorScheme.error
+                                        } else {
+                                            MaterialTheme.colorScheme.onTertiaryContainer
+                                        },
+                                    )
+                                }
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.End,
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    TextButton(onClick = { previewCandidateId = candidate.id }) {
+                                        Text(tx(lang, "预览", "Preview"))
+                                    }
+                                    TextButton(
+                                        enabled = !isSaving && !isGenerating,
+                                        onClick = {
+                                            val run = reviewRun ?: return@TextButton
+                                            isSaving = true
+                                            scope.launch {
+                                                try {
+                                                    val rejected = withContext(Dispatchers.IO) {
+                                                        vm.rejectChapterGeneration(projectId, run.id)
+                                                    }
+                                                    val saved = if (rejected) persistCurrentChapter() else false
+                                                    snackbarHost.showSnackbar(
+                                                        if (rejected && saved) {
+                                                            tx(lang, "已拒绝，正文保持不变", "Rejected; official text unchanged")
+                                                        } else {
+                                                            tx(lang, "拒绝候选稿失败", "Failed to reject candidate")
+                                                        },
+                                                    )
+                                                } finally {
+                                                    previewCandidateId = null
+                                                    isSaving = false
+                                                }
+                                            }
+                                        },
+                                    ) {
+                                        Text(tx(lang, "拒绝", "Reject"))
+                                    }
+                                    FilledTonalButton(
+                                        enabled = !isSaving && !isGenerating && report?.blocking != true,
+                                        onClick = {
+                                            val run = reviewRun ?: return@FilledTonalButton
+                                            val editorDraft = draftText
+                                            val editorFinal = finalText
+                                            val editorGoal = goal.ifBlank { null }
+                                            val editorConflict = conflict.ifBlank { null }
+                                            isSaving = true
+                                            scope.launch {
+                                                try {
+                                                    val editorMatchesPersistedSource = withContext(Dispatchers.IO) {
+                                                        val persistedBody = vm.chapterBody(chapterId)
+                                                        val persistedChapter = vm.chapters(projectId)
+                                                            .firstOrNull { it.id == chapterId }
+                                                        persistedChapter != null &&
+                                                            persistedBody.draft == editorDraft &&
+                                                            persistedBody.final == editorFinal &&
+                                                            persistedChapter.outline_goal == editorGoal &&
+                                                            persistedChapter.conflict == editorConflict
+                                                    }
+                                                    if (!editorMatchesPersistedSource) {
+                                                        snackbarHost.showSnackbar(
+                                                            tx(
+                                                                lang,
+                                                                "当前编辑内容在候选生成后发生了变化；为避免覆盖，不能直接采用",
+                                                                "The editor changed after this candidate was generated; acceptance was blocked to protect your edits.",
+                                                            ),
+                                                        )
+                                                        return@launch
+                                                    }
+                                                    val result = withContext(Dispatchers.IO) {
+                                                        vm.adoptChapterCandidate(projectId, run.id, candidate.id)
+                                                    }
+                                                    if (result is CandidateAdoptionResult.Adopted) {
+                                                        val body = vm.chapterBody(chapterId)
+                                                        val adopted = vm.chapters(projectId)
+                                                            .firstOrNull { it.id == chapterId }
+                                                        draftText = body.draft
+                                                        finalText = body.final
+                                                        goal = adopted?.outline_goal.orEmpty()
+                                                        conflict = adopted?.conflict.orEmpty()
+                                                        savedDraft = body.draft
+                                                        savedFinal = body.final
+                                                        savedGoal = goal
+                                                        savedConflict = conflict
+                                                        checkpointDraft = body.draft
+                                                        checkpointFinal = body.final
+                                                        tab = EditorTab.Final
+                                                        snackbarHost.showSnackbar(
+                                                            tx(lang, "已采用候选稿", "Candidate accepted"),
+                                                        )
+                                                    } else {
+                                                        snackbarHost.showSnackbar(
+                                                            tx(
+                                                                lang,
+                                                                "采用失败；候选稿已保留，请查看状态提示",
+                                                                "Acceptance failed; the candidate was kept. See status for details.",
+                                                            ),
+                                                        )
+                                                    }
+                                                } finally {
+                                                    previewCandidateId = null
+                                                    isSaving = false
+                                                }
+                                            }
+                                        },
+                                    ) {
+                                        Text(tx(lang, "采用", "Accept"))
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     // ── Promo error / banner ──────────────────────────────────────────────
@@ -741,16 +1226,30 @@ fun EditorScreen(
                                 FilledTonalButton(
                                     onClick = {
                                         if (inlineRevising) return@FilledTonalButton
-                                        val passage = finalTfv.text.substring(selStart, selEnd)
+                                        val baselineText = finalTfv.text
+                                        val baselineStart = selStart
+                                        val baselineEnd = selEnd
+                                        val passage = baselineText.substring(baselineStart, baselineEnd)
                                         inlineRevising = true
                                         scope.launch {
-                                            val r = vm.reviseSelection(passage, null)
-                                            if (r != null) {
-                                                val merged = finalTfv.text.substring(0, selStart) + r + finalTfv.text.substring(selEnd)
-                                                finalText = merged
-                                                finalTfv = TextFieldValue(merged, selection = TextRange(selStart + r.length))
+                                            try {
+                                                val r = vm.reviseSelection(passage, null)
+                                                if (r != null && finalTfv.text == baselineText) {
+                                                    val merged = baselineText.substring(0, baselineStart) + r + baselineText.substring(baselineEnd)
+                                                    finalText = merged
+                                                    finalTfv = TextFieldValue(merged, selection = TextRange(baselineStart + r.length))
+                                                } else if (r != null) {
+                                                    snackbarHost.showSnackbar(
+                                                        tx(
+                                                            lang,
+                                                            "正文在润色期间已被修改，已保留你的编辑；请重新选择后再润色",
+                                                            "The text changed while polishing. Your edits were kept; select the passage again.",
+                                                        ),
+                                                    )
+                                                }
+                                            } finally {
+                                                inlineRevising = false
                                             }
-                                            inlineRevising = false
                                         }
                                     },
                                     modifier = Modifier.align(Alignment.TopEnd).padding(8.dp),
@@ -891,6 +1390,50 @@ fun EditorScreen(
                 editorBody()
             }
         }
+    }
+
+    val previewCandidate = reviewCandidates.firstOrNull { it.id == previewCandidateId }
+    if (previewCandidate != null) {
+        AlertDialog(
+            onDismissRequest = { previewCandidateId = null },
+            title = { Text(tx(lang, "AI 候选稿预览", "AI Candidate Preview")) },
+            text = {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 520.dp)
+                        .verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    previewCandidate.qualityReport?.findings.orEmpty().forEach { finding ->
+                        Text(
+                            "• ${finding.message}",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (finding.severity == "error") {
+                                MaterialTheme.colorScheme.error
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            },
+                        )
+                    }
+                    if (previewCandidate.qualityReport?.findings?.isNotEmpty() == true) {
+                        HorizontalDivider()
+                    }
+                    Text(
+                        previewCandidate.body.ifBlank {
+                            tx(lang, "候选正文为空", "Candidate body is empty")
+                        },
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontFamily = FontFamily.Serif,
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { previewCandidateId = null }) {
+                    Text(tx(lang, "关闭", "Close"))
+                }
+            },
+        )
     }
 
     // ── Chapter switcher popup (long-novel only) ──────────────────────────────
@@ -1126,6 +1669,7 @@ fun EditorScreen(
                 isGeneratingIllustration = true
                 illustrationError = null
                 vm.generateIllustration(
+                    projectId = projectId,
                     chapterId = chapterId,
                     paragraphText = selectedText,
                     anchorIndex = anchor,
@@ -1185,6 +1729,7 @@ fun EditorScreen(
                 isGeneratingPromo = true
                 promoError = null
                 vm.generateChapterPromo(
+                    projectId = projectId,
                     chapterId = chapterId,
                     chapterTitle = chapter.title,
                     chapterContent = finalText,

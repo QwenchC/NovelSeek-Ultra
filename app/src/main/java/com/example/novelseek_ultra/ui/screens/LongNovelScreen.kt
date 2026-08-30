@@ -698,7 +698,7 @@ fun LongNovelScreen(
                 "Delete \"${ch.order_index}. ${ch.title}\"? Its final and draft content will be permanently removed."),
             confirmLabel = tx(lang, "删除", "Delete"),
             dismissLabel = tx(lang, "取消", "Cancel"),
-            onConfirm = { vm.deleteChapter(projectId, ch.id) },
+            onConfirm = { vm.deleteChapterFully(projectId, ch.id) },
             onDismiss = { deletingChapter = null },
         )
     }
@@ -997,6 +997,7 @@ fun LongNovelScreen(
                         return
                     }
                     vm.generateChapterPromo(
+                        projectId = projectId,
                         chapterId = chapter.id,
                         chapterTitle = chapter.title,
                         chapterContent = content,

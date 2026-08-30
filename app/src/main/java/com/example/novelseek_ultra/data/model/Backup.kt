@@ -38,6 +38,7 @@ val PROJECT_MAP_FIELDS = listOf(
     "cultivationRealmsByProject",
     "characterRealmEventsByProject",
     "containersByProject",
+    "factEvidenceByProject",
     "promoByChapter",
 )
 
@@ -57,6 +58,8 @@ val APP_SETTINGS_FIELDS = listOf(
     "uiLanguage",
     // Android-only app preferences (PC ignores unknown keys on import).
     "agentName",
+    "agentEngine",
+    "dualAgentReasoningLevel",
     "listenVoice",
     "listenRate",
     "lastListenProjectId",

@@ -1,10 +1,16 @@
 package com.example.novelseek_ultra.data.ai
 
 import com.example.novelseek_ultra.data.model.TextModelConfig
+import com.example.novelseek_ultra.data.model.TextModelThinkingModes
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
@@ -12,6 +18,7 @@ import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 import okhttp3.Call
 import okhttp3.Callback
@@ -20,24 +27,59 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.sse.EventSource
 import okhttp3.sse.EventSourceListener
 import okhttp3.sse.EventSources
 import java.io.IOException
+import java.net.ConnectException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 data class ChatMessage(val role: String, val content: String)
+
+data class StreamUsage(
+    val promptTokens: Long? = null,
+    val completionTokens: Long? = null,
+    val totalTokens: Long? = null,
+    val cacheHitTokens: Long? = null,
+    val cacheMissTokens: Long? = null,
+)
+
+data class TextUsageStats(
+    val requests: Long = 0,
+    val promptTokens: Long = 0,
+    val completionTokens: Long = 0,
+    val cacheObservedRequests: Long = 0,
+    val cacheHitTokens: Long = 0,
+    val cacheMissTokens: Long = 0,
+)
 
 /**
  * OkHttp-based replacement for the PC Tauri AI invoke commands. Supports OpenAI-compatible
  * `/chat/completions` endpoints (DeepSeek / OpenAI / OpenRouter / Gemini-OpenAI-compat / custom).
  */
+internal fun isDirectDeepSeek(config: TextModelConfig): Boolean {
+    val host = config.apiUrl.toHttpUrlOrNull()?.host.orEmpty()
+    return config.provider.trim().equals("deepseek", ignoreCase = true) ||
+        host == "api.deepseek.com"
+}
+
 class AiService {
+
+    private val usageLock = Any()
+    private val _usageStats = MutableStateFlow(TextUsageStats())
+    val usageStats: StateFlow<TextUsageStats> = _usageStats.asStateFlow()
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(180, TimeUnit.SECONDS)
         .callTimeout(0, TimeUnit.SECONDS)
+        // Never let a configured HTTPS endpoint downgrade a request (and its bearer token) to
+        // cleartext through a redirect. Same-scheme redirects remain available.
+        .followSslRedirects(false)
         .build()
 
     private val sseFactory = EventSources.createFactory(client)
@@ -46,36 +88,105 @@ class AiService {
     fun streamChat(
         config: TextModelConfig,
         messages: List<ChatMessage>,
+        onUsage: (StreamUsage) -> Unit = {},
     ): Flow<StreamEvent> = callbackFlow {
+        ApiEndpointPolicy.requireAllowed(config.apiUrl, config.apiKey)
         val payload = buildChatPayload(config, messages, stream = true).toString()
         val request = Request.Builder()
             .url("${config.apiUrl.trimEnd('/')}/chat/completions")
-            .addHeader("Authorization", "Bearer ${config.apiKey}")
+            .apply {
+                if (config.apiKey.isNotBlank()) {
+                    addHeader("Authorization", "Bearer ${config.apiKey}")
+                }
+            }
             .addHeader("Content-Type", "application/json")
             .addHeader("Accept", "text/event-stream")
             .post(payload.toRequestBody("application/json".toMediaType()))
             .build()
 
+        val terminated = AtomicBoolean(false)
+        val sawStop = AtomicBoolean(false)
+        val usageRecorded = AtomicBoolean(false)
+        var latestUsage: StreamUsage? = null
+
+        fun recordLatestUsage() {
+            if (usageRecorded.compareAndSet(false, true)) {
+                latestUsage?.let(::recordUsage)
+            }
+        }
+
+        fun succeed() {
+            if (!terminated.compareAndSet(false, true)) return
+            recordLatestUsage()
+            trySend(StreamEvent.Done)
+            close()
+        }
+
+        fun fail(message: String, cause: Throwable? = null) {
+            if (!terminated.compareAndSet(false, true)) return
+            recordLatestUsage()
+            // The original cause may contain an endpoint/query string or a provider response.
+            // Keep it only as a nested diagnostic cause; collectors and UI see the safe message.
+            val error = IOException(message, cause)
+            trySend(StreamEvent.Error(message))
+            // Closing exceptionally is deliberate: current collectors commit their buffer after a
+            // normal completion, so an Error event alone would still allow a truncated chapter.
+            close(error)
+        }
+
         val source = sseFactory.newEventSource(request, object : EventSourceListener() {
             override fun onEvent(eventSource: EventSource, id: String?, type: String?, data: String) {
-                if (data == "[DONE]") {
-                    trySend(StreamEvent.Done)
-                    close()
+                if (terminated.get()) return
+                val raw = data.trim()
+                if (raw == "[DONE]") {
+                    succeed()
                     return
                 }
-                val delta = parseSseDelta(data) ?: return
-                trySend(StreamEvent.Delta(delta))
+
+                parseSseError(raw, type)?.let {
+                    fail(it)
+                    return
+                }
+                val frame = parseSseFrame(raw)
+                if (frame == null) {
+                    fail("模型服务返回格式异常")
+                    return
+                }
+                frame.usage?.let { usage ->
+                    latestUsage = usage
+                    runCatching { onUsage(usage) }
+                }
+                frame.delta?.takeIf { it.isNotEmpty() }?.let {
+                    trySend(StreamEvent.Delta(it))
+                }
+                when (val reason = frame.finishReason?.takeIf { it.isNotBlank() }) {
+                    null -> Unit
+                    "stop" -> sawStop.set(true)
+                    "length" -> fail("生成内容因达到模型最大输出长度而被截断（finish_reason=length）")
+                    "content_filter" -> fail("生成内容被模型的内容安全策略中止（finish_reason=content_filter）")
+                    "insufficient_system_resource" ->
+                        fail("模型服务资源暂时不足（finish_reason=insufficient_system_resource）")
+                    else -> fail("模型以非正常原因结束生成（finish_reason=$reason）")
+                }
             }
 
             override fun onFailure(eventSource: EventSource, t: Throwable?, response: Response?) {
-                val msg = t?.message ?: response?.message ?: "unknown SSE error"
-                trySend(StreamEvent.Error(msg))
-                close(t ?: IOException(msg))
+                if (sawStop.get()) {
+                    succeed()
+                    return
+                }
+                val msg = when {
+                    response != null -> "HTTP ${response.code}: 模型服务流请求失败"
+                    t is SocketTimeoutException -> "模型服务流响应超时"
+                    t is UnknownHostException || t is ConnectException -> "模型服务流连接失败"
+                    else -> "模型服务流连接失败"
+                }
+                fail(msg, t)
             }
 
             override fun onClosed(eventSource: EventSource) {
-                trySend(StreamEvent.Done)
-                close()
+                if (sawStop.get()) succeed()
+                else fail("流式响应提前结束：未收到 [DONE] 或 finish_reason=stop")
             }
         })
 
@@ -83,12 +194,21 @@ class AiService {
     }
 
     /** Non-streaming chat completion — full text reply. */
-    suspend fun chat(config: TextModelConfig, messages: List<ChatMessage>): String =
-        kotlinx.coroutines.suspendCancellableCoroutine { cont ->
+    suspend fun chat(
+        config: TextModelConfig,
+        messages: List<ChatMessage>,
+        onUsage: (StreamUsage) -> Unit = {},
+    ): String {
+        ApiEndpointPolicy.requireAllowed(config.apiUrl, config.apiKey)
+        return kotlinx.coroutines.suspendCancellableCoroutine { cont ->
             val payload = buildChatPayload(config, messages, stream = false).toString()
             val request = Request.Builder()
                 .url("${config.apiUrl.trimEnd('/')}/chat/completions")
-                .addHeader("Authorization", "Bearer ${config.apiKey}")
+                .apply {
+                    if (config.apiKey.isNotBlank()) {
+                        addHeader("Authorization", "Bearer ${config.apiKey}")
+                    }
+                }
                 .addHeader("Content-Type", "application/json")
                 .post(payload.toRequestBody("application/json".toMediaType()))
                 .build()
@@ -103,28 +223,56 @@ class AiService {
 
             call.enqueue(object : Callback {
                 override fun onFailure(call: Call, e: IOException) {
-                    cont.resumeWith(Result.failure(e))
+                    val message = when (e) {
+                        is SocketTimeoutException -> "模型服务请求超时"
+                        is UnknownHostException, is ConnectException -> "模型服务网络连接失败"
+                        else -> "模型服务网络请求失败"
+                    }
+                    cont.resumeWith(Result.failure(IOException(message, e)))
                 }
 
                 override fun onResponse(call: Call, response: Response) {
                     response.use { resp ->
                         val body = resp.body?.string().orEmpty()
                         if (!resp.isSuccessful) {
-                            cont.resumeWith(Result.failure(IOException("HTTP ${resp.code}: $body")))
+                            cont.resumeWith(
+                                Result.failure(
+                                    IOException("HTTP ${resp.code}: 模型服务请求失败"),
+                                ),
+                            )
                             return
                         }
                         runCatching {
                             val root = kotlinx.serialization.json.Json.parseToJsonElement(body).jsonObject
-                            root["choices"]?.jsonArray?.get(0)?.jsonObject
-                                ?.get("message")?.jsonObject
+                            (root["usage"] as? JsonObject)?.let(::parseUsage)?.let { usage ->
+                                runCatching { onUsage(usage) }
+                                recordUsage(usage)
+                            }
+                            val choice = root["choices"]?.jsonArray?.get(0)?.jsonObject
+                            val finishReason = (choice?.get("finish_reason") as? JsonPrimitive)
+                                ?.contentOrNull
+                            requireSuccessfulFinish(finishReason)
+                            choice?.get("message")?.jsonObject
                                 ?.get("content")?.jsonPrimitive?.contentOrNull
                                 ?: ""
                         }.onSuccess { cont.resumeWith(Result.success(it)) }
-                            .onFailure { cont.resumeWith(Result.failure(it)) }
+                            .onFailure { error ->
+                                // Preserve deliberate, already-sanitized finish_reason failures;
+                                // only parser/shape errors should become malformed-response errors.
+                                val safeError = if (error is IOException) {
+                                    error
+                                } else {
+                                    IOException("模型服务返回格式异常", error)
+                                }
+                                cont.resumeWith(
+                                    Result.failure(safeError),
+                                )
+                            }
                     }
                 }
             })
         }
+    }
 
     /**
      * Pollinations image generation — uses the NEW unified gateway at `gen.pollinations.ai`
@@ -493,12 +641,22 @@ class AiService {
         }
     }
 
-    /** Verify model credentials by issuing a tiny `models` GET or 1-token completion. */
+    /** Verify credentials with a tiny non-thinking completion capped at 256 output tokens. */
     suspend fun testConnection(config: TextModelConfig): Boolean = try {
         chat(
-            config = config.copy(temperature = 0.0),
+            config = config.copy(
+                temperature = 0.0,
+                maxOutputTokens = 256,
+                thinkingMode = if (isDirectDeepSeek(config)) {
+                    TextModelThinkingModes.DISABLED
+                } else {
+                    config.thinkingMode
+                },
+            ),
             messages = listOf(ChatMessage("user", "ping")),
         ).isNotEmpty()
+    } catch (cancelled: CancellationException) {
+        throw cancelled
     } catch (_: Throwable) {
         false
     }
@@ -508,10 +666,23 @@ class AiService {
         messages: List<ChatMessage>,
         stream: Boolean,
     ): JsonObject = buildJsonObject {
-        put("model", config.model)
-        put("temperature", config.temperature)
+        val requestConfig = TextModelRequestPolicy.normalizeForRequest(config)
+        val budgeted = PromptRequestBudgeter.validate(requestConfig, messages)
+        val thinkingMode = TextModelThinkingModes.normalize(requestConfig.thinkingMode)
+        val isDeepSeek = isDirectDeepSeek(requestConfig)
+        put("model", requestConfig.model)
+        if (!(isDeepSeek && thinkingMode == TextModelThinkingModes.ENABLED)) {
+            put("temperature", requestConfig.temperature)
+        }
+        put("max_tokens", budgeted.maxOutputTokens)
         put("stream", stream)
-        put("messages", JsonArray(messages.map {
+        if (isDeepSeek && thinkingMode != TextModelThinkingModes.AUTO) {
+            put("thinking", buildJsonObject { put("type", thinkingMode) })
+        }
+        if (stream && supportsStreamUsage(requestConfig)) {
+            put("stream_options", buildJsonObject { put("include_usage", true) })
+        }
+        put("messages", JsonArray(budgeted.messages.map {
             buildJsonObject {
                 put("role", it.role)
                 put("content", it.content)
@@ -519,11 +690,152 @@ class AiService {
         }))
     }
 
-    private fun parseSseDelta(data: String): String? = runCatching {
-        val obj = kotlinx.serialization.json.Json.parseToJsonElement(data).jsonObject
-        val choice = obj["choices"]?.jsonArray?.firstOrNull()?.jsonObject ?: return@runCatching null
-        choice["delta"]?.jsonObject?.get("content")?.jsonPrimitive?.contentOrNull
+    private data class SseFrame(
+        val delta: String?,
+        val finishReason: String?,
+        val usage: StreamUsage?,
+    )
+
+    private fun parseSseFrame(data: String): SseFrame? = runCatching {
+        val root = kotlinx.serialization.json.Json.parseToJsonElement(data).jsonObject
+        val choice = root["choices"]?.jsonArray?.firstOrNull() as? JsonObject
+        SseFrame(
+            delta = (choice?.get("delta") as? JsonObject)
+                ?.get("content")?.let { it as? JsonPrimitive }?.contentOrNull,
+            finishReason = (choice?.get("finish_reason") as? JsonPrimitive)?.contentOrNull,
+            usage = (root["usage"] as? JsonObject)?.let(::parseUsage),
+        )
     }.getOrNull()
+
+    private fun parseSseError(data: String, eventType: String?): String? {
+        val root = runCatching {
+            kotlinx.serialization.json.Json.parseToJsonElement(data).jsonObject
+        }.getOrNull()
+        val error = root?.get("error")
+        if (error != null && error !is JsonNull) {
+            val code = (error as? JsonObject)?.let { errorObject ->
+                (errorObject["type"] as? JsonPrimitive)?.contentOrNull
+                    ?: (errorObject["code"] as? JsonPrimitive)?.contentOrNull
+            }
+            return safeProviderError(code)
+        }
+        if (eventType.equals("error", ignoreCase = true)) {
+            return "模型服务返回错误事件"
+        }
+        return null
+    }
+
+    private fun safeProviderError(code: String?): String {
+        val normalized = code.orEmpty().lowercase()
+        return when {
+            "quota" in normalized || "balance" in normalized -> "模型服务额度不足"
+            "rate" in normalized || "too_many" in normalized -> "模型服务请求过于频繁"
+            "auth" in normalized || "key" in normalized || "permission" in normalized ->
+                "模型服务鉴权失败"
+            else -> "模型服务返回错误事件"
+        }
+    }
+
+    private fun parseUsage(obj: JsonObject): StreamUsage? {
+        fun long(name: String): Long? =
+            (obj[name] as? JsonPrimitive)?.longOrNull?.takeIf { it >= 0L }
+        val prompt = long("prompt_tokens") ?: long("input_tokens")
+        val completion = long("completion_tokens") ?: long("output_tokens")
+        val details = (obj["prompt_tokens_details"] as? JsonObject)
+            ?: (obj["input_tokens_details"] as? JsonObject)
+        val rawCached = long("prompt_cache_hit_tokens")
+            ?: (details?.get("cached_tokens") as? JsonPrimitive)
+                ?.longOrNull?.takeIf { it >= 0L }
+        val rawCacheMiss = long("prompt_cache_miss_tokens")
+        // A cache rate is only meaningful when hit and miss refer to the same complete prompt.
+        // DeepSeek normally returns both; OpenAI returns cached tokens and lets us derive misses.
+        val cachePair = when {
+            rawCached != null && rawCacheMiss != null -> {
+                val sumIsSafe = rawCached <= Long.MAX_VALUE - rawCacheMiss
+                val sum = if (sumIsSafe) rawCached + rawCacheMiss else null
+                if (sum != null && (prompt == null || sum == prompt)) {
+                    rawCached to rawCacheMiss
+                } else {
+                    null
+                }
+            }
+            prompt != null && rawCached != null && rawCached <= prompt ->
+                rawCached to (prompt - rawCached)
+            prompt != null && rawCacheMiss != null && rawCacheMiss <= prompt ->
+                (prompt - rawCacheMiss) to rawCacheMiss
+            else -> null
+        }
+        val usage = StreamUsage(
+            promptTokens = prompt,
+            completionTokens = completion,
+            totalTokens = long("total_tokens")
+                ?: if (prompt != null && completion != null) {
+                    if (Long.MAX_VALUE - prompt < completion) Long.MAX_VALUE
+                    else prompt + completion
+                } else {
+                    null
+                },
+            cacheHitTokens = cachePair?.first,
+            cacheMissTokens = cachePair?.second,
+        )
+        return usage.takeIf {
+            it.promptTokens != null || it.completionTokens != null || it.totalTokens != null ||
+                it.cacheHitTokens != null || it.cacheMissTokens != null
+        }
+    }
+
+    private fun requireSuccessfulFinish(finishReason: String?) {
+        when (finishReason?.takeIf { it.isNotBlank() }) {
+            null, "stop" -> Unit
+            "length" -> throw IOException(
+                "生成内容因达到模型最大输出长度而被截断（finish_reason=length）",
+            )
+            "content_filter" -> throw IOException(
+                "生成内容被模型的内容安全策略中止（finish_reason=content_filter）",
+            )
+            "insufficient_system_resource" -> throw IOException(
+                "模型服务资源暂时不足（finish_reason=insufficient_system_resource）",
+            )
+            else -> throw IOException("模型以非正常原因结束生成")
+        }
+    }
+
+    private fun recordUsage(usage: StreamUsage) {
+        synchronized(usageLock) {
+            val current = _usageStats.value
+            val observedCache = usage.cacheHitTokens != null && usage.cacheMissTokens != null
+            _usageStats.value = current.copy(
+                requests = saturatedAdd(current.requests, 1),
+                promptTokens = saturatedAdd(current.promptTokens, usage.promptTokens ?: 0),
+                completionTokens = saturatedAdd(
+                    current.completionTokens,
+                    usage.completionTokens ?: 0,
+                ),
+                cacheObservedRequests = saturatedAdd(
+                    current.cacheObservedRequests,
+                    if (observedCache) 1 else 0,
+                ),
+                cacheHitTokens = saturatedAdd(
+                    current.cacheHitTokens,
+                    if (observedCache) usage.cacheHitTokens ?: 0 else 0,
+                ),
+                cacheMissTokens = saturatedAdd(
+                    current.cacheMissTokens,
+                    if (observedCache) usage.cacheMissTokens ?: 0 else 0,
+                ),
+            )
+        }
+    }
+
+    private fun saturatedAdd(left: Long, right: Long): Long =
+        if (right > 0L && left > Long.MAX_VALUE - right) Long.MAX_VALUE else left + right
+
+    private fun supportsStreamUsage(config: TextModelConfig): Boolean {
+        val host = config.apiUrl.toHttpUrlOrNull()?.host.orEmpty()
+        return isDirectDeepSeek(config) ||
+            config.provider.trim().equals("openai", ignoreCase = true) ||
+            host == "openai.com" || host.endsWith(".openai.com")
+    }
 
     sealed class StreamEvent {
         data class Delta(val text: String) : StreamEvent()

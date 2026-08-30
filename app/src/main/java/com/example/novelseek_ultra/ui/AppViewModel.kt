@@ -4,15 +4,34 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.novelseek_ultra.data.AppRepository
+import com.example.novelseek_ultra.data.ChapterSourceVersion
+import com.example.novelseek_ultra.data.DerivedChapterMutation
+import com.example.novelseek_ultra.data.DerivedSourceFingerprint
+import com.example.novelseek_ultra.data.FactEvidenceLedger
+import com.example.novelseek_ultra.data.NovelGenerationEngine
 import com.example.novelseek_ultra.data.ai.AiService
 import com.example.novelseek_ultra.data.ai.ChatMessage
+import com.example.novelseek_ultra.data.ai.EntityReconciliation
+import com.example.novelseek_ultra.data.ai.GenerationTelemetryCollector
 import com.example.novelseek_ultra.data.ai.KbService
 import com.example.novelseek_ultra.data.ai.Prompts
+import com.example.novelseek_ultra.data.ai.PromptRequestBudgeter
+import com.example.novelseek_ultra.data.ai.TextModelRequestPolicy
+import com.example.novelseek_ultra.data.ai.StoryStateCompiler
+import com.example.novelseek_ultra.data.ai.StoryStateVisibility
+import com.example.novelseek_ultra.data.ai.StreamUsage
+import com.example.novelseek_ultra.data.ai.collectCompleted
+import com.example.novelseek_ultra.data.ai.isUsableApiConfig
+import com.example.novelseek_ultra.data.ai.isDirectDeepSeek
+import com.example.novelseek_ultra.data.ai.launchWithFailureBoundary
 import com.example.novelseek_ultra.data.ai.toPromptContext
 import com.example.novelseek_ultra.data.model.BackupBundle
 import com.example.novelseek_ultra.data.model.BackupSummary
 import com.example.novelseek_ultra.data.model.Chapter
+import com.example.novelseek_ultra.data.model.ChapterFactEvidenceBatch
 import com.example.novelseek_ultra.data.model.ChapterPromo
+import com.example.novelseek_ultra.data.model.ChapterSpec
+import com.example.novelseek_ultra.data.model.CandidateAdoptionResult
 import com.example.novelseek_ultra.data.model.Character
 import com.example.novelseek_ultra.data.model.CharacterGrowthEntry
 import com.example.novelseek_ultra.data.model.Container
@@ -23,7 +42,14 @@ import com.example.novelseek_ultra.data.model.CultivationRealm
 import com.example.novelseek_ultra.data.model.CultivationSubRealm
 import com.example.novelseek_ultra.data.model.EmbeddingConfig
 import com.example.novelseek_ultra.data.model.EntityPayload
+import com.example.novelseek_ultra.data.model.GenerationContextFingerprint
+import com.example.novelseek_ultra.data.model.GenerationContextManifest
+import com.example.novelseek_ultra.data.model.GenerationContextMaterial
+import com.example.novelseek_ultra.data.model.GenerationRun
+import com.example.novelseek_ultra.data.model.GenerationTelemetry
+import com.example.novelseek_ultra.data.model.GenerationSourceFingerprint
 import com.example.novelseek_ultra.data.model.Illustration
+import com.example.novelseek_ultra.data.model.KbChunk
 import com.example.novelseek_ultra.data.model.NovelChatMessage
 import com.example.novelseek_ultra.data.model.PlotArc
 import com.example.novelseek_ultra.data.model.RestoreResult
@@ -33,11 +59,16 @@ import com.example.novelseek_ultra.data.model.Project
 import com.example.novelseek_ultra.data.model.Volume
 import com.example.novelseek_ultra.data.model.TextModelConfig
 import com.example.novelseek_ultra.data.model.TextModelProfile
+import com.example.novelseek_ultra.data.model.TextModelThinkingModes
 import com.example.novelseek_ultra.data.nowIso
 import com.example.novelseek_ultra.util.buildRealmSystemContext
 import com.example.novelseek_ultra.util.buildVolumeRealmConstraint
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -49,10 +80,206 @@ import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 
+private data class ChapterTextMutation(
+    val replacement: String?,
+    val observation: String,
+)
+
+private data class StreamingGenerationTicket(
+    val revision: Long,
+    val buffer: StringBuilder,
+)
+
+/** Process-wide execution ownership so a superseded durable run also stops its real provider call. */
+private object ChapterGenerationExecutions {
+    private data class Key(val projectId: String, val chapterId: String)
+    private data class Entry(val runId: String, val job: Job)
+
+    private val lock = Any()
+    private val entries = mutableMapOf<Key, Entry>()
+    private val jobsByRunId = mutableMapOf<String, Job>()
+    private val cancellationCategories = java.util.WeakHashMap<Job, String>()
+
+    fun replace(
+        projectId: String,
+        chapterId: String,
+        runId: String,
+        job: Job,
+    ) {
+        val previous = synchronized(lock) {
+            jobsByRunId[runId] = job
+            entries.put(Key(projectId, chapterId), Entry(runId, job)).also { old ->
+                if (old != null && old.runId != runId && old.job !== job) {
+                    cancellationCategories[old.job] = GenerationTelemetry.FAILURE_SUPERSEDED
+                }
+            }
+        }
+        if (previous != null && previous.runId != runId && previous.job !== job) {
+            previous.job.cancel(CancellationException("Generation superseded"))
+        }
+    }
+
+    fun cancelExisting(projectId: String, chapterId: String) {
+        val previous = synchronized(lock) {
+            entries.remove(Key(projectId, chapterId))?.also {
+                cancellationCategories[it.job] = GenerationTelemetry.FAILURE_SUPERSEDED
+            }
+        }
+        previous?.job?.cancel(CancellationException("Generation superseded"))
+    }
+
+    fun cancel(job: Job?, category: String) {
+        if (job == null) return
+        synchronized(lock) { cancellationCategories[job] = category }
+        val message = if (category == GenerationTelemetry.FAILURE_SUPERSEDED) {
+            "Generation superseded"
+        } else {
+            "Generation cancelled by user"
+        }
+        job.cancel(CancellationException(message))
+    }
+
+    fun cancellationCategory(runId: String, job: Job?): String? = synchronized(lock) {
+        job?.let(cancellationCategories::get)
+            ?: jobsByRunId[runId]?.let(cancellationCategories::get)
+    }
+
+    fun unregister(projectId: String, chapterId: String, runId: String) {
+        synchronized(lock) {
+            val key = Key(projectId, chapterId)
+            if (entries[key]?.runId == runId) entries.remove(key)
+            jobsByRunId.remove(runId)?.let(cancellationCategories::remove)
+        }
+    }
+}
+
+/** Repository sources that can affect an AI prompt. A source snapshot is captured twice before
+ * network I/O (to avoid accepting a torn multi-store read) and compared again at the write edge. */
+private enum class PromptSourceScope {
+    OUTLINE,
+    CHAPTER,
+    PLANNING,
+    VOLUME_COLLECTION,
+    ARC_COLLECTION,
+    PLOT_ARC,
+    CHARACTERS_FROM_OUTLINE,
+}
+
+private data class PromptProjectSource(
+    val id: String,
+    val title: String = "",
+    val genre: String = "",
+    val description: String = "",
+)
+
+private data class PromptCharacterSource(
+    val id: String,
+    val name: String,
+    val gender: String = "",
+    val role: String = "",
+    val personality: String = "",
+    val appearance: String = "",
+    val motivation: String = "",
+    val currentRealmId: String? = null,
+    val currentSubRealmId: String? = null,
+)
+
+private data class PromptVolumeSource(
+    val id: String,
+    val name: String,
+    val description: String,
+    val order: Int,
+    val realmPlan: String,
+)
+
+private data class PromptArcSource(
+    val id: String,
+    val title: String,
+    val summary: String,
+    val order: Int,
+    val status: String,
+    val chapterCount: Int,
+    val volumeId: String?,
+    val builtChapterIds: List<String>?,
+)
+
+private data class PromptChapterSource(
+    val id: String,
+    val title: String,
+    val orderIndex: Int,
+    val outlineGoal: String? = null,
+    val conflict: String? = null,
+    val wordCount: Int = 0,
+    val arcId: String? = null,
+)
+
+private data class PromptContainerSource(
+    val id: String,
+    val name: String,
+    val type: String,
+    val affectsGeneration: Boolean,
+    val affectsVolumeGeneration: Boolean,
+    val affectsArcGeneration: Boolean,
+)
+
+private data class PromptContainerValueSource(
+    val containerId: String,
+    val blockKey: String,
+    val latest: ContainerEntry?,
+)
+
+private data class PromptGrowthSource(
+    val characterId: String,
+    val latest: CharacterGrowthEntry?,
+)
+
+private data class BudgetedChapterContext(
+    val worldSetting: String?,
+    val timeline: String?,
+    val charactersInfo: String?,
+    val storyState: String?,
+    val targetConstraints: String?,
+    val chapterList: String?,
+    val draftReference: String?,
+)
+
+data class FactEvidenceCoverage(
+    val claims: Int,
+    val coveredChapters: Int,
+    val eligibleChapters: Int,
+)
+
+private data class PromptSourceSnapshot(
+    val project: PromptProjectSource,
+    val outline: String? = null,
+    val worldSetting: String? = null,
+    val timeline: String? = null,
+    val realms: List<CultivationRealm> = emptyList(),
+    val characters: List<PromptCharacterSource> = emptyList(),
+    val characterGrowth: List<PromptGrowthSource> = emptyList(),
+    val volumes: List<PromptVolumeSource> = emptyList(),
+    val arcs: List<PromptArcSource> = emptyList(),
+    val chapters: List<PromptChapterSource> = emptyList(),
+    val previousBodies: List<Pair<String, AppRepository.ChapterBody>> = emptyList(),
+    val summariesEnabled: Boolean? = null,
+    val summaries: List<SummaryPayload> = emptyList(),
+    val entitiesEnabled: Boolean? = null,
+    val entities: List<EntityPayload> = emptyList(),
+    val factEvidence: List<ChapterFactEvidenceBatch> = emptyList(),
+    val knowledgeBaseEnabled: Boolean? = null,
+    val embeddingConfig: EmbeddingConfig? = null,
+    val chunks: List<KbChunk> = emptyList(),
+    val containers: List<PromptContainerSource> = emptyList(),
+    val containerValues: List<PromptContainerValueSource> = emptyList(),
+)
+
 class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     private val repo: AppRepository = AppRepository.get(application)
     private val ai = AiService()
+    private val novelGenerationEngine = NovelGenerationEngine(repo)
+    /** Session-scoped provider token/cache telemetry; populated when the API returns usage. */
+    val textUsageStats = ai.usageStats
 
     /** Audiobook (听书) playback engine — observed directly by the listen screen. */
     val audiobook = com.example.novelseek_ultra.data.audio.AudiobookController(application, repo, viewModelScope)
@@ -64,6 +291,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     val projects: StateFlow<List<Project>> = repo.projects
     val state = repo.state
+    /** Bumped when durable AI chapter candidates are created, completed, accepted, or rejected. */
+    val generationRunRevision: StateFlow<Int> = repo.generationRunRevision
 
     private val _uiLanguage = MutableStateFlow(repo.uiLanguage())
     val uiLanguage: StateFlow<String> = _uiLanguage.asStateFlow()
@@ -75,7 +304,13 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private val _importPreview = MutableStateFlow<ImportPreview?>(null)
     val importPreview: StateFlow<ImportPreview?> = _importPreview.asStateFlow()
 
-    private val _statusMessage = MutableStateFlow("")
+    private val _statusMessage = MutableStateFlow(
+        if (repo.recoveredInterruptedBackupImport) {
+            "检测到上次备份导入意外中断，已自动恢复导入前的数据。"
+        } else {
+            ""
+        },
+    )
     val statusMessage: StateFlow<String> = _statusMessage.asStateFlow()
 
     /** Live preview of the currently streaming AI generation, if any. */
@@ -86,6 +321,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     val isGenerating: StateFlow<Boolean> = _isGenerating.asStateFlow()
 
     private var streamingJob: Job? = null
+    private val streamingGenerationLock = Any()
+    private var streamingGenerationRevision = 0L
+    /** Revisions that already crossed the point where Stop can safely prevent persistence. */
+    private val streamingCommittingRevisions = mutableSetOf<Long>()
 
     /** True only while a chapter body is streaming — guards EditorScreen from mini-outline bleed. */
     private val _isChapterGenerating = MutableStateFlow(false)
@@ -97,6 +336,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private val _isAiFilling = MutableStateFlow(false)
     val isAiFilling: StateFlow<Boolean> = _isAiFilling.asStateFlow()
     private var aiFillJob: Job? = null
+    @Volatile
+    private var aiFillRevision = 0L
 
     /** Live streaming answer for the "ask the novel" Q&A agent (per-project chat). */
     private val _qaStreamingText = MutableStateFlow("")
@@ -104,19 +345,22 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private val _qaGenerating = MutableStateFlow(false)
     val qaGenerating: StateFlow<Boolean> = _qaGenerating.asStateFlow()
     private var qaJob: Job? = null
+    private val qaGenerationLock = Any()
+    private var qaGenerationRevision = 0L
 
     init {
         viewModelScope.launch {
             repo.state.collectLatest {
                 _uiLanguage.value = repo.uiLanguage()
                 _theme.value = repo.themePref()
+                agent.refreshContextUsage()
             }
         }
     }
 
     override fun onCleared() {
         audiobook.release()
-        agent.stop()
+        agent.close()
         super.onCleared()
     }
 
@@ -125,6 +369,16 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun setUiLanguage(lang: String) = repo.setUiLanguage(lang)
     fun setTheme(theme: String) = repo.setTheme(theme)
     fun currentTheme(): String = repo.themePref()
+    fun agentEngine(): String = repo.agentEngine()
+    fun setAgentEngine(engine: String) {
+        repo.setAgentEngine(engine)
+        agent.refreshDefaultsForBlankSession()
+    }
+    fun dualAgentReasoningLevel(): String = repo.dualAgentReasoningLevel()
+    fun setDualAgentReasoningLevel(level: String) {
+        repo.setDualAgentReasoningLevel(level)
+        agent.refreshDefaultsForBlankSession()
+    }
 
     fun textModelProfiles(): List<TextModelProfile> = repo.textModelProfiles()
     fun saveTextModelProfile(profile: TextModelProfile) = repo.saveTextModelProfile(profile)
@@ -211,10 +465,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun chapters(projectId: String): List<Chapter> = repo.chapters(projectId)
     fun setChapters(projectId: String, chapters: List<Chapter>) = repo.setChapters(projectId, chapters)
     fun upsertChapter(projectId: String, ch: Chapter) = repo.upsertChapter(projectId, ch)
-    fun deleteChapter(projectId: String, chapterId: String) {
-        repo.deleteChapter(projectId, chapterId)
-        renumberChapters(projectId)   // close the序号 gap left by deletion
-    }
+    fun deleteChapter(projectId: String, chapterId: String): Boolean =
+        deleteChapterFully(projectId, chapterId)
 
     /** Renumber chapters to a contiguous 1..n by current order (only display order_index changes;
      *  the agent's chapter index is by id/arcId so it is NOT affected). */
@@ -226,31 +478,196 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         return needs
     }
 
-    /** Delete a chapter and clean up its references (arc.builtChapterIds + KB/summary/entities),
-     *  then renumber so chapter numbers stay contiguous. */
-    fun deleteChapterFully(projectId: String, chapterId: String) {
-        repo.setPlotArcs(projectId, repo.plotArcs(projectId).map { a ->
-            if (a.builtChapterIds?.contains(chapterId) == true)
-                a.copy(builtChapterIds = a.builtChapterIds.filterNot { it == chapterId }) else a
-        })
-        forgetKbForChapter(projectId, chapterId)
-        repo.deleteChapter(projectId, chapterId)
-        renumberChapters(projectId)
+    /** Delete one exact chapter version together with all of its derived references and files. */
+    fun deleteChapterFully(projectId: String, chapterId: String): Boolean {
+        val expected = repo.chapters(projectId).firstOrNull { it.id == chapterId }
+        if (expected == null) {
+            _statusMessage.value = "章节已不存在，未执行删除"
+            return false
+        }
+        val deleted = repo.deleteChapterFullyIfUnchanged(projectId, expected)
+        if (!deleted) {
+            _statusMessage.value = "内容冲突：章节在确认删除后已被修改，未执行删除"
+        }
+        return deleted
     }
 
     /** Resolve a chapter's arc id (explicit, else inferred from any arc's builtChapterIds). */
     fun chapterArcId(projectId: String, chapter: Chapter): String? =
         chapter.arcId ?: repo.plotArcs(projectId).firstOrNull { it.builtChapterIds?.contains(chapter.id) == true }?.id
 
-    /** Apply edited final text to a chapter (save + refresh word count + KB reindex). For the
-     *  agent's local edits. Returns false if the chapter doesn't exist. */
-    fun agentApplyChapterText(projectId: String, chapterId: String, text: String): Boolean {
-        val ch = repo.chapters(projectId).firstOrNull { it.id == chapterId } ?: return false
-        repo.saveChapterBody(chapterId, repo.chapterBody(chapterId).copy(final = text))
-        repo.upsertChapter(projectId, ch.copy(word_count = countWords(text), updated_at = nowIso()))
-        onChapterSaved(projectId, chapterId, ch.title, text)
-        return true
+    /** Compute one deterministic agent edit, but publish it only as a review candidate. */
+    private fun stageAgentChapterText(
+        projectId: String,
+        chapterId: String,
+        operation: String,
+        agentEngineMode: String,
+        agentSessionId: String,
+        agentActionId: String,
+        transform: (String) -> ChapterTextMutation,
+    ): String {
+        if (repo.project(projectId) == null) return "项目已不存在，未修改正文"
+        val chapter = repo.chapters(projectId).firstOrNull { it.id == chapterId }
+            ?: return "未找到章节"
+        val body = repo.chapterBody(chapterId)
+        val current = body.final.ifBlank { body.draft }
+        val mutation = transform(current)
+        val replacement = mutation.replacement ?: return mutation.observation
+        if (replacement == current) return "未产生任何变化：正文与目标文本相同"
+
+        val expectedSource = GenerationSourceFingerprint.capture(
+            chapter,
+            body.draft,
+            body.final,
+        )
+        val staticManifest = GenerationContextFingerprint.capture(
+            scope = "agent:$operation",
+            materials = listOf(
+                GenerationContextMaterial("operation", listOf(operation)),
+            ),
+        )
+        val telemetry = GenerationTelemetryCollector.local("chapter.agent_local.v1")
+        val active = novelGenerationEngine.start(
+            NovelGenerationEngine.Request(
+                projectId = projectId,
+                chapter = chapter,
+                targetWords = 0,
+                language = _uiLanguage.value,
+                baselineText = current,
+                requireNetNewBody = false,
+                contextManifest = staticManifest,
+                expectedSourceHash = expectedSource.sourceHash,
+                initiator = GenerationRun.INITIATOR_AGENT,
+                agentEngine = agentEngineMode,
+                agentSessionId = agentSessionId.takeIf { it.isNotBlank() },
+                agentActionId = agentActionId.takeIf { it.isNotBlank() },
+                operation = operation,
+            ),
+        ) ?: return "候选稿创建失败：章节正文或规划已变化，请重新读取后再修改"
+        ChapterGenerationExecutions.cancelExisting(projectId, chapterId)
+
+        val stillCurrent = repo.project(projectId) != null &&
+            repo.chapters(projectId).firstOrNull { it.id == chapterId } == chapter &&
+            repo.chapterBody(chapterId) == body
+        if (!stillCurrent) {
+            val category = GenerationTelemetry.FAILURE_SOURCE_CONFLICT
+            novelGenerationEngine.fail(
+                active,
+                GenerationTelemetryCollector.persistedFailureMessage(category),
+                telemetry.finishFailed(category),
+            )
+            return "内容冲突：章节正文或规划已变化，未创建可采用的候选稿"
+        }
+        val completion = completeGenerationCandidate(active, replacement, telemetry)
+        if (completion == null) {
+            if (generationRunWasSuperseded(projectId, active.run.id)) {
+                val category = GenerationTelemetry.FAILURE_SUPERSEDED
+                novelGenerationEngine.cancel(
+                    active,
+                    GenerationTelemetryCollector.persistedFailureMessage(category),
+                    telemetry.finishCancelled(category),
+                )
+                return "候选稿生成任务已被新的任务替代，正式正文未改变"
+            }
+            val category = GenerationTelemetry.FAILURE_PERSISTENCE
+            novelGenerationEngine.fail(
+                active,
+                GenerationTelemetryCollector.persistedFailureMessage(category),
+                telemetry.finishFailed(category),
+            )
+            return "候选稿保存失败，正式正文未改变"
+        }
+        return if (completion.report.blocking) {
+            "${mutation.observation}；候选稿已保存但未通过硬性质量检查，正式正文未改变"
+        } else {
+            "${mutation.observation}；已生成候选稿，等待用户审核，正式正文未改变"
+        }
     }
+
+    fun agentReplaceInChapter(
+        projectId: String,
+        chapterId: String,
+        find: String,
+        replacement: String,
+        agentEngineMode: String = repo.agentEngine(),
+        agentSessionId: String = "",
+        agentActionId: String = "",
+    ): String = stageAgentChapterText(
+        projectId,
+        chapterId,
+        GenerationRun.OPERATION_REPLACE,
+        agentEngineMode,
+        agentSessionId,
+        agentActionId,
+    ) { current ->
+        if (find.isBlank()) {
+            ChapterTextMutation(null, "find 不能为空")
+        } else if (!current.contains(find)) {
+            ChapterTextMutation(null, "未在正文中找到该片段，请先用 read_chapter 复制逐字一致的原文")
+        } else {
+            val count = current.split(find).size - 1
+            ChapterTextMutation(current.replace(find, replacement), "已替换 $count 处")
+        }
+    }
+
+    fun agentEditChapterParagraph(
+        projectId: String,
+        chapterId: String,
+        paragraphIndex: Int,
+        newText: String,
+        agentEngineMode: String = repo.agentEngine(),
+        agentSessionId: String = "",
+        agentActionId: String = "",
+    ): String = stageAgentChapterText(
+        projectId,
+        chapterId,
+        GenerationRun.OPERATION_EDIT_PARAGRAPH,
+        agentEngineMode,
+        agentSessionId,
+        agentActionId,
+    ) { current ->
+        if (current.isBlank()) {
+            ChapterTextMutation(null, "该章暂无正文")
+        } else {
+            val lines = current.split("\n").toMutableList()
+            var paragraphCount = 0
+            var target = -1
+            for (index in lines.indices) {
+                if (lines[index].isNotBlank()) {
+                    paragraphCount++
+                    if (paragraphCount == paragraphIndex) {
+                        target = index
+                        break
+                    }
+                }
+            }
+            if (target < 0) {
+                ChapterTextMutation(null, "未找到第 $paragraphIndex 段（共 $paragraphCount 段）")
+            } else {
+                lines[target] = newText
+                ChapterTextMutation(lines.joinToString("\n"), "已替换第 $paragraphIndex 段")
+            }
+        }
+    }
+
+    fun agentSetChapterText(
+        projectId: String,
+        chapterId: String,
+        text: String,
+        agentEngineMode: String = repo.agentEngine(),
+        agentSessionId: String = "",
+        agentActionId: String = "",
+    ): String =
+        stageAgentChapterText(
+            projectId,
+            chapterId,
+            GenerationRun.OPERATION_SET_BODY,
+            agentEngineMode,
+            agentSessionId,
+            agentActionId,
+        ) {
+            ChapterTextMutation(text, "已写入正文（${text.length} 字符）")
+        }
 
     /** Move a chapter to [newPos1Based] (1-based) in the chapter list, renumbering order_index 1..n. */
     fun moveChapterToPosition(projectId: String, chapterId: String, newPos1Based: Int) {
@@ -289,6 +706,98 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
     fun chapterBody(chapterId: String): AppRepository.ChapterBody = repo.chapterBody(chapterId)
     fun saveChapterBody(chapterId: String, body: AppRepository.ChapterBody) = repo.saveChapterBody(chapterId, body)
+
+    /** Newest completed run that still awaits an explicit accept/reject decision. */
+    fun latestReviewableGenerationRun(projectId: String, chapterId: String): GenerationRun? =
+        repo.listGenerationRuns(projectId, chapterId)
+            .firstOrNull { it.status == GenerationRun.STATUS_COMPLETED }
+
+    fun adoptChapterCandidate(
+        projectId: String,
+        runId: String,
+        candidateId: String,
+    ): CandidateAdoptionResult {
+        val run = repo.getGenerationRun(projectId, runId)
+        val currentContextManifest = {
+            run?.contextManifest?.let { expected ->
+            when {
+                expected.scope == "prompt:${PromptSourceScope.CHAPTER.name}" -> {
+                    val liveChapter = repo.chapters(projectId).firstOrNull { chapter ->
+                        chapter.id == run.chapterId
+                    }
+                    liveChapter?.let { chapter ->
+                        captureStablePromptSources(
+                            projectId,
+                            PromptSourceScope.CHAPTER,
+                            chapter.order_index,
+                        )?.let { snapshot ->
+                            promptContextManifest(PromptSourceScope.CHAPTER, snapshot)
+                        }
+                    }
+                }
+                // Deterministic agent edits use only the exact chapter body/plan guarded by the
+                // repository source hash; their static request manifest has no mutable live source.
+                expected.scope.startsWith("agent:") -> expected
+                else -> null
+            }
+            }
+        }
+        val result = novelGenerationEngine.adoptWithContextRecheck(
+            projectId,
+            runId,
+            candidateId,
+            currentContextManifest,
+        )
+        when (result) {
+            is CandidateAdoptionResult.Adopted -> {
+                _statusMessage.value = if (_uiLanguage.value == "en") {
+                    "Candidate accepted; official chapter updated."
+                } else {
+                    "已采用候选稿并更新正式正文"
+                }
+                result.run.candidates.firstOrNull { it.id == candidateId }?.let { candidate ->
+                    onChapterSaved(
+                        projectId,
+                        result.chapter.id,
+                        result.chapter.title,
+                        candidate.body,
+                    )
+                }
+            }
+            is CandidateAdoptionResult.SourceChanged -> {
+                val changed = buildList {
+                    if (result.planChanged) add(if (_uiLanguage.value == "en") "plan" else "章节规划")
+                    if (result.bodyChanged) add(if (_uiLanguage.value == "en") "body" else "正文/草稿")
+                    if (result.contextChanged) {
+                        add(if (_uiLanguage.value == "en") "generation context" else "世界观/角色/前文等生成上下文")
+                    }
+                }.joinToString(if (_uiLanguage.value == "en") " and " else "和")
+                _statusMessage.value = if (_uiLanguage.value == "en") {
+                    "Candidate kept, but cannot be accepted because the $changed changed after generation."
+                } else {
+                    "候选稿已保留，但生成后的${changed}发生了变化，不能覆盖新内容"
+                }
+            }
+            is CandidateAdoptionResult.Unavailable -> {
+                _statusMessage.value = if (_uiLanguage.value == "en") {
+                    "Candidate is not available for acceptance (${result.reason})."
+                } else {
+                    "该候选稿当前不能采用（${result.reason}）"
+                }
+            }
+        }
+        return result
+    }
+
+    fun rejectChapterGeneration(projectId: String, runId: String): Boolean {
+        val rejected = novelGenerationEngine.reject(projectId, runId) ?: return false
+        _statusMessage.value = if (_uiLanguage.value == "en") {
+            "Candidate rejected; official chapter was not changed."
+        } else {
+            "已拒绝候选稿，正式正文未改变"
+        }
+        return rejected.status == GenerationRun.STATUS_REJECTED
+    }
 
     fun addChapter(projectId: String, title: String, goal: String?): Chapter {
         val list = repo.chapters(projectId)
@@ -342,6 +851,15 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     fun characters(projectId: String): List<Character> = repo.characters(projectId)
     fun setCharacters(projectId: String, list: List<Character>) = repo.setCharacters(projectId, list)
+    fun mergeGeneratedCharacters(
+        projectId: String,
+        candidates: List<Character>,
+        expectedOutline: String? = null,
+    ): List<Character> = if (expectedOutline == null) {
+        repo.mergeCharactersIfProjectExists(projectId, candidates)
+    } else {
+        repo.mergeCharactersIfOutlineUnchanged(projectId, expectedOutline, candidates)
+    }
 
     // ── Character growth route (角色成长) ──
     fun characterGrowth(projectId: String, characterId: String): List<CharacterGrowthEntry> =
@@ -356,14 +874,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun updateCharacterGrowthLatest(projectId: String, characterId: String, value: String) {
-        val chain = repo.characterGrowth(projectId, characterId).toMutableList()
-        if (chain.isEmpty()) return
-        chain[chain.lastIndex] = chain.last().copy(value = value, manual = true)
-        repo.setCharacterGrowth(projectId, characterId, chain)
+        repo.updateLatestCharacterGrowth(projectId, characterId, value)
     }
 
     fun deleteCharacterGrowth(projectId: String, characterId: String, entryId: String) =
-        repo.setCharacterGrowth(projectId, characterId, repo.characterGrowth(projectId, characterId).filterNot { it.id == entryId })
+        repo.deleteCharacterGrowthEntry(projectId, characterId, entryId)
 
     fun plotArcs(projectId: String): List<PlotArc> = repo.plotArcs(projectId)
     fun setPlotArcs(projectId: String, arcs: List<PlotArc>) = repo.setPlotArcs(projectId, arcs)
@@ -444,10 +959,155 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     // ── AI orchestration ──────────────────────────────────────────────────
 
     fun stopGenerating() {
-        streamingJob?.cancel()
-        streamingJob = null
-        _isGenerating.value = false
-        _isChapterGenerating.value = false
+        synchronized(streamingGenerationLock) {
+            streamingGenerationRevision++
+            ChapterGenerationExecutions.cancel(
+                streamingJob,
+                GenerationTelemetry.FAILURE_USER_CANCELLED,
+            )
+            streamingJob = null
+            _isGenerating.value = false
+            _isChapterGenerating.value = false
+        }
+    }
+
+    /**
+     * Starts one UI streaming generation with an isolated buffer. A monotonically increasing
+     * revision prevents a cancelled predecessor from appending to, committing, or clearing the
+     * flags of its successor even if the provider delivers one last callback after cancellation.
+     */
+    private fun claimStreamingGeneration(
+        initialText: String,
+        chapterGeneration: Boolean = false,
+    ): StreamingGenerationTicket = synchronized(streamingGenerationLock) {
+            val revision = ++streamingGenerationRevision
+            ChapterGenerationExecutions.cancel(
+                streamingJob,
+                GenerationTelemetry.FAILURE_SUPERSEDED,
+            )
+            streamingJob = null
+            _streamingText.value = initialText
+            _isGenerating.value = true
+            _isChapterGenerating.value = chapterGeneration
+            StreamingGenerationTicket(revision, StringBuilder(initialText))
+        }
+
+    private fun launchStreamingGeneration(
+        initialText: String,
+        chapterGeneration: Boolean = false,
+        block: suspend (revision: Long, buffer: StringBuilder) -> Unit,
+    ): Job = launchStreamingGeneration(
+        ticket = claimStreamingGeneration(initialText, chapterGeneration),
+        block = block,
+    )
+
+    private fun launchStreamingGeneration(
+        ticket: StreamingGenerationTicket,
+        block: suspend (revision: Long, buffer: StringBuilder) -> Unit,
+    ): Job {
+        val job = synchronized(streamingGenerationLock) {
+            if (streamingGenerationRevision != ticket.revision) return@synchronized null
+            viewModelScope.launchWithFailureBoundary(
+                context = Dispatchers.IO,
+                start = CoroutineStart.LAZY,
+                onFailure = { error ->
+                    streamingError(
+                        ticket.revision,
+                        "生成失败：${error.message ?: error::class.simpleName ?: "未知错误"}",
+                    )
+                },
+            ) {
+                try {
+                    block(ticket.revision, ticket.buffer)
+                } finally {
+                    synchronized(streamingGenerationLock) {
+                        if (streamingGenerationRevision == ticket.revision) {
+                            _isGenerating.value = false
+                            _isChapterGenerating.value = false
+                            streamingJob = null
+                        }
+                    }
+                }
+            }.also { streamingJob = it }
+        }
+        if (job == null) return Job().also { it.cancel() }
+        job.start()
+        return job
+    }
+
+    private fun setStreamingInitialText(ticket: StreamingGenerationTicket, text: String): Boolean =
+        synchronized(streamingGenerationLock) {
+            if (streamingGenerationRevision != ticket.revision) {
+                false
+            } else {
+                ticket.buffer.clear()
+                ticket.buffer.append(text)
+                _streamingText.value = text
+                true
+            }
+        }
+
+    private fun abandonStreamingGeneration(ticket: StreamingGenerationTicket, message: String) {
+        synchronized(streamingGenerationLock) {
+            if (streamingGenerationRevision == ticket.revision) {
+                streamingGenerationRevision++
+                streamingJob = null
+                _isGenerating.value = false
+                _isChapterGenerating.value = false
+                _statusMessage.value = message
+            }
+        }
+    }
+
+    private suspend fun ensureStreamingOwner(revision: Long) {
+        currentCoroutineContext().ensureActive()
+        val current = synchronized(streamingGenerationLock) { streamingGenerationRevision }
+        if (current != revision) throw CancellationException("Streaming generation was superseded")
+    }
+
+    private suspend fun appendStreamingText(
+        revision: Long,
+        buffer: StringBuilder,
+        text: String,
+    ) {
+        ensureStreamingOwner(revision)
+        synchronized(streamingGenerationLock) {
+            if (streamingGenerationRevision != revision) {
+                throw CancellationException("Streaming generation was superseded")
+            }
+            buffer.append(text)
+            _streamingText.value = buffer.toString()
+        }
+    }
+
+    private fun streamingError(revision: Long, message: String) {
+        synchronized(streamingGenerationLock) {
+            if (streamingGenerationRevision == revision) _statusMessage.value = message
+        }
+    }
+
+    /**
+     * Linearizes the decision to commit against stop/new-generation token claims, then performs
+     * the potentially heavy repository/snapshot write without holding the UI-facing monitor.
+     * Once a revision enters COMMITTING, Stop may hide/cancel the job but does not roll back the
+     * already-authorized atomic write.
+     */
+    private fun commitIfStreamingOwner(revision: Long, commit: () -> Boolean): Boolean {
+        val authorized = synchronized(streamingGenerationLock) {
+            if (streamingGenerationRevision != revision) {
+                false
+            } else {
+                streamingCommittingRevisions.add(revision)
+            }
+        }
+        if (!authorized) return false
+        return try {
+            commit()
+        } finally {
+            synchronized(streamingGenerationLock) {
+                streamingCommittingRevisions.remove(revision)
+            }
+        }
     }
 
     fun generateOutline(
@@ -470,6 +1130,16 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             _statusMessage.value = "请先在「设置」中配置可用的文本模型 / Configure a text model first."
             return
         }
+        val ticket = claimStreamingGeneration("")
+        val currentOutline = repo.outline(projectId)
+        // Continuations keep the original text in the isolated buffer, never in a shared mutable
+        // buffer that a cancelled predecessor could still append to.
+        val prefix = when {
+            continueFromExisting && currentOutline.isNotBlank() -> "$currentOutline\n\n"
+            appendToExisting -> currentOutline.let { if (it.isEmpty()) "" else "$it\n\n" }
+            else -> ""
+        }
+        if (!setStreamingInitialText(ticket, prefix)) return
         val lang = _uiLanguage.value
         val realmCtx = buildRealmSystemContext(repo.cultivationRealms(projectId), lang).ifBlank { null }
         val existingWorld = repo.worldSetting(projectId).ifBlank { null }
@@ -482,7 +1152,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 }?.joinToString("\n")
         } else null
         val existingCharsInfo = buildCharactersInfo(projectId)
-        val currentOutline = repo.outline(projectId)
         val messages = listOf(
             ChatMessage("system", Prompts.outlineSystem(lang, isLong)),
             ChatMessage(
@@ -500,35 +1169,25 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 ),
             ),
         )
-        streamingJob?.cancel()
-        // In continuation mode the model is told to emit ONLY the next chunk, so we prefix the
-        // streaming buffer with everything already written. `appendToExisting` keeps the same
-        // behaviour for legacy callers that just want a prefix without changing the prompt.
-        val prefix = when {
-            continueFromExisting && currentOutline.isNotBlank() -> "$currentOutline\n\n"
-            appendToExisting -> currentOutline.let { if (it.isEmpty()) "" else "$it\n\n" }
-            else -> ""
-        }
-        _streamingText.value = prefix
-        _isGenerating.value = true
-        streamingJob = viewModelScope.launch(Dispatchers.IO) {
-            try {
-                ai.streamChat(cfg, messages).collect { ev ->
-                    when (ev) {
-                        is AiService.StreamEvent.Delta -> {
-                            _streamingText.value = _streamingText.value + ev.text
-                        }
-                        AiService.StreamEvent.Done -> { /* handled below */ }
-                        is AiService.StreamEvent.Error -> _statusMessage.value = "生成失败：${ev.message}"
-                    }
+        launchStreamingGeneration(ticket) { revision, buffer ->
+            ai.streamChat(cfg, messages).collectCompleted(
+                onDelta = { text -> appendStreamingText(revision, buffer, text) },
+                onFailure = { message -> streamingError(revision, "生成失败：$message") },
+            )
+            ensureStreamingOwner(revision)
+            val final = buffer.toString().trim()
+            if (final.isNotEmpty()) {
+                val committed = commitIfStreamingOwner(revision) {
+                    repo.setOutlineIfUnchanged(projectId, currentOutline, final)
                 }
-                val final = _streamingText.value.trim()
-                if (final.isNotEmpty()) {
-                    repo.setOutline(projectId, final)
+                if (committed) {
                     onComplete(final)
+                } else {
+                    streamingError(
+                        revision,
+                        "内容冲突：大纲在 AI 生成期间已被修改或项目已删除，已保留新内容",
+                    )
                 }
-            } finally {
-                _isGenerating.value = false
             }
         }
     }
@@ -540,119 +1199,385 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         stepwise: Boolean = false,       // logic-chain path: blueprint → per-beat prose (off = legacy one-shot)
         draftReference: String? = null,  // user's chapter draft (from the Draft tab), injected as a strong reference
     ) {
-        val cfg = repo.activeTextModelConfig()
+        val cfg = try {
+            TextModelRequestPolicy.normalizeForRequest(repo.activeTextModelConfig())
+        } catch (error: IllegalArgumentException) {
+            _statusMessage.value = error.message.orEmpty()
+            return
+        }
         if (!cfg.isValid()) {
             _statusMessage.value = "请先在「设置」中配置可用的文本模型 / Configure a text model first."
             return
         }
+        val ticket = claimStreamingGeneration(currentContent ?: "", chapterGeneration = true)
         val lang = _uiLanguage.value
         val isContinuation = !currentContent.isNullOrBlank()
+        val baselineChapter = repo.chapters(projectId).firstOrNull { it.id == chapter.id }
+        if (baselineChapter == null) {
+            abandonStreamingGeneration(ticket, "章节不存在，无法生成正文")
+            return
+        }
+        val baselineBody = repo.chapterBody(chapter.id)
+        val promptSources = captureStablePromptSources(
+            projectId,
+            PromptSourceScope.CHAPTER,
+            baselineChapter.order_index,
+        )
+        if (promptSources == null) {
+            abandonStreamingGeneration(ticket, "章节规划上下文正在变化或项目已删除，请稍后重试")
+            return
+        }
 
+        val expectedSource = GenerationSourceFingerprint.capture(
+            baselineChapter,
+            baselineBody.draft,
+            baselineBody.final,
+        )
+        if (GenerationSourceFingerprint.plan(chapter) != expectedSource.planHash) {
+            abandonStreamingGeneration(ticket, "章节规划与刚保存的基线不一致，请重新生成")
+            return
+        }
         // Build all context
-        val arcs = repo.plotArcs(projectId)
-        val arcContext = buildArcContext(arcs, lang)
-        val realmCtx = buildRealmSystemContext(repo.cultivationRealms(projectId), lang)
+        val arcs = promptSources.arcs.map { it.toPlotArc() }
+        val realmCtx = buildRealmSystemContext(promptSources.realms, lang)
         // Per-volume realm ceiling (hard limit) for THIS chapter's owning volume — prevents over-leveling /
         // skips / drops across the volume. Goes right after the realm ladder so it reads as the binding rule.
         val ownerArc = chapter.arcId?.let { aid -> arcs.firstOrNull { it.id == aid } }
             ?: arcs.firstOrNull { (it.builtChapterIds ?: emptyList()).contains(chapter.id) }
         val volRealmConstraint = ownerArc?.volumeId
-            ?.let { vid -> repo.volumes(projectId).firstOrNull { it.id == vid } }
+            ?.let { vid -> promptSources.volumes.firstOrNull { it.id == vid } }
             ?.let { vol -> buildVolumeRealmConstraint(vol.realmPlan, vol.name, lang, phase = "generate") }
             ?.takeIf { it.isNotBlank() }
-        val worldSettingRaw = repo.worldSetting(projectId).ifBlank { repo.outline(projectId) }
+        val worldSettingRaw = promptSources.worldSetting.orEmpty()
+            .ifBlank { promptSources.outline.orEmpty() }
         val worldParts = listOfNotNull(
-            arcContext.takeIf { it.isNotBlank() },
-            realmCtx.takeIf { it.isNotBlank() },
-            volRealmConstraint,
             worldSettingRaw.takeIf { it.isNotBlank() },
+            realmCtx.takeIf { it.isNotBlank() },
         )
         val worldSetting = worldParts.joinToString("\n\n").takeIf { it.isNotBlank() }
-        val timeline = repo.timeline(projectId).takeIf { it.isNotBlank() }
+        val targetConstraints = volRealmConstraint
+        val timeline = promptSources.timeline?.takeIf { it.isNotBlank() }
         val charactersInfo = buildCharactersInfo(projectId)
-        val prevSummary = buildPreviousChapterSummary(projectId, chapter.order_index)
+        // Recent history is already compiled once inside Story State v2; do not duplicate it here.
+        val prevSummary = ""
         val chapterList = buildChapterList(projectId, chapter.id)
 
-        streamingJob?.cancel()
-        _streamingText.value = currentContent ?: ""
-        _isGenerating.value = true
-        _isChapterGenerating.value = true
-        streamingJob = viewModelScope.launch(Dispatchers.IO) {
-            // KB augmentation: book summary + arc summary + open foreshadowing + RAG chunks.
-            // Each layer respects its own enable flag and silently no-ops if config is missing.
-            val kbAugmentation = buildKbAugmentation(projectId, chapter, lang)
-
-            try {
-                if (stepwise) {
-                    // Logic-chain path: first draft a beat-by-beat blueprint bound to this chapter's
-                    // plan/realm/containers/prior context, then write each beat in sequence. Each beat
-                    // streams into _streamingText, so the UI updates live just like the one-shot path.
-                    generateChapterStepwise(
-                        cfg = cfg,
-                        chapter = chapter,
-                        currentContent = currentContent,
-                        isContinuation = isContinuation,
-                        lang = lang,
-                        chapterList = chapterList.takeIf { it.isNotBlank() },
-                        charactersInfo = charactersInfo,
-                        worldSetting = worldSetting,
-                        timeline = timeline,
-                        prevSummary = prevSummary.takeIf { it.isNotBlank() },
-                        kbAugmentation = kbAugmentation,
-                        draftReference = draftReference,
-                    )
+        launchStreamingGeneration(ticket) { revision, buffer ->
+            // Finish potentially expensive local/RAG preparation before reserving a durable run.
+            // This removes the crash window where context preparation could strand RUNNING state.
+            val kbAugmentation = try {
+                buildStoryStateContext(promptSources, chapter, lang)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                streamingError(
+                    revision,
+                    "生成准备失败，请检查知识库配置与网络后重试",
+                )
+                return@launchStreamingGeneration
+            }
+            val budgetedContext = try {
+                val preparationConfig = if (stepwise) {
+                    cfg.withStageOutputLimit(BLUEPRINT_MAX_OUTPUT_TOKENS)
                 } else {
-                    val messages = listOf(
-                        ChatMessage("system", Prompts.chapterSystem(lang)),
-                        ChatMessage("user", Prompts.chapterUser(
-                            chapterTitle = chapter.title,
-                            outlineGoal = chapter.outline_goal.orEmpty(),
-                            conflict = chapter.conflict,
-                            prevSummary = prevSummary.takeIf { it.isNotBlank() },
-                            currentContent = if (isContinuation) currentContent!!.takeLast(2000) else null,
-                            chapterList = chapterList.takeIf { it.isNotBlank() },
-                            charactersInfo = charactersInfo,
+                    cfg
+                }
+                if (stepwise) {
+                    val segmentPreflightConfig =
+                        cfg.withStageOutputLimit(STEPWISE_PREFLIGHT_OUTPUT_TOKENS)
+                    val blueprintTextReserve = stepwiseGeneratedTextReserve(
+                        preparationConfig,
+                        "蓝",
+                    )
+                    try {
+                        fun segmentRequiredText(writtenTail: String?): String = listOfNotNull(
+                                chapter.title,
+                                blueprintTextReserve,
+                                blueprintTextReserve,
+                                writtenTail,
+                                "beat=$MAX_CHAPTER_BEATS/$MAX_CHAPTER_BEATS",
+                                "targetWords=$TARGET_WORDS",
+                            ).joinToString("\n")
+                        fun segmentContext(writtenTail: String?) = budgetChapterContext(
+                                cfg = segmentPreflightConfig,
+                                systemPrompt = Prompts.chapterSegmentSystem(lang),
+                                requiredTaskText = segmentRequiredText(writtenTail),
+                                worldSetting = worldSetting,
+                                timeline = timeline,
+                                charactersInfo = charactersInfo,
+                                storyState = kbAugmentation,
+                                targetConstraints = targetConstraints,
+                                chapterList = null,
+                                draftReference = draftReference,
+                            )
+                        segmentContext(STEPWISE_WRITTEN_TAIL_RESERVE)
+                        // A syntactically valid but unusable blueprint falls back to the legacy
+                        // one-shot request. Validate that branch before paying for the blueprint.
+                        budgetChapterContext(
+                            cfg = cfg,
+                            systemPrompt = Prompts.chapterSystem(lang),
+                            requiredTaskText = listOfNotNull(
+                                chapter.title,
+                                chapter.outline_goal,
+                                chapter.conflict,
+                                currentContent?.takeLast(2_000),
+                                "targetWords=$TARGET_WORDS",
+                            ).joinToString("\n"),
                             worldSetting = worldSetting,
                             timeline = timeline,
-                            targetWords = TARGET_WORDS,
-                            isContinuation = isContinuation,
-                            language = lang,
-                            kbAugmentation = kbAugmentation,
+                            charactersInfo = charactersInfo,
+                            storyState = kbAugmentation,
+                            targetConstraints = targetConstraints,
+                            chapterList = chapterList.takeIf { it.isNotBlank() },
                             draftReference = draftReference,
-                        )),
-                    )
-                    ai.streamChat(cfg, messages).collect { ev ->
-                        when (ev) {
-                            is AiService.StreamEvent.Delta -> _streamingText.value = _streamingText.value + ev.text
-                            AiService.StreamEvent.Done -> {}
-                            is AiService.StreamEvent.Error -> _statusMessage.value = "生成失败：${ev.message}"
-                        }
+                        )
+                    } catch (error: PromptRequestBudgeter.BudgetExceededException) {
+                        throw PromptRequestBudgeter.BudgetExceededException(
+                            "分步生成的分段必需输入无法装入当前上下文；" + error.message.orEmpty(),
+                        )
                     }
                 }
-                val final = _streamingText.value
-                if (final.isNotEmpty()) {
-                    val prior = repo.chapterBody(chapter.id)
-                    // Safety snapshot before AI overwrites real existing work (skip empty chapters).
-                    if (prior.final.isNotBlank() || prior.draft.isNotBlank()) {
-                        runCatching {
-                            repo.createSnapshot(projectId, "AI写作前：${chapter.title}", SnapshotMeta.TRIGGER_PRE_AI)
-                        }
-                    }
-                    val body = prior.copy(final = final)
-                    repo.saveChapterBody(chapter.id, body)
-                    repo.upsertChapter(
+                budgetChapterContext(
+                    cfg = preparationConfig,
+                    systemPrompt = if (stepwise) {
+                        Prompts.chapterBlueprintSystem(lang)
+                    } else {
+                        Prompts.chapterSystem(lang)
+                    },
+                    requiredTaskText = listOfNotNull(
+                        chapter.title,
+                        chapter.outline_goal,
+                        chapter.conflict,
+                        currentContent?.takeLast(2_000),
+                        "targetWords=$TARGET_WORDS",
+                    ).joinToString("\n"),
+                    worldSetting = worldSetting,
+                    timeline = timeline,
+                    charactersInfo = charactersInfo,
+                    storyState = kbAugmentation,
+                    targetConstraints = targetConstraints,
+                    chapterList = chapterList.takeIf { it.isNotBlank() },
+                    draftReference = draftReference,
+                )
+            } catch (error: PromptRequestBudgeter.BudgetExceededException) {
+                streamingError(revision, error.message.orEmpty())
+                return@launchStreamingGeneration
+            }
+            if (!promptSourcesStillCurrent(
+                    projectId,
+                    PromptSourceScope.CHAPTER,
+                    promptSources,
+                    baselineChapter.order_index,
+                ) || repo.chapters(projectId).firstOrNull { it.id == chapter.id } != baselineChapter ||
+                repo.chapterBody(chapter.id) != baselineBody
+            ) {
+                streamingError(revision, "内容冲突：章节规划上下文在 AI 生成前已被修改，请重新生成")
+                return@launchStreamingGeneration
+            }
+            val activeGeneration = novelGenerationEngine.startWithContextRecheck(
+                NovelGenerationEngine.Request(
+                    projectId = projectId,
+                    chapter = chapter,
+                    targetWords = TARGET_WORDS,
+                    language = lang,
+                    mode = if (stepwise) ChapterSpec.MODE_STEPWISE else ChapterSpec.MODE_ONE_SHOT,
+                    baselineText = currentContent.orEmpty(),
+                    requireNetNewBody = isContinuation,
+                    contextManifest = promptContextManifest(
+                        PromptSourceScope.CHAPTER,
+                        promptSources,
+                    ),
+                    expectedSourceHash = expectedSource.sourceHash,
+                    initiator = GenerationRun.INITIATOR_EDITOR,
+                    operation = if (isContinuation) {
+                        GenerationRun.OPERATION_CONTINUE
+                    } else {
+                        GenerationRun.OPERATION_GENERATE
+                    },
+                ),
+                currentContextManifest = {
+                    capturePromptSources(
                         projectId,
-                        chapter.copy(word_count = countWords(final), updated_at = nowIso(), status = "review"),
-                    )
-                    // KB fan-out: index this freshly-generated chapter + regenerate its summary +
-                    // extract entities (each respects its own enable flag). Previously only the
-                    // manual save button did this, so AI-generated / continued chapters were never
-                    // auto-indexed or summarized.
-                    onChapterSaved(projectId, chapter.id, chapter.title, final)
+                        PromptSourceScope.CHAPTER,
+                        baselineChapter.order_index,
+                    )?.let { live ->
+                        promptContextManifest(PromptSourceScope.CHAPTER, live)
+                    }
+                },
+            )
+            if (activeGeneration == null) {
+                streamingError(revision, "无法建立候选稿生成记录，请稍后重试")
+                return@launchStreamingGeneration
+            }
+            ChapterGenerationExecutions.replace(
+                projectId,
+                chapter.id,
+                activeGeneration.run.id,
+                checkNotNull(currentCoroutineContext()[Job]) { "Missing generation coroutine job" },
+            )
+            val generationTelemetry = GenerationTelemetryCollector.forModel(
+                cfg,
+                if (stepwise) "chapter.stepwise.v2" else "chapter.one_shot.v2",
+            )
+            try {
+            if (stepwise) {
+                // Logic-chain path: first draft a beat-by-beat blueprint bound to this chapter's
+                // plan/realm/containers/prior context, then write each beat in sequence.
+                generateChapterStepwise(
+                    cfg = cfg,
+                    chapter = chapter,
+                    currentContent = currentContent,
+                    isContinuation = isContinuation,
+                    lang = lang,
+                    chapterList = budgetedContext.chapterList,
+                    charactersInfo = budgetedContext.charactersInfo,
+                    worldSetting = budgetedContext.worldSetting,
+                    timeline = budgetedContext.timeline,
+                    prevSummary = prevSummary.takeIf { it.isNotBlank() },
+                    kbAugmentation = budgetedContext.storyState,
+                    targetConstraints = budgetedContext.targetConstraints,
+                    draftReference = budgetedContext.draftReference,
+                    generationRevision = revision,
+                    buffer = buffer,
+                    telemetry = generationTelemetry,
+                )
+            } else {
+                val messages = listOf(
+                    ChatMessage("system", Prompts.chapterSystem(lang)),
+                    ChatMessage("user", Prompts.chapterUser(
+                        chapterTitle = chapter.title,
+                        outlineGoal = chapter.outline_goal.orEmpty(),
+                        conflict = chapter.conflict,
+                        prevSummary = prevSummary.takeIf { it.isNotBlank() },
+                        currentContent = if (isContinuation) currentContent!!.takeLast(2000) else null,
+                        chapterList = budgetedContext.chapterList,
+                        charactersInfo = budgetedContext.charactersInfo,
+                        worldSetting = budgetedContext.worldSetting,
+                        timeline = budgetedContext.timeline,
+                        targetWords = TARGET_WORDS,
+                        isContinuation = isContinuation,
+                        language = lang,
+                        kbAugmentation = budgetedContext.storyState,
+                        targetConstraints = budgetedContext.targetConstraints,
+                        draftReference = budgetedContext.draftReference,
+                    )),
+                )
+                collectGenerationStream(
+                    cfg = cfg,
+                    messages = messages,
+                    telemetry = generationTelemetry,
+                    purpose = if (isContinuation) "chapter_continue" else "chapter_generate",
+                    onDelta = { text -> appendStreamingText(revision, buffer, text) },
+                    onFailure = { message -> streamingError(revision, "生成失败：$message") },
+                )
+            }
+            ensureStreamingOwner(revision)
+            val final = buffer.toString()
+            val sourceStillCurrent = repo.project(projectId) != null &&
+                repo.chapters(projectId).firstOrNull { it.id == chapter.id } == baselineChapter &&
+                repo.chapterBody(chapter.id) == baselineBody &&
+                promptSourcesStillCurrent(
+                    projectId,
+                    PromptSourceScope.CHAPTER,
+                    promptSources,
+                    baselineChapter.order_index,
+                )
+            if (!sourceStillCurrent) {
+                val category = GenerationTelemetry.FAILURE_SOURCE_CONFLICT
+                novelGenerationEngine.fail(
+                    activeGeneration,
+                    GenerationTelemetryCollector.persistedFailureMessage(category),
+                    generationTelemetry.finishFailed(category),
+                )
+                streamingError(
+                    revision,
+                    "内容冲突：章节或其规划上下文在 AI 生成期间已被修改，未覆盖正式正文",
+                )
+                return@launchStreamingGeneration
+            }
+
+            var completion: NovelGenerationEngine.Completion? = null
+            var completionAttempted = false
+            val persisted = commitIfStreamingOwner(revision) {
+                completionAttempted = true
+                completion = completeGenerationCandidate(
+                    activeGeneration,
+                    final,
+                    generationTelemetry,
+                )
+                completion != null
+            }
+            if (persisted) {
+                val qualityReport = checkNotNull(completion).report
+                streamingError(
+                    revision,
+                    if (qualityReport.blocking) {
+                        "候选稿已保存，但未通过硬性质量检查；正式正文未改变"
+                    } else {
+                        "候选稿已生成，请预览后选择采用或拒绝；正式正文尚未改变"
+                    },
+                )
+            } else {
+                val persistenceFailure = completionAttempted &&
+                    !generationRunWasSuperseded(projectId, activeGeneration.run.id)
+                val category = if (persistenceFailure) {
+                    GenerationTelemetry.FAILURE_PERSISTENCE
+                } else {
+                    GenerationTelemetry.FAILURE_SUPERSEDED
                 }
+                val terminal = if (persistenceFailure) {
+                    generationTelemetry.finishFailed(category)
+                } else {
+                    generationTelemetry.finishCancelled(category)
+                }
+                if (persistenceFailure) {
+                    novelGenerationEngine.fail(
+                        activeGeneration,
+                        GenerationTelemetryCollector.persistedFailureMessage(category),
+                        terminal,
+                    )
+                } else {
+                    novelGenerationEngine.cancel(
+                        activeGeneration,
+                        GenerationTelemetryCollector.persistedFailureMessage(category),
+                        terminal,
+                    )
+                }
+            }
+            } catch (cancelled: CancellationException) {
+                val category = generationCancellationCategory(
+                    projectId,
+                    activeGeneration.run.id,
+                )
+                val telemetry = generationTelemetry.finishCancelled(category)
+                novelGenerationEngine.cancel(
+                    activeGeneration,
+                    GenerationTelemetryCollector.persistedFailureMessage(category),
+                    telemetry.takeIf { it.outcome == GenerationTelemetry.OUTCOME_CANCELLED },
+                )
+                throw cancelled
+            } catch (error: Throwable) {
+                val category = GenerationTelemetryCollector.failureCategory(error)
+                val telemetry = generationTelemetry.finishFailed(category)
+                novelGenerationEngine.fail(
+                    activeGeneration,
+                    GenerationTelemetryCollector.persistedFailureMessage(category),
+                    telemetry.takeIf { it.outcome == GenerationTelemetry.OUTCOME_FAILED },
+                )
+                streamingError(
+                    revision,
+                    "生成失败：" + if (error is PromptRequestBudgeter.BudgetExceededException) {
+                        error.message.orEmpty()
+                    } else {
+                        GenerationTelemetryCollector.persistedFailureMessage(category)
+                    },
+                )
             } finally {
-                _isGenerating.value = false
-                _isChapterGenerating.value = false
+                ChapterGenerationExecutions.unregister(
+                    projectId,
+                    chapter.id,
+                    activeGeneration.run.id,
+                )
             }
         }
     }
@@ -661,10 +1586,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
      * Logic-chain chapter generation. Runs inside the same streaming job as [generateChapter]:
      *   1) one-shot [AiService.chat] drafts a beat-by-beat blueprint bound to the chapter plan,
      *      realm system, containers and prior context;
-     *   2) each beat is then written with a streamed call, accumulating into [_streamingText].
+     *   2) each beat is then written with a streamed call, accumulating into the caller's buffer.
      * If the blueprint comes back empty (model/network hiccup), falls back to a single one-shot
      * streamed generation so the user still gets a chapter.
-     * The caller owns _streamingText init, the generating flags, and persistence of the final text.
+     * The caller owns the generation token, UI publication, and persistence of the final text.
      */
     private suspend fun generateChapterStepwise(
         cfg: TextModelConfig,
@@ -678,14 +1603,18 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         timeline: String?,
         prevSummary: String?,
         kbAugmentation: String?,
+        targetConstraints: String?,
         draftReference: String?,
+        generationRevision: Long,
+        buffer: StringBuilder,
+        telemetry: GenerationTelemetryCollector,
     ) {
+        val blueprintConfig = cfg.withStageOutputLimit(BLUEPRINT_MAX_OUTPUT_TOKENS)
         // Stage 1 — blueprint (non-streaming, internal; not shown verbatim to the user).
         // Use try/catch (not runCatching) so a CancellationException from stopGenerating() during the
         // blueprint call propagates instead of being swallowed — otherwise an empty blueprint would
         // wrongly fall through to the one-shot fallback after the user already asked to stop.
-        val blueprint = try {
-            ai.chat(cfg, listOf(
+        val blueprintMessages = listOf(
                 ChatMessage("system", Prompts.chapterBlueprintSystem(lang)),
                 ChatMessage("user", Prompts.chapterBlueprintUser(
                     chapterTitle = chapter.title,
@@ -698,22 +1627,46 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     worldSetting = worldSetting,
                     timeline = timeline,
                     kbAugmentation = kbAugmentation,
+                    targetConstraints = targetConstraints,
                     draftReference = draftReference,
                     targetWords = TARGET_WORDS,
                     isContinuation = isContinuation,
                     language = lang,
                 )),
-            )).trim()
-        } catch (e: kotlinx.coroutines.CancellationException) {
-            throw e
-        } catch (_: Throwable) {
-            ""
-        }
+            )
+        val blueprint = generationChat(
+            cfg = blueprintConfig,
+            messages = blueprintMessages,
+            telemetry = telemetry,
+            purpose = "chapter_blueprint",
+        ).trim()
+        ensureStreamingOwner(generationRevision)
 
-        val beats = blueprint.split(Prompts.BEAT_DELIM).map { it.trim() }.filter { it.isNotBlank() }
+        val beats = blueprint.split(Prompts.BEAT_DELIM)
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .take(MAX_CHAPTER_BEATS)
 
         // Fallback: no usable blueprint → one-shot streamed generation (legacy behavior).
         if (beats.size < 2) {
+            val fallbackContext = budgetChapterContext(
+                cfg = cfg,
+                systemPrompt = Prompts.chapterSystem(lang),
+                requiredTaskText = listOfNotNull(
+                    chapter.title,
+                    chapter.outline_goal,
+                    chapter.conflict,
+                    currentContent?.takeLast(2_000),
+                    "targetWords=$TARGET_WORDS",
+                ).joinToString("\n"),
+                worldSetting = worldSetting,
+                timeline = timeline,
+                charactersInfo = charactersInfo,
+                storyState = kbAugmentation,
+                targetConstraints = targetConstraints,
+                chapterList = chapterList,
+                draftReference = draftReference,
+            )
             val messages = listOf(
                 ChatMessage("system", Prompts.chapterSystem(lang)),
                 ChatMessage("user", Prompts.chapterUser(
@@ -722,60 +1675,95 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     conflict = chapter.conflict,
                     prevSummary = prevSummary,
                     currentContent = if (isContinuation) currentContent?.takeLast(2000) else null,
-                    chapterList = chapterList,
-                    charactersInfo = charactersInfo,
-                    worldSetting = worldSetting,
-                    timeline = timeline,
+                    chapterList = fallbackContext.chapterList,
+                    charactersInfo = fallbackContext.charactersInfo,
+                    worldSetting = fallbackContext.worldSetting,
+                    timeline = fallbackContext.timeline,
                     targetWords = TARGET_WORDS,
                     isContinuation = isContinuation,
                     language = lang,
-                    kbAugmentation = kbAugmentation,
-                    draftReference = draftReference,
+                    kbAugmentation = fallbackContext.storyState,
+                    targetConstraints = fallbackContext.targetConstraints,
+                    draftReference = fallbackContext.draftReference,
                 )),
             )
-            ai.streamChat(cfg, messages).collect { ev ->
-                when (ev) {
-                    is AiService.StreamEvent.Delta -> _streamingText.value = _streamingText.value + ev.text
-                    AiService.StreamEvent.Done -> {}
-                    is AiService.StreamEvent.Error -> _statusMessage.value = "生成失败：${ev.message}"
-                }
-            }
+            collectGenerationStream(
+                cfg = cfg,
+                messages = messages,
+                telemetry = telemetry,
+                purpose = "chapter_fallback",
+                onDelta = { text -> appendStreamingText(generationRevision, buffer, text) },
+                onFailure = { message -> streamingError(generationRevision, "生成失败：$message") },
+            )
             return
         }
 
         // Stage 2 — write each beat, streaming into the same _streamingText buffer.
         val perBeatWords = (TARGET_WORDS / beats.size).coerceAtLeast(300)
+        val normalizedBlueprint = beats.joinToString("\n${Prompts.BEAT_DELIM}\n")
+        val longestBeat = beats.maxByOrNull(PromptRequestBudgeter::estimateText).orEmpty()
+        val segmentOutputLimit = (perBeatWords * 2 + 512).coerceIn(1_024, 4_096)
+        val segmentConfig = cfg.withStageOutputLimit(segmentOutputLimit)
+        // Allocate all slow-changing blocks once against the worst per-beat required tail. Every
+        // segment then carries the exact same cacheable prefix regardless of how much prose exists.
+        val fixedSegmentContext = budgetChapterContext(
+            cfg = segmentConfig,
+            systemPrompt = Prompts.chapterSegmentSystem(lang),
+            requiredTaskText = listOf(
+                chapter.title,
+                normalizedBlueprint,
+                longestBeat,
+                STEPWISE_WRITTEN_TAIL_RESERVE,
+                "beat=${beats.size}/${beats.size}",
+                "targetWords=$perBeatWords",
+            ).joinToString("\n"),
+            worldSetting = worldSetting,
+            timeline = timeline,
+            charactersInfo = charactersInfo,
+            storyState = kbAugmentation,
+            targetConstraints = targetConstraints,
+            chapterList = null,
+            draftReference = draftReference,
+        )
         beats.forEachIndexed { i, beat ->
+            ensureStreamingOwner(generationRevision)
             // Separate beats (and separate from any pre-existing continuation text) with a blank line.
-            val cur = _streamingText.value
+            val cur = buffer.toString()
             if (cur.isNotEmpty() && !cur.endsWith("\n\n")) {
-                _streamingText.value = if (cur.endsWith("\n")) cur + "\n" else cur + "\n\n"
+                appendStreamingText(
+                    generationRevision,
+                    buffer,
+                    if (cur.endsWith("\n")) "\n" else "\n\n",
+                )
             }
+            val writtenTail = buffer.toString().takeLast(1500).takeIf { it.isNotBlank() }
             val messages = listOf(
                 ChatMessage("system", Prompts.chapterSegmentSystem(lang)),
                 ChatMessage("user", Prompts.chapterSegmentUser(
                     chapterTitle = chapter.title,
-                    blueprint = blueprint,
+                    blueprint = normalizedBlueprint,
                     currentBeat = beat,
                     beatIndex = i + 1,
                     beatTotal = beats.size,
-                    writtenTail = _streamingText.value.takeLast(1500).takeIf { it.isNotBlank() },
-                    charactersInfo = charactersInfo,
-                    worldSetting = worldSetting,
-                    timeline = timeline,
-                    kbAugmentation = kbAugmentation,
-                    draftReference = draftReference,
+                    writtenTail = writtenTail,
+                    charactersInfo = fixedSegmentContext.charactersInfo,
+                    worldSetting = fixedSegmentContext.worldSetting,
+                    timeline = fixedSegmentContext.timeline,
+                    kbAugmentation = fixedSegmentContext.storyState,
+                    targetConstraints = fixedSegmentContext.targetConstraints,
+                    draftReference = fixedSegmentContext.draftReference,
                     targetWords = perBeatWords,
                     language = lang,
                 )),
             )
-            ai.streamChat(cfg, messages).collect { ev ->
-                when (ev) {
-                    is AiService.StreamEvent.Delta -> _streamingText.value = _streamingText.value + ev.text
-                    AiService.StreamEvent.Done -> {}
-                    is AiService.StreamEvent.Error -> _statusMessage.value = "生成失败：${ev.message}"
-                }
-            }
+            collectGenerationStream(
+                cfg = segmentConfig,
+                messages = messages,
+                telemetry = telemetry,
+                purpose = "chapter_segment_${i + 1}",
+                onDelta = { text -> appendStreamingText(generationRevision, buffer, text) },
+                onFailure = { message -> streamingError(generationRevision, "生成失败：$message") },
+            )
         }
     }
 
@@ -809,25 +1797,55 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 language = lang,
             )),
         )
+        val revision = ++aiFillRevision
         aiFillJob?.cancel()
         _aiFillText.value = ""
         _isAiFilling.value = true
-        aiFillJob = viewModelScope.launch(Dispatchers.IO) {
-            try {
-                ai.streamChat(cfg, messages).collect { ev ->
-                    when (ev) {
-                        is AiService.StreamEvent.Delta -> _aiFillText.value = _aiFillText.value + ev.text
-                        AiService.StreamEvent.Done -> {}
-                        is AiService.StreamEvent.Error -> _statusMessage.value = "AI助填失败：${ev.message}"
-                    }
+        val job = viewModelScope.launchWithFailureBoundary(
+            context = Dispatchers.IO,
+            start = CoroutineStart.LAZY,
+            onFailure = { error ->
+                if (aiFillRevision == revision) {
+                    // A truncated three-line response must never become an applyable suggestion.
+                    _aiFillText.value = ""
+                    _statusMessage.value =
+                        "AI助填失败：${error.message ?: error::class.simpleName ?: "未知错误"}"
                 }
+            },
+        ) {
+            try {
+                ai.streamChat(cfg, messages).collectCompleted(
+                    onDelta = { text ->
+                        currentCoroutineContext().ensureActive()
+                        if (aiFillRevision != revision) {
+                            throw CancellationException("AI fill request was superseded")
+                        }
+                        _aiFillText.value = _aiFillText.value + text
+                    },
+                    onFailure = { message ->
+                        if (aiFillRevision == revision) {
+                            _aiFillText.value = ""
+                            _statusMessage.value = "AI助填失败：$message"
+                        }
+                    },
+                )
             } finally {
-                _isAiFilling.value = false
+                if (aiFillRevision == revision) {
+                    _isAiFilling.value = false
+                    aiFillJob = null
+                }
             }
         }
+        aiFillJob = job
+        job.start()
     }
 
-    fun stopAiFill() { aiFillJob?.cancel(); aiFillJob = null; _isAiFilling.value = false }
+    fun stopAiFill() {
+        aiFillRevision++
+        aiFillJob?.cancel()
+        aiFillJob = null
+        _isAiFilling.value = false
+    }
     fun clearAiFill() { _aiFillText.value = "" }
 
     /** Generates a chapter-by-chapter plan for [arcId] and saves it as arc.miniOutline. */
@@ -837,20 +1855,31 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             _statusMessage.value = "请先在「设置」中配置可用的文本模型 / Configure a text model first."
             return
         }
+        val ticket = claimStreamingGeneration("")
         val lang = _uiLanguage.value
-        val project = repo.project(projectId) ?: return
-        val arc = repo.plotArcs(projectId).find { it.id == arcId } ?: return
-        streamingJob?.cancel()
-        _streamingText.value = ""
-        _isGenerating.value = true
-        streamingJob = viewModelScope.launch(Dispatchers.IO) {
-            try {
-                val chapters = repo.chapters(projectId)
-                val realmCtx = buildRealmSystemContext(repo.cultivationRealms(projectId), lang)
-                val charactersInfo = buildCharactersInfo(projectId)
-                val startChapterNumber = (chapters.maxOfOrNull { it.order_index } ?: 0) + 1
-                val prevCtx = chapters.sortedByDescending { it.order_index }.take(5).reversed()
-                    .joinToString("\n") { c -> "第${c.order_index}章《${c.title}》：${c.outline_goal ?: "(无目标)"}" }
+        val project = repo.project(projectId)
+        val arc = repo.plotArcs(projectId).find { it.id == arcId }
+        if (project == null || arc == null) {
+            abandonStreamingGeneration(ticket, "项目或目标弧线已不存在")
+            return
+        }
+        val planningOrder = (repo.chapters(projectId).maxOfOrNull { it.order_index } ?: 0) + 1
+        val promptSources = captureStablePromptSources(
+            projectId,
+            PromptSourceScope.PLANNING,
+            planningOrder,
+        )
+        if (promptSources == null) {
+            abandonStreamingGeneration(ticket, "弧线规划上下文正在变化或项目已删除，请稍后重试")
+            return
+        }
+        launchStreamingGeneration(ticket) { revision, buffer ->
+            val chapters = repo.chapters(projectId)
+            val realmCtx = buildRealmSystemContext(repo.cultivationRealms(projectId), lang)
+            val charactersInfo = buildCharactersInfo(projectId)
+            val startChapterNumber = (chapters.maxOfOrNull { it.order_index } ?: 0) + 1
+            val prevCtx = chapters.sortedByDescending { it.order_index }.take(5).reversed()
+                .joinToString("\n") { c -> "第${c.order_index}章《${c.title}》：${c.outline_goal ?: "(无目标)"}" }
                 // Planning sources not already in the prompt's dedicated slots: 境界体系、所属副本、
                 // 全局弧线进度、角色成长、容器知识库（手动+追踪）、设置页知识库索引检索 — so the manual
                 // planner reads the same full context the agent does and won't plan blind.
@@ -873,7 +1902,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 val messages = listOf(
                     ChatMessage("system", Prompts.arcMiniOutlineSystem(lang)),
                     ChatMessage("user", Prompts.arcMiniOutlineUser(
-                        projectTitle = project.title,
+                        projectTitle = promptSources.project.title,
                         projectOutline = projectOutline,
                         arcTitle = arc.title,
                         arcSummary = arc.summary,
@@ -884,21 +1913,39 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         language = lang,
                     )),
                 )
-                ai.streamChat(cfg, messages).collect { ev ->
-                    when (ev) {
-                        is AiService.StreamEvent.Delta -> _streamingText.value = _streamingText.value + ev.text
-                        AiService.StreamEvent.Done -> {}
-                        is AiService.StreamEvent.Error -> _statusMessage.value = "弧线计划生成失败：${ev.message}"
-                    }
+            if (!promptSourcesStillCurrent(
+                    projectId,
+                    PromptSourceScope.PLANNING,
+                    promptSources,
+                    planningOrder,
+                ) || repo.plotArcs(projectId).firstOrNull { it.id == arcId } != arc
+            ) {
+                streamingError(revision, "内容冲突：弧线规划上下文在 AI 生成前已被修改，请重新生成")
+                return@launchStreamingGeneration
+            }
+            ai.streamChat(cfg, messages).collectCompleted(
+                onDelta = { text -> appendStreamingText(revision, buffer, text) },
+                onFailure = { message -> streamingError(revision, "弧线计划生成失败：$message") },
+            )
+            ensureStreamingOwner(revision)
+            val result = buffer.toString()
+            if (result.isNotEmpty()) {
+                val committed = commitIfStreamingOwner(revision) {
+                    promptSourcesStillCurrent(
+                        projectId,
+                        PromptSourceScope.PLANNING,
+                        promptSources,
+                        planningOrder,
+                    ) && repo.updatePlotArcIfUnchanged(projectId, arc) {
+                            it.copy(miniOutline = result, builtChapterIds = emptyList())
+                        }
                 }
-                val result = _streamingText.value
-                if (result.isNotEmpty()) {
-                    repo.setPlotArcs(projectId, repo.plotArcs(projectId).map { a ->
-                        if (a.id == arcId) a.copy(miniOutline = result, builtChapterIds = emptyList()) else a
-                    })
+                if (!committed) {
+                    streamingError(
+                        revision,
+                        "内容冲突：弧线或完整规划上下文在 AI 规划期间已被修改，已保留新内容",
+                    )
                 }
-            } finally {
-                _isGenerating.value = false
             }
         }
     }
@@ -909,29 +1956,38 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         arcId: String?,
         items: List<Pair<String, String?>>,   // (title, goal?)
     ): List<Chapter> {
+        val expectedArc = arcId?.let { id -> repo.plotArcs(projectId).firstOrNull { it.id == id } }
+        if (arcId != null && expectedArc == null) return emptyList()
+        return addChaptersBatchAgainst(projectId, expectedArc, items)
+    }
+
+    private fun addChaptersBatchAgainst(
+        projectId: String,
+        expectedArc: PlotArc?,
+        items: List<Pair<String, String?>>,
+        expectedChapters: List<Chapter>? = null,
+    ): List<Chapter> {
+        if (repo.project(projectId) == null) return emptyList()
         val ts = System.currentTimeMillis()
-        val maxOrder = repo.chapters(projectId).maxOfOrNull { it.order_index } ?: 0
         val now = nowIso()
-        val newChapters = items.mapIndexed { i, (title, goal) ->
+        val candidates = items.mapIndexed { i, (title, goal) ->
             Chapter(
                 id = "c-$ts-$i",
                 project_id = projectId,
                 title = title,
-                order_index = maxOrder + i + 1,
+                order_index = 0,
                 outline_goal = goal,
                 created_at = now,
                 updated_at = now,
-                arcId = arcId,
+                arcId = expectedArc?.id,
             )
         }
-        newChapters.forEach { ch -> repo.upsertChapter(projectId, ch) }
-        if (arcId != null) {
-            val builtIds = newChapters.map { it.id }
-            repo.setPlotArcs(projectId, repo.plotArcs(projectId).map { a ->
-                if (a.id == arcId) a.copy(builtChapterIds = builtIds) else a
-            })
-        }
-        return newChapters
+        return repo.appendChaptersToArcIfUnchanged(
+            projectId,
+            expectedArc,
+            candidates,
+            expectedChapters = expectedChapters,
+        )
     }
 
     /** Convenience wrapper so LongNovelScreen can patch a single arc without replacing the whole list. */
@@ -958,7 +2014,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
         val lang = _uiLanguage.value
         return withContext(Dispatchers.IO) {
-            runCatching {
+            runSuspendCatching {
                 ai.chat(
                     cfg,
                     listOf(
@@ -982,7 +2038,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         if (!cfg.isValid()) return null
         val lang = _uiLanguage.value
         val reply = withContext(Dispatchers.IO) {
-            runCatching {
+            runSuspendCatching {
                 ai.chat(
                     cfg,
                     listOf(
@@ -1022,7 +2078,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             if (realmCtx.isNotEmpty()) { if (isNotEmpty()) append("\n\n"); append(realmCtx) }
         }
         val reply = withContext(Dispatchers.IO) {
-            runCatching {
+            runSuspendCatching {
                 ai.chat(
                     cfg,
                     listOf(
@@ -1080,7 +2136,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     suspend fun generatePortraitImage(prompt: String, width: Int = 768, height: Int = 1024): ByteArray? =
         withContext(Dispatchers.IO) {
-            runCatching {
+            runSuspendCatching {
                 generateImageBytes(prompt, width, height)
             }.getOrNull()
         }
@@ -1109,6 +2165,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
      * state without blocking the editor.
      */
     fun generateIllustration(
+        projectId: String,
         chapterId: String,
         paragraphText: String,
         anchorIndex: Int,
@@ -1131,9 +2188,14 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             onDone(null, "请先勾选需要生成插图的段落 / Select paragraphs before generating.")
             return
         }
+        val source = repo.captureChapterSource(projectId, chapterId)
+        if (source == null) {
+            onDone(null, "项目或章节已不存在，无法生成插图。")
+            return
+        }
         val lang = _uiLanguage.value
         viewModelScope.launch(Dispatchers.IO) {
-            val prompt = runCatching {
+            val prompt = runSuspendCatching {
                 ai.chat(cfg, listOf(
                     ChatMessage("system", Prompts.illustrationPromptSystem(lang)),
                     ChatMessage("user", Prompts.illustrationPromptUser(
@@ -1147,7 +2209,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 onDone(null, "模型未返回可用的图像提示词。")
                 return@launch
             }
-            val bytes = runCatching {
+            val bytes = runSuspendCatching {
                 generateImageBytes(prompt = prompt, width = width, height = height, model = model)
             }.getOrElse {
                 onDone(null, "图像生成失败：${it.message}"); return@launch
@@ -1161,8 +2223,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 imageBase64 = b64,
                 createdAt = nowIso(),
             )
-            repo.upsertIllustration(chapterId, illustration)
-            onDone(illustration, null)
+            currentCoroutineContext().ensureActive()
+            if (repo.upsertIllustrationIfChapterSourceCurrent(projectId, source.source, illustration)) {
+                onDone(illustration, null)
+            } else {
+                onDone(null, "章节在插图生成期间已被修改或删除，过期插图未保存。")
+            }
         }
     }
 
@@ -1171,6 +2237,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun getChapterPromo(chapterId: String): ChapterPromo? = repo.getChapterPromo(chapterId)
 
     fun generateChapterPromo(
+        projectId: String,
         chapterId: String,
         chapterTitle: String,
         chapterContent: String,
@@ -1179,19 +2246,28 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         width: Int,
         height: Int,
         onDone: (ChapterPromo?, errorMessage: String?) -> Unit,
-    ) {
+    ): Job? {
         val cfg = repo.activeTextModelConfig()
         if (!cfg.isValid()) {
             onDone(null, "请先在「设置」中配置可用的文本模型 / Configure a text model first.")
-            return
+            return null
         }
         if (chapterContent.length < 100) {
             onDone(null, "章节内容太少（至少需要100字）/ Chapter content too short (need 100+ chars).")
-            return
+            return null
+        }
+        val source = repo.captureChapterMediaSource(projectId, chapterId)
+        if (
+            source == null ||
+            source.chapter.source.title != chapterTitle ||
+            source.chapter.effectiveText != chapterContent
+        ) {
+            onDone(null, "章节标题或正文已变化，请保存并刷新后重试。")
+            return null
         }
         val lang = _uiLanguage.value
-        viewModelScope.launch(Dispatchers.IO) {
-            val json = runCatching {
+        return viewModelScope.launch(Dispatchers.IO) {
+            val json = runSuspendCatching {
                 ai.chat(cfg, listOf(
                     ChatMessage("system", Prompts.chapterPromoSystem(lang)),
                     ChatMessage("user", Prompts.chapterPromoUser(chapterTitle, chapterContent, style, lang)),
@@ -1202,13 +2278,24 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             val imagePrompt = (el?.get("image_prompt") as? kotlinx.serialization.json.JsonPrimitive)?.content.orEmpty()
             val summary = (el?.get("summary") as? kotlinx.serialization.json.JsonPrimitive)?.content.orEmpty()
             if (imagePrompt.isBlank()) { onDone(null, "模型未返回可用的图像提示词。"); return@launch }
-            val bytes = runCatching {
+            val bytes = runSuspendCatching {
                 generateImageBytes(prompt = imagePrompt, width = width, height = height, model = model)
             }.getOrElse { onDone(null, "图像生成失败：${it.message}"); return@launch }
             val b64 = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
             val promo = ChapterPromo(imagePrompt = imagePrompt, summary = summary, imageBase64 = b64)
-            repo.setChapterPromo(chapterId, promo)
-            onDone(promo, null)
+            currentCoroutineContext().ensureActive()
+            if (
+                repo.setChapterPromoIfSourceCurrent(
+                    projectId,
+                    source.chapter.source,
+                    source.promo,
+                    promo,
+                )
+            ) {
+                onDone(promo, null)
+            } else {
+                onDone(null, "章节在推文生成期间已被修改或删除，过期推文未保存。")
+            }
         }
     }
 
@@ -1236,7 +2323,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         val lang = _uiLanguage.value
         val outline = repo.outline(projectId)
         viewModelScope.launch(Dispatchers.IO) {
-            val prompt = runCatching {
+            val prompt = runSuspendCatching {
                 ai.chat(cfg, listOf(
                     ChatMessage("system", Prompts.projectCoverSystem(lang)),
                     ChatMessage("user", Prompts.projectCoverUser(
@@ -1246,7 +2333,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             }.getOrElse { onDone(null, "生成封面提示词失败：${it.message}"); return@launch }
                 .trim().lines().firstOrNull { it.isNotBlank() }.orEmpty()
             if (prompt.isBlank()) { onDone(null, "模型未返回可用的图像提示词。"); return@launch }
-            val bytes = runCatching {
+            val bytes = runSuspendCatching {
                 generateImageBytes(prompt = prompt, width = width, height = height, model = model)
             }.getOrElse { onDone(null, "图像生成失败：${it.message}"); return@launch }
             val b64 = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
@@ -1259,10 +2346,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 createdAt = nowIso(),
                 config = CoverImageConfig(model = model, style = style.orEmpty(), width = width, height = height),
             )
-            val existing = repo.getCoverImages(projectId)
-            val newList = existing + item
-            val defaultId = repo.project(projectId)?.default_cover_id ?: item.id
-            repo.setCoverImages(projectId, newList, defaultId)
+            val committed = repo.upsertCoverImage(projectId, item, makeDefault = false)
+            if (!committed) {
+                onDone(null, "项目已删除，生成的封面未保存。")
+                return@launch
+            }
             onDone(item, null)
         }
     }
@@ -1288,20 +2376,29 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         if (!cfg.isValid()) return null
         val lang = _uiLanguage.value
         val project = repo.project(projectId) ?: return null
-        val existingArcs = repo.plotArcs(projectId).joinToString("\n") { "- ${it.title} (${it.status})" }
+        val promptSources = captureStablePromptSources(projectId, PromptSourceScope.PLOT_ARC)
+            ?: return null
+        val baselineArcs = repo.plotArcs(projectId)
+        val existingArcs = baselineArcs.joinToString("\n") { "- ${it.title} (${it.status})" }
         val realmCtx = buildRealmSystemContext(repo.cultivationRealms(projectId), lang)
         val charSummary = repo.characters(projectId).joinToString("\n") { "- ${it.name}: ${it.role}" }
+        val bookOutline = repo.outline(projectId).ifBlank { null }
+        if (!promptSourcesStillCurrent(projectId, PromptSourceScope.PLOT_ARC, promptSources) ||
+            repo.plotArcs(projectId) != baselineArcs
+        ) {
+            contentConflict("剧情弧线生成上下文")
+        }
         val reply = withContext(Dispatchers.IO) {
-            runCatching {
+            runSuspendCatching {
                 ai.chat(
                     cfg,
                     listOf(
                         ChatMessage("system", Prompts.plotArcSystem(lang)),
                         ChatMessage("user", Prompts.plotArcUser(
                             userIdea = userIdea,
-                            bookTitle = project.title,
-                            bookDescription = project.description,
-                            bookOutline = repo.outline(projectId).ifBlank { null },
+                            bookTitle = promptSources.project.title,
+                            bookDescription = promptSources.project.description,
+                            bookOutline = bookOutline,
                             existingArcsSummary = existingArcs.ifBlank { null },
                             realmSystemContext = realmCtx.ifBlank { null },
                             charactersSummary = charSummary.ifBlank { null },
@@ -1313,29 +2410,47 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             }.getOrNull()
         } ?: return null
         val parsed = parsePlotArcJson(reply) ?: return null
-        val order = (repo.plotArcs(projectId).maxOfOrNull { it.order } ?: -1) + 1
-        val arc = PlotArc(
+        currentCoroutineContext().ensureActive()
+        val candidate = PlotArc(
             id = "arc-${System.currentTimeMillis()}",
             title = parsed.title,
             summary = parsed.summary,
-            order = order,
+            order = 0,
             status = "upcoming",
             chapterCount = parsed.chapterCount,
             miniOutline = parsed.miniOutline,
         )
-        repo.setPlotArcs(projectId, repo.plotArcs(projectId) + arc)
-        return arc
+        if (!promptSourcesStillCurrent(projectId, PromptSourceScope.PLOT_ARC, promptSources) ||
+            repo.plotArcs(projectId) != baselineArcs
+        ) {
+            contentConflict("剧情弧线生成上下文或弧线集合")
+        }
+        val saved = repo.appendPlotArcsIfTargetExists(
+            projectId,
+            listOf(candidate),
+            expectedArcs = baselineArcs,
+        ).singleOrNull() ?: contentConflict("剧情弧线生成上下文或弧线集合")
+        return saved
     }
 
     // ── 副本 / 弧线 AI generation ─────────────────────────────────────────────
 
     /** Generate [count] volumes from the outline + realm system + influencing containers (no arcs).
      *  [requirements] is the user's free-form instruction (e.g. what the first/later volumes cover). */
-    fun generateVolumes(projectId: String, count: Int, requirements: String? = null, onDone: (Int) -> Unit = {}) {
+    fun generateVolumes(projectId: String, count: Int, requirements: String? = null, onDone: (Int) -> Unit = {}): Job? {
         val cfg = repo.activeTextModelConfig()
-        if (!cfg.isValid()) { _statusMessage.value = "请先在「设置」中配置可用的文本模型"; onDone(0); return }
+        if (!cfg.isValid()) { _statusMessage.value = "请先在「设置」中配置可用的文本模型"; onDone(0); return null }
         val lang = _uiLanguage.value
-        viewModelScope.launch(Dispatchers.IO) {
+        return viewModelScope.launch(Dispatchers.IO) {
+            val promptSources = captureStablePromptSources(projectId, PromptSourceScope.VOLUME_COLLECTION)
+            if (promptSources == null) {
+                withContext(Dispatchers.Main) {
+                    _statusMessage.value = "副本生成上下文正在变化或项目已删除，请稍后重试"
+                    onDone(0)
+                }
+                return@launch
+            }
+            val baselineVolumes = repo.volumes(projectId)
             val context = buildString {
                 repo.outline(projectId).takeIf { it.isNotBlank() }?.let {
                     append(if (lang == "en") "[Outline]\n" else "【大纲】\n"); append(it.take(4000))
@@ -1347,8 +2462,17 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     if (isNotEmpty()) append("\n\n"); append(it)
                 }
             }
-            val existing = repo.volumes(projectId).sortedBy { it.order }.joinToString("\n") { "- ${it.name}" }.ifBlank { null }
-            val reply = runCatching {
+            val existing = baselineVolumes.sortedBy { it.order }.joinToString("\n") { "- ${it.name}" }.ifBlank { null }
+            if (!promptSourcesStillCurrent(projectId, PromptSourceScope.VOLUME_COLLECTION, promptSources) ||
+                repo.volumes(projectId) != baselineVolumes
+            ) {
+                withContext(Dispatchers.Main) {
+                    _statusMessage.value = "内容冲突：副本生成上下文或副本集合已修改，请重新生成"
+                    onDone(0)
+                }
+                return@launch
+            }
+            val reply = runSuspendCatching {
                 ai.chat(cfg, listOf(
                     ChatMessage("system", Prompts.volumePlanSystem(lang)),
                     ChatMessage("user", Prompts.volumePlanUser(count, context, existing, requirements?.trim()?.ifBlank { null }, lang)),
@@ -1356,24 +2480,50 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             }.getOrNull()
             val parsed = reply?.let { parseVolumeArray(it) } ?: emptyList()
             if (parsed.isEmpty()) { withContext(Dispatchers.Main) { _statusMessage.value = "副本生成失败"; onDone(0) }; return@launch }
-            var order = (repo.volumes(projectId).maxOfOrNull { it.order } ?: -1) + 1
-            val ts = System.currentTimeMillis()
-            val newVols = parsed.mapIndexed { i, (name, desc) ->
-                Volume(id = "vol-$ts-$i", name = name, description = desc, order = order++, createdAt = nowIso())
+            currentCoroutineContext().ensureActive()
+            if (!promptSourcesStillCurrent(projectId, PromptSourceScope.VOLUME_COLLECTION, promptSources) ||
+                repo.volumes(projectId) != baselineVolumes
+            ) {
+                withContext(Dispatchers.Main) {
+                    _statusMessage.value = "内容冲突：副本生成上下文或副本集合在 AI 生成期间已修改，结果未保存"
+                    onDone(0)
+                }
+                return@launch
             }
-            repo.setVolumes(projectId, repo.volumes(projectId) + newVols)
-            withContext(Dispatchers.Main) { _statusMessage.value = "已生成 ${newVols.size} 个副本"; onDone(newVols.size) }
+            val ts = System.currentTimeMillis()
+            val candidates = parsed.mapIndexed { i, (name, desc) ->
+                Volume(id = "vol-$ts-$i", name = name, description = desc, order = 0, createdAt = nowIso())
+            }
+            val newVols = repo.appendVolumesIfProjectExists(
+                projectId,
+                candidates,
+                expectedVolumes = baselineVolumes,
+            )
+            withContext(Dispatchers.Main) {
+                if (newVols.isEmpty()) _statusMessage.value = "内容冲突：项目或副本集合已修改，结果未保存"
+                else _statusMessage.value = "已生成 ${newVols.size} 个副本"
+                onDone(newVols.size)
+            }
         }
     }
 
     /** Generate [count] plot arcs inside [volumeId] (no chapter planning). [requirements] is the
      *  user's free-form instruction (e.g. what specific arcs should cover). */
-    fun generateArcsForVolume(projectId: String, volumeId: String, count: Int, requirements: String? = null, onDone: (Int) -> Unit = {}) {
+    fun generateArcsForVolume(projectId: String, volumeId: String, count: Int, requirements: String? = null, onDone: (Int) -> Unit = {}): Job? {
         val cfg = repo.activeTextModelConfig()
-        if (!cfg.isValid()) { _statusMessage.value = "请先在「设置」中配置可用的文本模型"; onDone(0); return }
+        if (!cfg.isValid()) { _statusMessage.value = "请先在「设置」中配置可用的文本模型"; onDone(0); return null }
         val lang = _uiLanguage.value
-        val volume = repo.volumes(projectId).firstOrNull { it.id == volumeId } ?: run { onDone(0); return }
-        viewModelScope.launch(Dispatchers.IO) {
+        val volume = repo.volumes(projectId).firstOrNull { it.id == volumeId } ?: run { onDone(0); return null }
+        return viewModelScope.launch(Dispatchers.IO) {
+            val promptSources = captureStablePromptSources(projectId, PromptSourceScope.ARC_COLLECTION)
+            if (promptSources == null) {
+                withContext(Dispatchers.Main) {
+                    _statusMessage.value = "弧线生成上下文正在变化或项目已删除，请稍后重试"
+                    onDone(0)
+                }
+                return@launch
+            }
+            val baselineArcs = repo.plotArcs(projectId)
             val context = buildString {
                 repo.outline(projectId).takeIf { it.isNotBlank() }?.let {
                     append(if (lang == "en") "[Outline]\n" else "【大纲】\n"); append(it.take(3000))
@@ -1389,9 +2539,19 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     if (isNotEmpty()) append("\n\n"); append(it)
                 }
             }
-            val existingArcs = repo.plotArcs(projectId).filter { it.volumeId == volumeId }
+            val existingArcs = baselineArcs.filter { it.volumeId == volumeId }
                 .joinToString("\n") { "- ${it.title}" }.ifBlank { null }
-            val reply = runCatching {
+            if (!promptSourcesStillCurrent(projectId, PromptSourceScope.ARC_COLLECTION, promptSources) ||
+                repo.volumes(projectId).firstOrNull { it.id == volumeId } != volume ||
+                repo.plotArcs(projectId) != baselineArcs
+            ) {
+                withContext(Dispatchers.Main) {
+                    _statusMessage.value = "内容冲突：弧线生成上下文、目标副本或弧线集合已修改，请重新生成"
+                    onDone(0)
+                }
+                return@launch
+            }
+            val reply = runSuspendCatching {
                 ai.chat(cfg, listOf(
                     ChatMessage("system", Prompts.arcsForVolumeSystem(lang)),
                     ChatMessage("user", Prompts.arcsForVolumeUser(count, volume.name, volume.description.ifBlank { null }, context, existingArcs, requirements?.trim()?.ifBlank { null }, lang)),
@@ -1399,14 +2559,33 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             }.getOrNull()
             val parsed = reply?.let { parseArcArray(it) } ?: emptyList()
             if (parsed.isEmpty()) { withContext(Dispatchers.Main) { _statusMessage.value = "弧线生成失败"; onDone(0) }; return@launch }
-            var order = (repo.plotArcs(projectId).maxOfOrNull { it.order } ?: -1) + 1
+            currentCoroutineContext().ensureActive()
+            if (!promptSourcesStillCurrent(projectId, PromptSourceScope.ARC_COLLECTION, promptSources) ||
+                repo.volumes(projectId).firstOrNull { it.id == volumeId } != volume ||
+                repo.plotArcs(projectId) != baselineArcs
+            ) {
+                withContext(Dispatchers.Main) {
+                    _statusMessage.value = "内容冲突：弧线生成上下文、目标副本或弧线集合在 AI 生成期间已修改，结果未保存"
+                    onDone(0)
+                }
+                return@launch
+            }
             val ts = System.currentTimeMillis()
-            val newArcs = parsed.mapIndexed { i, p ->
-                PlotArc(id = "arc-$ts-$i", title = p.title, summary = p.summary, order = order++,
+            val candidates = parsed.mapIndexed { i, p ->
+                PlotArc(id = "arc-$ts-$i", title = p.title, summary = p.summary, order = 0,
                     status = "upcoming", chapterCount = p.chapterCount, volumeId = volumeId)
             }
-            repo.setPlotArcs(projectId, repo.plotArcs(projectId) + newArcs)
-            withContext(Dispatchers.Main) { _statusMessage.value = "已生成 ${newArcs.size} 条弧线"; onDone(newArcs.size) }
+            val newArcs = repo.appendPlotArcsIfTargetExists(
+                projectId,
+                candidates,
+                expectedVolume = volume,
+                expectedArcs = baselineArcs,
+            )
+            withContext(Dispatchers.Main) {
+                if (newArcs.isEmpty()) _statusMessage.value = "内容冲突：目标副本或弧线集合已修改，结果未保存"
+                else _statusMessage.value = "已生成 ${newArcs.size} 条弧线"
+                onDone(newArcs.size)
+            }
         }
     }
 
@@ -1477,9 +2656,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     /** Raw chat call on the active text model — the agent's reasoning step. Throws on network /
      *  HTTP / timeout errors so the caller can retry and surface the real cause. */
-    suspend fun agentChat(messages: List<ChatMessage>): String? {
+    suspend fun agentChat(
+        messages: List<ChatMessage>,
+        onUsage: (StreamUsage) -> Unit = {},
+    ): String? {
         val cfg = repo.activeTextModelConfig(); if (!cfg.isValid()) return null
-        return withContext(Dispatchers.IO) { ai.chat(cfg, messages) }
+        return withContext(Dispatchers.IO) { ai.chat(cfg, messages, onUsage) }
     }
 
     fun agentTextModelReady(): Boolean = repo.activeTextModelConfig().isValid()
@@ -1488,32 +2670,129 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun setAgentName(name: String) = repo.setAgentName(name)
     fun activeTextModelProfileId(): String? = repo.activeTextModelProfileId()
 
+    private fun generationRunWasSuperseded(projectId: String, runId: String): Boolean {
+        val stored = repo.getGenerationRun(projectId, runId)
+        return stored?.status == GenerationRun.STATUS_CANCELLED &&
+            stored.error == GenerationRun.CANCEL_REASON_SUPERSEDED
+    }
+
+    private suspend fun generationCancellationCategory(projectId: String, runId: String): String {
+        ChapterGenerationExecutions.cancellationCategory(
+            runId,
+            currentCoroutineContext()[Job],
+        )?.let { return it }
+        return if (generationRunWasSuperseded(projectId, runId)) {
+            GenerationTelemetry.FAILURE_SUPERSEDED
+        } else {
+            GenerationTelemetry.FAILURE_USER_CANCELLED
+        }
+    }
+
+    /** Atomically persist a completed candidate before sealing the collector as successful. */
+    private fun completeGenerationCandidate(
+        active: NovelGenerationEngine.ActiveCandidate,
+        body: String,
+        telemetry: GenerationTelemetryCollector,
+    ): NovelGenerationEngine.Completion? {
+        val snapshot = telemetry.completedSnapshot()
+        return novelGenerationEngine.complete(active, body, telemetry = snapshot)
+            ?.also { telemetry.sealCompleted(snapshot) }
+    }
+
+    /** Collect one model stream and attribute its timing/usage to an exact generation run. */
+    private suspend fun collectGenerationStream(
+        cfg: TextModelConfig,
+        messages: List<ChatMessage>,
+        telemetry: GenerationTelemetryCollector,
+        purpose: String,
+        visibleOutput: Boolean = true,
+        onDelta: suspend (String) -> Unit,
+        onFailure: suspend (String) -> Unit = {},
+    ) {
+        val preparedMessages = PromptRequestBudgeter.validate(cfg, messages).messages
+        val trace = telemetry.beginRequest(purpose, preparedMessages, visibleOutput)
+        try {
+            ai.streamChat(cfg, preparedMessages, onUsage = trace::onUsage).collectCompleted(
+                onDelta = { text ->
+                    trace.onContent(text)
+                    onDelta(text)
+                },
+                onFailure = onFailure,
+            )
+            trace.complete()
+        } catch (cancelled: CancellationException) {
+            trace.cancel()
+            throw cancelled
+        } catch (error: Throwable) {
+            trace.fail(GenerationTelemetryCollector.failureCategory(error))
+            throw error
+        }
+    }
+
+    /** Collect one non-streaming model call without losing its per-request usage. */
+    private suspend fun generationChat(
+        cfg: TextModelConfig,
+        messages: List<ChatMessage>,
+        telemetry: GenerationTelemetryCollector,
+        purpose: String,
+    ): String {
+        val preparedMessages = PromptRequestBudgeter.validate(cfg, messages).messages
+        val trace = telemetry.beginRequest(purpose, preparedMessages, visibleOutput = false)
+        return try {
+            ai.chat(cfg, preparedMessages, onUsage = trace::onUsage).also {
+                trace.complete()
+            }
+        } catch (cancelled: CancellationException) {
+            trace.cancel()
+            throw cancelled
+        } catch (error: Throwable) {
+            trace.fail(GenerationTelemetryCollector.failureCategory(error))
+            throw error
+        }
+    }
+
     /** Collect a streaming completion, reporting the cumulative text via [onDelta]. */
     private suspend fun streamCollect(
         cfg: TextModelConfig,
         messages: List<ChatMessage>,
         onDelta: (String) -> Unit,
+        telemetry: GenerationTelemetryCollector? = null,
+        purpose: String = "agent_stream",
     ): String {
         val sb = StringBuilder()
-        ai.streamChat(cfg, messages).collect { ev ->
-            when (ev) {
-                is AiService.StreamEvent.Delta -> { sb.append(ev.text); onDelta(sb.toString()) }
-                else -> {}
-            }
+        val append: suspend (String) -> Unit = { text ->
+            sb.append(text)
+            onDelta(sb.toString())
+        }
+        if (telemetry == null) {
+            ai.streamChat(cfg, messages).collectCompleted(onDelta = append)
+        } else {
+            collectGenerationStream(
+                cfg = cfg,
+                messages = messages,
+                telemetry = telemetry,
+                purpose = purpose,
+                onDelta = append,
+            )
         }
         return sb.toString().trim()
     }
 
+    private fun contentConflict(target: String): Nothing =
+        throw IllegalStateException("内容冲突：$target 在 AI 处理期间已被修改，已保留用户的新内容")
+
     suspend fun agentGenerateOutline(projectId: String, onDelta: (String) -> Unit = {}): String? {
         val cfg = repo.activeTextModelConfig(); if (!cfg.isValid()) return null
-        val p = repo.project(projectId) ?: return null
+        val promptSources = captureStablePromptSources(projectId, PromptSourceScope.OUTLINE) ?: return null
+        val baselineOutline = promptSources.outline.orEmpty()
+        val projectSource = promptSources.project
         val lang = _uiLanguage.value
         return withContext(Dispatchers.IO) {
             val realmCtx = buildRealmSystemContext(repo.cultivationRealms(projectId), lang).ifBlank { null }
             val messages = listOf(
                 ChatMessage("system", Prompts.outlineSystem(lang, isLong = true)),
                 ChatMessage("user", Prompts.outlineUser(
-                    p.title, p.genre.orEmpty(), p.description.orEmpty(), null, null, lang,
+                    projectSource.title, projectSource.genre, projectSource.description, null, null, lang,
                     isLong = true, realmContext = realmCtx,
                     existingWorld = repo.worldSetting(projectId).ifBlank { null },
                     existingTimeline = repo.timeline(projectId).ifBlank { null },
@@ -1521,64 +2800,226 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     charactersInfo = buildCharactersInfo(projectId),
                 )),
             )
-            val out = runCatching { streamCollect(cfg, messages, onDelta) }.getOrNull()?.takeIf { it.isNotEmpty() }
-            if (out != null) repo.setOutline(projectId, out)
+            if (!promptSourcesStillCurrent(projectId, PromptSourceScope.OUTLINE, promptSources)) {
+                contentConflict("项目大纲生成上下文")
+            }
+            val out = runSuspendCatching { streamCollect(cfg, messages, onDelta) }.getOrNull()?.takeIf { it.isNotEmpty() }
+            if (out != null) {
+                currentCoroutineContext().ensureActive()
+                if (!promptSourcesStillCurrent(projectId, PromptSourceScope.OUTLINE, promptSources) ||
+                    !repo.setOutlineIfUnchanged(projectId, baselineOutline, out)
+                ) {
+                    contentConflict("项目大纲或生成上下文")
+                }
+            }
             out
         }
     }
 
-    suspend fun agentGenerateChapterText(projectId: String, chapterId: String, onDelta: (String) -> Unit = {}): String? {
+    suspend fun agentGenerateChapterText(
+        projectId: String,
+        chapterId: String,
+        agentEngineMode: String = repo.agentEngine(),
+        agentSessionId: String = "",
+        agentActionId: String = "",
+        onDelta: (String) -> Unit = {},
+    ): String? {
         val cfg = repo.activeTextModelConfig(); if (!cfg.isValid()) return null
         val chapter = repo.chapters(projectId).firstOrNull { it.id == chapterId } ?: return null
+        val baselineBody = repo.chapterBody(chapterId)
+        val promptSources = captureStablePromptSources(
+            projectId,
+            PromptSourceScope.CHAPTER,
+            chapter.order_index,
+        ) ?: return null
         val lang = _uiLanguage.value
         return withContext(Dispatchers.IO) {
-            val arcs = repo.plotArcs(projectId)
-            val arcContext = buildArcContext(arcs, lang)
-            val realmCtx = buildRealmSystemContext(repo.cultivationRealms(projectId), lang)
+            val arcs = promptSources.arcs.map { it.toPlotArc() }
+            val realmCtx = buildRealmSystemContext(promptSources.realms, lang)
             // Per-volume realm ceiling (hard limit) for THIS chapter's owning volume — same enforcement the
             // manual generateChapter() path applies, so agent-written chapters can't drift past the limit either.
             val ownerArc = chapter.arcId?.let { aid -> arcs.firstOrNull { it.id == aid } }
                 ?: arcs.firstOrNull { (it.builtChapterIds ?: emptyList()).contains(chapter.id) }
             val volRealmConstraint = ownerArc?.volumeId
-                ?.let { vid -> repo.volumes(projectId).firstOrNull { it.id == vid } }
+                ?.let { vid -> promptSources.volumes.firstOrNull { it.id == vid } }
                 ?.let { vol -> buildVolumeRealmConstraint(vol.realmPlan, vol.name, lang, phase = "generate") }
                 ?.takeIf { it.isNotBlank() }
-            val worldRaw = repo.worldSetting(projectId).ifBlank { repo.outline(projectId) }
-            val worldSetting = listOfNotNull(arcContext.ifBlank { null }, realmCtx.ifBlank { null }, volRealmConstraint, worldRaw.ifBlank { null })
+            val worldRaw = promptSources.worldSetting.orEmpty()
+                .ifBlank { promptSources.outline.orEmpty() }
+            val worldSetting = listOfNotNull(worldRaw.ifBlank { null }, realmCtx.ifBlank { null })
                 .joinToString("\n\n").ifBlank { null }
-            val kbAug = buildKbAugmentation(projectId, chapter, lang)
+            val kbAug = buildStoryStateContext(promptSources, chapter, lang)
+            val chapterSystem = Prompts.chapterSystem(lang)
+            val budgetedContext = budgetChapterContext(
+                cfg = cfg,
+                systemPrompt = chapterSystem,
+                requiredTaskText = listOf(
+                    chapter.title,
+                    chapter.outline_goal.orEmpty(),
+                    chapter.conflict.orEmpty(),
+                    "targetWords=$TARGET_WORDS",
+                ).joinToString("\n"),
+                worldSetting = worldSetting,
+                timeline = promptSources.timeline?.ifBlank { null },
+                charactersInfo = buildCharactersInfo(projectId),
+                storyState = kbAug,
+                targetConstraints = volRealmConstraint,
+                chapterList = buildChapterList(projectId, chapter.id).ifBlank { null },
+                draftReference = null,
+            )
             val messages = listOf(
-                ChatMessage("system", Prompts.chapterSystem(lang)),
+                ChatMessage("system", chapterSystem),
                 ChatMessage("user", Prompts.chapterUser(
                     chapterTitle = chapter.title,
                     outlineGoal = chapter.outline_goal.orEmpty(),
                     conflict = chapter.conflict,
-                    prevSummary = buildPreviousChapterSummary(projectId, chapter.order_index).ifBlank { null },
+                    prevSummary = null,
                     currentContent = null,
-                    chapterList = buildChapterList(projectId, chapter.id).ifBlank { null },
-                    charactersInfo = buildCharactersInfo(projectId),
-                    worldSetting = worldSetting,
-                    timeline = repo.timeline(projectId).ifBlank { null },
+                    chapterList = budgetedContext.chapterList,
+                    charactersInfo = budgetedContext.charactersInfo,
+                    worldSetting = budgetedContext.worldSetting,
+                    timeline = budgetedContext.timeline,
                     targetWords = TARGET_WORDS,
                     isContinuation = false,
                     language = lang,
-                    kbAugmentation = kbAug,
+                    kbAugmentation = budgetedContext.storyState,
+                    targetConstraints = budgetedContext.targetConstraints,
                 )),
             )
-            val text = runCatching { streamCollect(cfg, messages, onDelta) }.getOrNull()?.takeIf { it.isNotEmpty() }
-            if (text != null) {
-                repo.saveChapterBody(chapterId, repo.chapterBody(chapterId).copy(final = text))
-                repo.upsertChapter(projectId, chapter.copy(word_count = countWords(text), updated_at = nowIso(), status = "review"))
-                onChapterSaved(projectId, chapterId, chapter.title, text)
+            if (!promptSourcesStillCurrent(
+                    projectId,
+                    PromptSourceScope.CHAPTER,
+                    promptSources,
+                    chapter.order_index,
+                ) || repo.chapters(projectId).firstOrNull { it.id == chapterId } != chapter ||
+                repo.chapterBody(chapterId) != baselineBody
+            ) {
+                contentConflict("章节正文或完整规划上下文")
             }
-            text
+            val expectedSource = GenerationSourceFingerprint.capture(
+                chapter,
+                baselineBody.draft,
+                baselineBody.final,
+            )
+            val active = novelGenerationEngine.startWithContextRecheck(
+                NovelGenerationEngine.Request(
+                    projectId = projectId,
+                    chapter = chapter,
+                    targetWords = TARGET_WORDS,
+                    language = lang,
+                    baselineText = "",
+                    requireNetNewBody = false,
+                    contextManifest = promptContextManifest(PromptSourceScope.CHAPTER, promptSources),
+                    expectedSourceHash = expectedSource.sourceHash,
+                    initiator = GenerationRun.INITIATOR_AGENT,
+                    agentEngine = agentEngineMode,
+                    agentSessionId = agentSessionId.takeIf { it.isNotBlank() },
+                    agentActionId = agentActionId.takeIf { it.isNotBlank() },
+                    operation = GenerationRun.OPERATION_GENERATE,
+                ),
+                currentContextManifest = {
+                    capturePromptSources(
+                        projectId,
+                        PromptSourceScope.CHAPTER,
+                        chapter.order_index,
+                    )?.let { live ->
+                        promptContextManifest(PromptSourceScope.CHAPTER, live)
+                    }
+                },
+            ) ?: return@withContext null
+            ChapterGenerationExecutions.replace(
+                projectId,
+                chapterId,
+                active.run.id,
+                checkNotNull(currentCoroutineContext()[Job]) { "Missing generation coroutine job" },
+            )
+            val generationTelemetry = GenerationTelemetryCollector.forModel(
+                cfg,
+                "chapter.agent_generate.v2",
+            )
+            try {
+                if (!promptSourcesStillCurrent(
+                        projectId,
+                        PromptSourceScope.CHAPTER,
+                        promptSources,
+                        chapter.order_index,
+                    ) || repo.chapters(projectId).firstOrNull { it.id == chapterId } != chapter ||
+                    repo.chapterBody(chapterId) != baselineBody
+                ) {
+                    val category = GenerationTelemetry.FAILURE_SOURCE_CONFLICT
+                    novelGenerationEngine.fail(
+                        active,
+                        GenerationTelemetryCollector.persistedFailureMessage(category),
+                        generationTelemetry.finishFailed(category),
+                    )
+                    contentConflict("章节正文或完整规划上下文")
+                }
+                val text = streamCollect(
+                    cfg,
+                    messages,
+                    onDelta,
+                    telemetry = generationTelemetry,
+                    purpose = "chapter_agent_generate",
+                ).takeIf { it.isNotEmpty() }
+                    ?: error("模型返回了空正文")
+                currentCoroutineContext().ensureActive()
+                if (
+                    repo.project(projectId) == null ||
+                    repo.chapters(projectId).firstOrNull { it.id == chapterId } != chapter ||
+                    repo.chapterBody(chapterId) != baselineBody ||
+                    !promptSourcesStillCurrent(
+                        projectId,
+                        PromptSourceScope.CHAPTER,
+                        promptSources,
+                        chapter.order_index,
+                    )
+                ) {
+                    val category = GenerationTelemetry.FAILURE_SOURCE_CONFLICT
+                    novelGenerationEngine.fail(
+                        active,
+                        GenerationTelemetryCollector.persistedFailureMessage(category),
+                        generationTelemetry.finishFailed(category),
+                    )
+                    contentConflict("章节正文、章节信息或完整规划上下文")
+                }
+                if (completeGenerationCandidate(active, text, generationTelemetry) == null) {
+                    if (generationRunWasSuperseded(projectId, active.run.id)) {
+                        throw CancellationException("Generation superseded")
+                    }
+                    error("候选稿完成状态写入失败")
+                }
+                text
+            } catch (cancelled: CancellationException) {
+                val category = generationCancellationCategory(projectId, active.run.id)
+                val telemetry = generationTelemetry.finishCancelled(category)
+                novelGenerationEngine.cancel(
+                    active,
+                    GenerationTelemetryCollector.persistedFailureMessage(category),
+                    telemetry.takeIf { it.outcome == GenerationTelemetry.OUTCOME_CANCELLED },
+                )
+                throw cancelled
+            } catch (error: Throwable) {
+                val category = GenerationTelemetryCollector.failureCategory(error)
+                val telemetry = generationTelemetry.finishFailed(category)
+                novelGenerationEngine.fail(
+                    active,
+                    GenerationTelemetryCollector.persistedFailureMessage(category),
+                    telemetry.takeIf { it.outcome == GenerationTelemetry.OUTCOME_FAILED },
+                )
+                throw error
+            } finally {
+                ChapterGenerationExecutions.unregister(projectId, chapterId, active.run.id)
+            }
         }
     }
 
     /** Scan a chapter's text for characters (esp. new ones not yet registered) and add the new
      *  ones to the character manager. Returns the list of newly-added names. */
     suspend fun agentExtractCharactersFromChapter(projectId: String, chapterId: String): List<String> {
-        val cfg = repo.activeTextModelConfig(); if (!cfg.isValid()) return emptyList()
+        val cfg = repo.activeTextModelConfig()
+        if (!cfg.isValid()) throw IllegalStateException("角色提取失败：请先配置可用的文本模型")
+        val chapter = repo.chapters(projectId).firstOrNull { it.id == chapterId }
+            ?: throw IllegalStateException("角色提取失败：未找到章节")
         val body = repo.chapterBody(chapterId)
         val text = body.final.ifBlank { body.draft }
         if (text.isBlank()) return emptyList()
@@ -1598,10 +3039,25 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     append(if (lang == "en") "Output the JSON character array." else "请输出 JSON 角色数组。")
                 }),
             )
-            val reply = runCatching { ai.chat(cfg, messages) }.getOrNull() ?: return@withContext emptyList()
+            val reply = runSuspendCatching { ai.chat(cfg, messages) }.getOrElse {
+                throw IllegalStateException("角色提取失败：文本模型调用失败", it)
+            }
             val parsed = parseCharsFromAiText(reply).filter { it.name.isNotBlank() && it.name !in existingNames }
-            if (parsed.isNotEmpty()) repo.setCharacters(projectId, existing + parsed)
-            parsed.map { it.name }
+            if (parsed.isEmpty()) return@withContext emptyList()
+            currentCoroutineContext().ensureActive()
+            val added = repo.withChapterTransaction {
+                if (
+                    repo.project(projectId) == null ||
+                    repo.chapters(projectId).firstOrNull { it.id == chapterId } != chapter ||
+                    repo.chapterBody(chapterId) != body ||
+                    repo.characters(projectId) != existing
+                ) {
+                    contentConflict("章节正文、章节信息或角色列表")
+                } else {
+                    repo.mergeCharactersIfProjectExists(projectId, parsed)
+                }
+            }
+            added.map { it.name }
         }
     }
 
@@ -1631,7 +3087,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     append(ctx)
                 }),
             )
-            val reply = runCatching { ai.chat(cfg, messages) }.getOrNull() ?: return@withContext null
+            val reply = runSuspendCatching { ai.chat(cfg, messages) }.getOrNull() ?: return@withContext null
             val s = reply.replace(Regex("```(?:json)?\\s*"), "").replace("```", "").trim()
             val start = s.indexOf('{'); val end = s.lastIndexOf('}')
             if (start < 0 || end <= start) return@withContext null
@@ -1640,33 +3096,246 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             fun str(k: String) = (o[k] as? kotlinx.serialization.json.JsonPrimitive)?.content?.trim()
             val goal = str("goal"); val conflict = str("conflict")
             if (goal.isNullOrBlank() && conflict.isNullOrBlank()) return@withContext null
-            repo.upsertChapter(projectId, chapter.copy(
-                outline_goal = goal ?: chapter.outline_goal,
-                conflict = conflict ?: chapter.conflict,
-                updated_at = nowIso(),
-            ))
+            currentCoroutineContext().ensureActive()
+            val committed = repo.withChapterTransaction {
+                val latestChapter = repo.chapters(projectId).firstOrNull { it.id == chapterId }
+                if (repo.project(projectId) == null || latestChapter != chapter) {
+                    false
+                } else {
+                    repo.upsertChapter(projectId, latestChapter.copy(
+                        outline_goal = goal ?: latestChapter.outline_goal,
+                        conflict = conflict ?: latestChapter.conflict,
+                        updated_at = nowIso(),
+                    ))
+                    true
+                }
+            }
+            if (!committed) contentConflict("章节规划")
             "目标：${goal.orEmpty()}\n冲突：${conflict.orEmpty()}"
         }
     }
 
-    suspend fun agentReviseChapter(projectId: String, chapterId: String, instruction: String, onDelta: (String) -> Unit = {}): String? {
+    suspend fun agentReviseChapter(
+        projectId: String,
+        chapterId: String,
+        instruction: String,
+        agentEngineMode: String = repo.agentEngine(),
+        agentSessionId: String = "",
+        agentActionId: String = "",
+        onDelta: (String) -> Unit = {},
+    ): String? {
         val cfg = repo.activeTextModelConfig(); if (!cfg.isValid()) return null
         val chapter = repo.chapters(projectId).firstOrNull { it.id == chapterId } ?: return null
         val body = repo.chapterBody(chapterId)
         val src = body.final.ifBlank { body.draft }
         if (src.isBlank()) return null
+        val promptSources = captureStablePromptSources(
+            projectId,
+            PromptSourceScope.CHAPTER,
+            chapter.order_index,
+        ) ?: return null
+        val lang = _uiLanguage.value
         return withContext(Dispatchers.IO) {
-            val messages = listOf(
-                ChatMessage("system", "你是资深小说编辑。请按用户要求修改给定章节正文，只输出修改后的完整正文，不要任何解释或标记。"),
-                ChatMessage("user", "原文：\n$src\n\n修改要求：$instruction"),
-            )
-            val out = runCatching { streamCollect(cfg, messages, onDelta) }.getOrNull()?.takeIf { it.isNotEmpty() }
-            if (out != null) {
-                repo.saveChapterBody(chapterId, body.copy(final = out))
-                repo.upsertChapter(projectId, chapter.copy(word_count = countWords(out), updated_at = nowIso()))
-                onChapterSaved(projectId, chapterId, chapter.title, out)
+            val arcs = promptSources.arcs.map { it.toPlotArc() }
+            val realmContext = buildRealmSystemContext(promptSources.realms, lang)
+            val ownerArc = chapter.arcId?.let { id -> arcs.firstOrNull { it.id == id } }
+                ?: arcs.firstOrNull { (it.builtChapterIds ?: emptyList()).contains(chapter.id) }
+            val volumeConstraint = ownerArc?.volumeId
+                ?.let { id -> promptSources.volumes.firstOrNull { it.id == id } }
+                ?.let { volume ->
+                    buildVolumeRealmConstraint(
+                        volume.realmPlan,
+                        volume.name,
+                        lang,
+                        phase = "generate",
+                    )
+                }
+                ?.takeIf { it.isNotBlank() }
+            val worldRaw = promptSources.worldSetting.orEmpty()
+                .ifBlank { promptSources.outline.orEmpty() }
+            val worldContext = listOfNotNull(
+                worldRaw.ifBlank { null },
+                realmContext.ifBlank { null },
+            ).joinToString("\n\n").ifBlank { null }
+            val targetConstraints = volumeConstraint
+            val chapterList = buildChapterList(projectId, chapter.id).ifBlank { null }
+            val characters = buildCharactersInfo(projectId)
+            val timeline = promptSources.timeline?.ifBlank { null }
+            val kbAugmentation = buildStoryStateContext(promptSources, chapter, lang)
+            val revisionSystem = if (lang == "en") {
+                "You are a senior fiction editor. Rewrite the complete chapter to satisfy " +
+                    "the instruction while preserving story continuity. Output prose only."
+            } else {
+                "你是资深小说编辑。请结合完整小说上下文按要求重写整章，保持人物、世界观与前文连续；只输出修改后的完整正文。"
             }
-            out
+            val budgetedContext = budgetChapterContext(
+                cfg = cfg,
+                systemPrompt = revisionSystem,
+                // Original prose and the author's revision instruction are never silently cut.
+                requiredTaskText = listOf(
+                    chapter.title,
+                    chapter.outline_goal.orEmpty(),
+                    chapter.conflict.orEmpty(),
+                    src,
+                    instruction,
+                ).joinToString("\n"),
+                worldSetting = worldContext,
+                timeline = timeline,
+                charactersInfo = characters,
+                storyState = kbAugmentation,
+                targetConstraints = targetConstraints,
+                chapterList = chapterList,
+                draftReference = null,
+            )
+            val messages = listOf(
+                ChatMessage("system", revisionSystem),
+                ChatMessage("user", buildString {
+                    appendLine(if (lang == "en") "Chapter: " + chapter.title else "章节：" + chapter.title)
+                    appendLine(if (lang == "en") "Goal: " + chapter.outline_goal.orEmpty() else "本章目标：" + chapter.outline_goal.orEmpty())
+                    appendLine(if (lang == "en") "Conflict: " + chapter.conflict.orEmpty() else "核心冲突：" + chapter.conflict.orEmpty())
+                    budgetedContext.worldSetting?.let { appendLine("\n【世界与约束】\n" + it) }
+                    budgetedContext.timeline?.let { appendLine("\n【时间线】\n" + it) }
+                    budgetedContext.charactersInfo?.let { appendLine("\n【角色】\n" + it) }
+                    budgetedContext.storyState?.let {
+                        appendLine(
+                            if (lang == "en") {
+                                "\n[Compiled Story State v2]\n$it"
+                            } else {
+                                "\n【编译小说状态 v2】\n$it"
+                            },
+                        )
+                    }
+                    budgetedContext.targetConstraints?.let { appendLine("\n【目标章节约束】\n" + it) }
+                    budgetedContext.chapterList?.let { appendLine("\n【章节结构】\n" + it) }
+                    appendLine("\n【原文】\n" + src)
+                    appendLine("\n【修改要求】\n" + instruction)
+                }),
+            )
+            if (!promptSourcesStillCurrent(
+                    projectId,
+                    PromptSourceScope.CHAPTER,
+                    promptSources,
+                    chapter.order_index,
+                ) || repo.chapters(projectId).firstOrNull { it.id == chapterId } != chapter ||
+                repo.chapterBody(chapterId) != body
+            ) {
+                contentConflict("章节正文或完整修订上下文")
+            }
+            val expectedSource = GenerationSourceFingerprint.capture(
+                chapter,
+                body.draft,
+                body.final,
+            )
+            val active = novelGenerationEngine.startWithContextRecheck(
+                NovelGenerationEngine.Request(
+                    projectId = projectId,
+                    chapter = chapter,
+                    targetWords = countWords(src),
+                    language = lang,
+                    baselineText = src,
+                    requireNetNewBody = false,
+                    constraints = listOf(instruction),
+                    contextManifest = promptContextManifest(PromptSourceScope.CHAPTER, promptSources),
+                    expectedSourceHash = expectedSource.sourceHash,
+                    initiator = GenerationRun.INITIATOR_AGENT,
+                    agentEngine = agentEngineMode,
+                    agentSessionId = agentSessionId.takeIf { it.isNotBlank() },
+                    agentActionId = agentActionId.takeIf { it.isNotBlank() },
+                    operation = GenerationRun.OPERATION_REVISE,
+                ),
+                currentContextManifest = {
+                    capturePromptSources(
+                        projectId,
+                        PromptSourceScope.CHAPTER,
+                        chapter.order_index,
+                    )?.let { live ->
+                        promptContextManifest(PromptSourceScope.CHAPTER, live)
+                    }
+                },
+            ) ?: return@withContext null
+            ChapterGenerationExecutions.replace(
+                projectId,
+                chapterId,
+                active.run.id,
+                checkNotNull(currentCoroutineContext()[Job]) { "Missing generation coroutine job" },
+            )
+            val generationTelemetry = GenerationTelemetryCollector.forModel(
+                cfg,
+                "chapter.agent_revise.v2",
+            )
+            try {
+                if (!promptSourcesStillCurrent(
+                        projectId,
+                        PromptSourceScope.CHAPTER,
+                        promptSources,
+                        chapter.order_index,
+                    ) || repo.chapters(projectId).firstOrNull { it.id == chapterId } != chapter ||
+                    repo.chapterBody(chapterId) != body
+                ) {
+                    val category = GenerationTelemetry.FAILURE_SOURCE_CONFLICT
+                    novelGenerationEngine.fail(
+                        active,
+                        GenerationTelemetryCollector.persistedFailureMessage(category),
+                        generationTelemetry.finishFailed(category),
+                    )
+                    contentConflict("章节正文或完整修订上下文")
+                }
+                val out = streamCollect(
+                    cfg,
+                    messages,
+                    onDelta,
+                    telemetry = generationTelemetry,
+                    purpose = "chapter_agent_revise",
+                ).takeIf { it.isNotEmpty() }
+                    ?: error("模型返回了空正文")
+                currentCoroutineContext().ensureActive()
+                if (
+                    repo.project(projectId) == null ||
+                    repo.chapters(projectId).firstOrNull { it.id == chapterId } != chapter ||
+                    repo.chapterBody(chapterId) != body ||
+                    !promptSourcesStillCurrent(
+                        projectId,
+                        PromptSourceScope.CHAPTER,
+                        promptSources,
+                        chapter.order_index,
+                    )
+                ) {
+                    val category = GenerationTelemetry.FAILURE_SOURCE_CONFLICT
+                    novelGenerationEngine.fail(
+                        active,
+                        GenerationTelemetryCollector.persistedFailureMessage(category),
+                        generationTelemetry.finishFailed(category),
+                    )
+                    contentConflict("章节正文或完整修订上下文")
+                }
+                if (completeGenerationCandidate(active, out, generationTelemetry) == null) {
+                    if (generationRunWasSuperseded(projectId, active.run.id)) {
+                        throw CancellationException("Generation superseded")
+                    }
+                    error("修订候选稿完成状态写入失败")
+                }
+                out
+            } catch (cancelled: CancellationException) {
+                val category = generationCancellationCategory(projectId, active.run.id)
+                val telemetry = generationTelemetry.finishCancelled(category)
+                novelGenerationEngine.cancel(
+                    active,
+                    GenerationTelemetryCollector.persistedFailureMessage(category),
+                    telemetry.takeIf { it.outcome == GenerationTelemetry.OUTCOME_CANCELLED },
+                )
+                throw cancelled
+            } catch (error: Throwable) {
+                val category = GenerationTelemetryCollector.failureCategory(error)
+                val telemetry = generationTelemetry.finishFailed(category)
+                novelGenerationEngine.fail(
+                    active,
+                    GenerationTelemetryCollector.persistedFailureMessage(category),
+                    telemetry.takeIf { it.outcome == GenerationTelemetry.OUTCOME_FAILED },
+                )
+                throw error
+            } finally {
+                ChapterGenerationExecutions.unregister(projectId, chapterId, active.run.id)
+            }
         }
     }
 
@@ -1679,7 +3348,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 ChatMessage("system", novelQaSystemPrompt(lang)),
                 ChatMessage("user", "【小说资料】\n${ctx.ifBlank { "（暂无资料）" }}\n\n【问题】\n$question"),
             )
-            runCatching { ai.chat(cfg, messages) }.getOrNull()?.trim() ?: "（检索失败）"
+            runSuspendCatching { ai.chat(cfg, messages) }.getOrNull()?.trim() ?: "（检索失败）"
         }
     }
 
@@ -1689,7 +3358,16 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         val arc = repo.plotArcs(projectId).firstOrNull { it.id == arcId } ?: return 0
         val lang = _uiLanguage.value
         return withContext(Dispatchers.IO) {
-            val nextOrder = (repo.chapters(projectId).maxOfOrNull { it.order_index } ?: 0) + 1
+            val baselineChapters = repo.chapters(projectId)
+            val nextOrder = (baselineChapters.maxOfOrNull { it.order_index } ?: 0) + 1
+            val promptSources = captureStablePromptSources(
+                projectId,
+                PromptSourceScope.PLANNING,
+                nextOrder,
+            ) ?: contentConflict("弧线章节规划上下文")
+            if (repo.chapters(projectId) != baselineChapters) {
+                contentConflict("弧线章节规划上下文")
+            }
             // Full planning context so arc chapters are planned against the whole project state.
             val ctx = buildPlanningContext(
                 projectId = projectId, arc = arc, query = "${arc.title}\n${arc.summary}", lang = lang,
@@ -1699,10 +3377,38 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 ChatMessage("system", "你为某条剧情弧线规划具体章节。只输出 JSON 数组：[{\"title\":\"章节名\",\"goal\":\"本章目标(1-2句)\"}]，不要任何其它文字。"),
                 ChatMessage("user", "弧线：${arc.title}\n${arc.summary}\n请规划 $count 个章节。\n参考资料：\n$ctx"),
             )
-            val reply = runCatching { ai.chat(cfg, messages) }.getOrNull() ?: return@withContext 0
+            if (!promptSourcesStillCurrent(
+                    projectId,
+                    PromptSourceScope.PLANNING,
+                    promptSources,
+                    nextOrder,
+                ) || repo.plotArcs(projectId).firstOrNull { it.id == arcId } != arc ||
+                repo.chapters(projectId) != baselineChapters
+            ) {
+                contentConflict("弧线章节规划上下文")
+            }
+            val reply = runSuspendCatching { ai.chat(cfg, messages) }.getOrNull() ?: return@withContext 0
             val items = parseChapterPlanArray(reply)
-            if (items.isNotEmpty()) withContext(Dispatchers.Main) { addChaptersBatch(projectId, arcId, items) }
-            items.size
+            if (items.isEmpty()) return@withContext 0
+            currentCoroutineContext().ensureActive()
+            if (!promptSourcesStillCurrent(
+                    projectId,
+                    PromptSourceScope.PLANNING,
+                    promptSources,
+                    nextOrder,
+                ) || repo.plotArcs(projectId).firstOrNull { it.id == arcId } != arc ||
+                repo.chapters(projectId) != baselineChapters
+            ) {
+                contentConflict("弧线章节规划上下文或章节集合")
+            }
+            val added = addChaptersBatchAgainst(
+                projectId,
+                arc,
+                items,
+                expectedChapters = baselineChapters,
+            )
+            if (added.isEmpty()) contentConflict("弧线章节规划上下文或章节集合")
+            added.size
         }
     }
 
@@ -1729,7 +3435,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     appendLine("【各章梗概/节选】\n$lines")
                 }),
             )
-            runCatching { streamCollect(cfg, messages, onDelta) }.getOrNull()?.takeIf { it.isNotEmpty() } ?: "（审阅失败）"
+            runSuspendCatching { streamCollect(cfg, messages, onDelta) }.getOrNull()?.takeIf { it.isNotEmpty() } ?: "（审阅失败）"
         }
     }
 
@@ -1750,16 +3456,33 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun generateCharactersFromOutline(
         projectId: String,
         onComplete: (List<Character>) -> Unit,
-    ) {
+    ): Job? = generateCharactersFromOutlineWithSource(projectId) { parsed, _ -> onComplete(parsed) }
+
+    fun generateCharactersFromOutlineWithSource(
+        projectId: String,
+        onComplete: (List<Character>, sourceOutline: String) -> Unit,
+    ): Job? {
         val cfg = repo.activeTextModelConfig()
         if (!cfg.isValid()) {
             _statusMessage.value = "请先在「设置」中配置可用的文本模型 / Configure a text model first."
-            return
+            return null
         }
-        val outline = repo.outline(projectId)
+        val ticket = claimStreamingGeneration("")
+        val promptSources = captureStablePromptSources(
+            projectId,
+            PromptSourceScope.CHARACTERS_FROM_OUTLINE,
+        )
+        if (promptSources == null) {
+            abandonStreamingGeneration(ticket, "角色生成上下文正在变化或项目已删除，请稍后重试")
+            return null
+        }
+        val outline = promptSources.outline.orEmpty()
         if (outline.isBlank()) {
-            _statusMessage.value = "尚无大纲，请先生成大纲 / No outline yet — generate one first."
-            return
+            abandonStreamingGeneration(
+                ticket,
+                "尚无大纲，请先生成大纲 / No outline yet — generate one first.",
+            )
+            return null
         }
         val lang = _uiLanguage.value
         val realmCtx = buildRealmSystemContext(repo.cultivationRealms(projectId), lang)
@@ -1768,23 +3491,37 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             ChatMessage("system", Prompts.charsFromOutlineSystem(lang)),
             ChatMessage("user", Prompts.charsFromOutlineUser(outlineWithCtx, lang)),
         )
-        streamingJob?.cancel()
-        _streamingText.value = ""
-        _isGenerating.value = true
-        streamingJob = viewModelScope.launch(Dispatchers.IO) {
-            try {
-                ai.streamChat(cfg, messages).collect { ev ->
-                    when (ev) {
-                        is AiService.StreamEvent.Delta -> _streamingText.value = _streamingText.value + ev.text
-                        AiService.StreamEvent.Done -> {}
-                        is AiService.StreamEvent.Error -> _statusMessage.value = "生成失败：${ev.message}"
+        return launchStreamingGeneration(ticket) { revision, buffer ->
+            if (!promptSourcesStillCurrent(
+                    projectId,
+                    PromptSourceScope.CHARACTERS_FROM_OUTLINE,
+                    promptSources,
+                )
+            ) {
+                contentConflict("大纲、境界体系或项目")
+            }
+            ai.streamChat(cfg, messages).collectCompleted(
+                onDelta = { text -> appendStreamingText(revision, buffer, text) },
+                onFailure = { message -> streamingError(revision, "生成失败：$message") },
+            )
+            ensureStreamingOwner(revision)
+            val parsed = parseCharsFromAiText(buffer.toString())
+            val committed = withContext(Dispatchers.Main) {
+                commitIfStreamingOwner(revision) {
+                    if (!promptSourcesStillCurrent(
+                            projectId,
+                            PromptSourceScope.CHARACTERS_FROM_OUTLINE,
+                            promptSources,
+                        )
+                    ) {
+                        false
+                    } else {
+                        onComplete(parsed, outline)
+                        true
                     }
                 }
-                val parsed = parseCharsFromAiText(_streamingText.value)
-                withContext(Dispatchers.Main) { onComplete(parsed) }
-            } finally {
-                _isGenerating.value = false
             }
+            if (!committed) contentConflict("大纲、境界体系或项目")
         }
     }
 
@@ -1850,8 +3587,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
 
 
-    fun buildBackupJson(): String {
-        val bundle = repo.buildBackupBundle()
+    fun buildBackupJson(includeSecrets: Boolean = false): String {
+        val bundle = repo.buildBackupBundle(includeSecrets)
         return AppRepository.JSON.encodeToString(BackupBundle.serializer(), bundle)
     }
 
@@ -1883,11 +3620,23 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     fun confirmImport(includeAppSettings: Boolean) {
         val preview = _importPreview.value ?: return
-        repo.importBackup(preview.bundle, includeAppSettings)
-        val merged = preview.summary.projectIdsInBackup
+        // Close the confirmation immediately so repeated taps cannot launch overlapping imports.
+        // A failed import restores the preview, allowing the user to inspect/retry the same file.
         _importPreview.value = null
-        _statusMessage.value = "Import done: merged metadata for $merged projects." +
-            if (includeAppSettings) " App settings (incl. API keys) overwritten." else ""
+        viewModelScope.launch {
+            _statusMessage.value = "正在校验并导入备份… / Validating and importing backup…"
+            val result = withContext(Dispatchers.IO) {
+                runCatching { repo.importBackup(preview.bundle, includeAppSettings) }
+            }
+            result.onSuccess {
+                val merged = preview.summary.projectIdsInBackup
+                _statusMessage.value = "Import done: merged metadata for $merged projects." +
+                    if (includeAppSettings) " App settings and any included API keys imported." else ""
+            }.onFailure { error ->
+                _importPreview.value = preview
+                _statusMessage.value = error.message ?: "Import failed."
+            }
+        }
     }
 
     fun clearStatus() { _statusMessage.value = "" }
@@ -1897,6 +3646,443 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun clearStreaming() { _streamingText.value = "" }
 
     // ── private helpers ───────────────────────────────────────────────────
+
+    /** Capture only fields that can be rendered into the selected prompt, plus the target
+     * collection for collection-producing calls. Repository lists are immutable data snapshots;
+     * the caller performs a second identical capture before beginning provider I/O. */
+    private fun capturePromptSources(
+        projectId: String,
+        scope: PromptSourceScope,
+        currentOrderIndex: Int? = null,
+    ): PromptSourceSnapshot? {
+        val project = repo.project(projectId) ?: return null
+        val fullProjectMetadata = scope == PromptSourceScope.OUTLINE ||
+            scope == PromptSourceScope.PLANNING || scope == PromptSourceScope.PLOT_ARC
+
+        val includeFullCharacters = scope == PromptSourceScope.OUTLINE ||
+            scope == PromptSourceScope.CHAPTER || scope == PromptSourceScope.PLANNING ||
+            scope == PromptSourceScope.PLOT_ARC
+        val includeGrowth = scope == PromptSourceScope.CHAPTER || scope == PromptSourceScope.PLANNING
+        val includeVolumes = scope == PromptSourceScope.CHAPTER ||
+            scope == PromptSourceScope.PLANNING || scope == PromptSourceScope.VOLUME_COLLECTION ||
+            scope == PromptSourceScope.ARC_COLLECTION
+        val includeArcs = scope == PromptSourceScope.CHAPTER ||
+            scope == PromptSourceScope.PLANNING || scope == PromptSourceScope.ARC_COLLECTION ||
+            scope == PromptSourceScope.PLOT_ARC
+        val includeDirectChapters = scope == PromptSourceScope.CHAPTER || scope == PromptSourceScope.PLANNING
+        val includeKb = scope == PromptSourceScope.CHAPTER || scope == PromptSourceScope.PLANNING
+
+        val selectedContainers = when (scope) {
+            PromptSourceScope.CHAPTER -> repo.containers(projectId).filter { it.affectsGeneration }
+            PromptSourceScope.PLANNING -> repo.containers(projectId)
+            PromptSourceScope.VOLUME_COLLECTION -> repo.containers(projectId).filter { it.affectsVolumeGeneration }
+            PromptSourceScope.ARC_COLLECTION -> repo.containers(projectId).filter { it.affectsArcGeneration }
+            else -> emptyList()
+        }
+        val needsCharacterKeys = selectedContainers.any { it.type == Container.BY_CHARACTER }
+        val needsChapterKeys = selectedContainers.any { it.type == Container.BY_CHAPTER }
+        val rawCharacters = if (includeFullCharacters || needsCharacterKeys || includeGrowth) {
+            repo.characters(projectId)
+        } else {
+            emptyList()
+        }
+        val rawChapters = if (includeDirectChapters || needsChapterKeys) repo.chapters(projectId) else emptyList()
+        val rawArcs = if (includeArcs) repo.plotArcs(projectId) else emptyList()
+        val temporalTargetOrder = currentOrderIndex.takeIf { scope == PromptSourceScope.CHAPTER }
+        val chapterOrdersById = rawChapters.associate { it.id to it.order_index }
+        fun sourceVisible(sourceChapterId: String?, sourceChapterOrder: Int?): Boolean =
+            StoryStateVisibility.isVisibleBefore(
+                targetChapterOrder = temporalTargetOrder,
+                sourceChapterId = sourceChapterId,
+                sourceChapterOrder = sourceChapterOrder,
+                chapterOrdersById = chapterOrdersById,
+            )
+
+        // Global currentRealm has no chapter provenance. It is safe only for a genuinely blank
+        // append target after every written chapter. Read effective bodies when legacy word_count is
+        // missing so rewrites cannot accidentally receive an end-of-chapter/future realm.
+        val hasWrittenTargetOrFutureChapter = if (temporalTargetOrder == null) {
+            false
+        } else {
+            DerivedChapterMutation.hasWrittenAtOrAfter(
+                temporalTargetOrder,
+                rawChapters.asSequence()
+                    .filter { it.order_index >= temporalTargetOrder }
+                    .map { source ->
+                        val effectiveText = if (source.word_count > 0) {
+                            ""
+                        } else {
+                            repo.chapterBody(source.id).let { body ->
+                                DerivedChapterMutation.effectiveText(body.draft, body.final)
+                            }
+                        }
+                        DerivedChapterMutation.Presence(
+                            orderIndex = source.order_index,
+                            wordCount = source.word_count,
+                            effectiveText = effectiveText,
+                        )
+                    }
+                    .toList(),
+            )
+        }
+
+        val characterSources = rawCharacters.map { character ->
+            PromptCharacterSource(
+                id = character.id,
+                name = character.name,
+                gender = character.gender.takeIf { includeFullCharacters }.orEmpty(),
+                role = character.role.takeIf { includeFullCharacters }.orEmpty(),
+                personality = character.personality.takeIf { includeFullCharacters }.orEmpty(),
+                appearance = character.appearance.takeIf { includeFullCharacters }.orEmpty(),
+                motivation = character.motivation.takeIf { includeFullCharacters }.orEmpty(),
+                currentRealmId = character.currentRealmId.takeIf {
+                    includeFullCharacters && !hasWrittenTargetOrFutureChapter
+                },
+                currentSubRealmId = character.currentSubRealmId.takeIf {
+                    includeFullCharacters && !hasWrittenTargetOrFutureChapter
+                },
+            )
+        }
+        val chapterSources = rawChapters.map { chapter ->
+            PromptChapterSource(
+                id = chapter.id,
+                title = chapter.title,
+                orderIndex = chapter.order_index,
+                outlineGoal = chapter.outline_goal.takeIf { includeDirectChapters },
+                conflict = chapter.conflict.takeIf { includeDirectChapters },
+                wordCount = chapter.word_count.takeIf { includeDirectChapters } ?: 0,
+                arcId = chapter.arcId.takeIf { includeDirectChapters },
+            )
+        }
+        val previousBodies = if (includeDirectChapters && currentOrderIndex != null) {
+            rawChapters.asSequence()
+                .filter { it.order_index < currentOrderIndex }
+                .sortedBy { it.order_index }
+                .map { it.id to repo.chapterBody(it.id) }
+                .toList()
+        } else {
+            emptyList()
+        }
+
+        val recentContainerChapterCount = if (scope == PromptSourceScope.PLANNING) 5 else 3
+        val eligibleContainerChapters = if (
+            scope == PromptSourceScope.CHAPTER && currentOrderIndex != null
+        ) {
+            // Never leak state attached to planned/future chapters into the current chapter prompt.
+            rawChapters.filter { it.order_index < currentOrderIndex }
+        } else {
+            rawChapters
+        }
+        val recentContainerChapters = eligibleContainerChapters
+            .sortedBy { it.order_index }
+            .takeLast(recentContainerChapterCount)
+        val containerValues = selectedContainers.flatMap { container ->
+            val blockKeys = when (container.type) {
+                Container.BY_CHARACTER -> rawCharacters.map { it.id }
+                Container.BY_CHAPTER -> recentContainerChapters.map { it.id }
+                else -> listOf(Container.SINGLE_BLOCK_KEY)
+            }
+            blockKeys.map { blockKey ->
+                val latestVisible = repo.containerEntries(projectId, container.id, blockKey)
+                    .lastOrNull { sourceVisible(it.sourceChapterId, it.sourceChapterOrder) }
+                PromptContainerValueSource(
+                    containerId = container.id,
+                    blockKey = blockKey,
+                    latest = latestVisible,
+                )
+            }
+        }
+
+        val summariesEnabled = if (scope == PromptSourceScope.CHAPTER) repo.summariesEnabled() else null
+        val relevantSummaries = if (summariesEnabled == true) {
+            val activeArcIds = rawArcs.filter { it.status == "active" || it.status == "ending" }.map { it.id }.toSet()
+            val recentChapterIds = previousBodies.takeLast(3).map { it.first }.toSet()
+            repo.summaries(projectId).filter { summary ->
+                !summary.isStale && when (summary.scopeType) {
+                    // Roll-ups have no covered-through/source hash. They are safe only for a truly
+                    // new blank append target; a rewrite could otherwise see its own old ending.
+                    "book" -> !hasWrittenTargetOrFutureChapter && summary.scopeId == projectId
+                    "arc" -> !hasWrittenTargetOrFutureChapter && summary.scopeId in activeArcIds
+                    "chapter" -> summary.scopeId in recentChapterIds
+                    else -> false
+                }
+            }
+        } else {
+            emptyList()
+        }
+        val entitiesEnabled = if (scope == PromptSourceScope.CHAPTER) repo.entitiesEnabled() else null
+        val relevantEntities = if (entitiesEnabled == true) {
+            repo.entities(projectId).mapNotNull { entity ->
+                when (StoryStateVisibility.entityProjectionBefore(
+                    targetChapterOrder = temporalTargetOrder,
+                    historicalTarget = hasWrittenTargetOrFutureChapter,
+                    currentStatus = entity.status,
+                    firstSeenChapterId = entity.firstSeenChapterId,
+                    lastSeenChapterId = entity.lastSeenChapterId,
+                    chapterOrdersById = chapterOrdersById,
+                )) {
+                    StoryStateVisibility.EntityProjection.FULL -> entity
+                    StoryStateVisibility.EntityProjection.IDENTITY_ONLY -> entity.copy(
+                        aliases = emptyList(),
+                        summary = "",
+                        status = "open",
+                        lastSeenChapterId = null,
+                    )
+                    StoryStateVisibility.EntityProjection.HIDDEN -> null
+                }
+            }
+        } else {
+            emptyList()
+        }
+        val knowledgeBaseEnabled = if (includeKb) repo.knowledgeBaseEnabled() else null
+        val embeddingConfig = if (knowledgeBaseEnabled == true) repo.embeddingConfig() else null
+        val kbStaleChapterIds = if (knowledgeBaseEnabled == true) {
+            repo.kbStaleChapters(projectId).toSet()
+        } else {
+            emptySet()
+        }
+        val kbIndexHashes = if (knowledgeBaseEnabled == true) repo.kbIndexHashes(projectId) else emptyMap()
+        val visibleBodyHashes = previousBodies.associate { (chapterId, body) ->
+            chapterId to com.example.novelseek_ultra.data.SnapshotStore.sha1(
+                com.example.novelseek_ultra.data.SnapshotStore.canonicalChapterText(
+                    body.final,
+                    body.draft,
+                ),
+            )
+        }
+        val chunks = if (knowledgeBaseEnabled == true && embeddingConfig != null) {
+            repo.chunks(projectId).filter {
+                it.embeddingModel == embeddingConfig.model &&
+                    (it.sourceType != "chapter" || (
+                        sourceVisible(it.sourceId, null) &&
+                            it.sourceId !in kbStaleChapterIds &&
+                            (
+                                temporalTargetOrder == null ||
+                                    kbIndexHashes[it.sourceId] == visibleBodyHashes[it.sourceId]
+                                )
+                        ))
+            }
+        } else {
+            emptyList()
+        }
+        val relevantFactEvidence = if (entitiesEnabled == true) {
+            val bodiesById = previousBodies.toMap()
+            val characterSignature = repo.characterSourceSignature(rawCharacters)
+            FactEvidenceLedger.visibleBefore(
+                existing = repo.factEvidence(projectId),
+                targetChapterOrder = temporalTargetOrder,
+                chapterOrdersById = chapterOrdersById,
+            ).filter { batch ->
+                val source = chapterSources.firstOrNull { it.id == batch.chapterId }
+                    ?: return@filter false
+                val body = bodiesById[batch.chapterId] ?: return@filter false
+                val effective = DerivedChapterMutation.effectiveText(body.draft, body.final)
+                val sourceHash = DerivedSourceFingerprint.chapter(
+                    chapterId = source.id,
+                    title = source.title,
+                    orderIndex = source.orderIndex,
+                    effectiveText = effective,
+                ).textHash
+                FactEvidenceLedger.isFresh(
+                    batch = batch,
+                    chapterId = source.id,
+                    chapterTitle = source.title,
+                    sourceHash = sourceHash,
+                    characterSignature = characterSignature,
+                )
+            }
+        } else {
+            emptyList()
+        }
+
+        val targetChapter = temporalTargetOrder?.let { targetOrder ->
+            rawChapters.firstOrNull { it.order_index == targetOrder }
+        }
+        val targetArcOrder = targetChapter?.let { target ->
+            rawArcs.firstOrNull { arc ->
+                target.arcId == arc.id || target.id in arc.builtChapterIds.orEmpty()
+            }?.order
+        }
+        val projectedArcs = rawArcs.map { arc ->
+            val assignedOrders = rawChapters.asSequence()
+                .filter { source ->
+                    source.arcId == arc.id || source.id in arc.builtChapterIds.orEmpty()
+                }
+                .map { it.order_index }
+                .toList()
+            PromptArcSource(
+                id = arc.id,
+                title = arc.title,
+                summary = arc.summary,
+                order = arc.order,
+                status = StoryStateVisibility.arcStatusBefore(
+                    targetChapterOrder = temporalTargetOrder,
+                    historicalTarget = hasWrittenTargetOrFutureChapter,
+                    currentStatus = arc.status,
+                    arcOrder = arc.order,
+                    targetArcOrder = targetArcOrder,
+                    assignedChapterOrders = assignedOrders,
+                ),
+                chapterCount = arc.chapterCount,
+                volumeId = arc.volumeId,
+                builtChapterIds = arc.builtChapterIds,
+            )
+        }
+
+        return PromptSourceSnapshot(
+            project = PromptProjectSource(
+                id = project.id,
+                title = project.title.takeIf { fullProjectMetadata }.orEmpty(),
+                genre = project.genre.orEmpty().takeIf { fullProjectMetadata }.orEmpty(),
+                description = project.description.orEmpty().takeIf { fullProjectMetadata }.orEmpty(),
+            ),
+            outline = repo.outline(projectId),
+            worldSetting = repo.worldSetting(projectId).takeIf {
+                scope == PromptSourceScope.OUTLINE || scope == PromptSourceScope.CHAPTER
+            },
+            timeline = repo.timeline(projectId).takeIf {
+                scope == PromptSourceScope.OUTLINE || scope == PromptSourceScope.CHAPTER
+            },
+            realms = repo.cultivationRealms(projectId),
+            characters = characterSources,
+            characterGrowth = if (includeGrowth) rawCharacters.map {
+                PromptGrowthSource(
+                    it.id,
+                    repo.characterGrowth(projectId, it.id).lastOrNull { entry ->
+                        sourceVisible(entry.chapterId, entry.chapterOrder)
+                    },
+                )
+            } else emptyList(),
+            volumes = if (includeVolumes) repo.volumes(projectId).map {
+                PromptVolumeSource(it.id, it.name, it.description, it.order, it.realmPlan)
+            } else emptyList(),
+            arcs = projectedArcs,
+            chapters = chapterSources,
+            previousBodies = previousBodies,
+            summariesEnabled = summariesEnabled,
+            summaries = relevantSummaries,
+            entitiesEnabled = entitiesEnabled,
+            entities = relevantEntities,
+            factEvidence = relevantFactEvidence,
+            knowledgeBaseEnabled = knowledgeBaseEnabled,
+            embeddingConfig = embeddingConfig,
+            chunks = chunks,
+            containers = selectedContainers.map {
+                PromptContainerSource(
+                    it.id, it.name, it.type, it.affectsGeneration,
+                    it.affectsVolumeGeneration, it.affectsArcGeneration,
+                )
+            },
+            containerValues = containerValues,
+        )
+    }
+
+    /** Consecutive equal reads prove that prompt construction starts from one stable source state
+     * without holding any repository lock during provider/network work. */
+    private fun captureStablePromptSources(
+        projectId: String,
+        scope: PromptSourceScope,
+        currentOrderIndex: Int? = null,
+    ): PromptSourceSnapshot? {
+        var previous = capturePromptSources(projectId, scope, currentOrderIndex) ?: return null
+        repeat(2) {
+            val current = capturePromptSources(projectId, scope, currentOrderIndex) ?: return null
+            if (current == previous) return current
+            previous = current
+        }
+        return null
+    }
+
+    private fun promptSourcesStillCurrent(
+        projectId: String,
+        scope: PromptSourceScope,
+        expected: PromptSourceSnapshot,
+        currentOrderIndex: Int? = null,
+    ): Boolean = capturePromptSources(projectId, scope, currentOrderIndex) == expected
+
+    /**
+     * Convert the exact stable prompt snapshot into a small, persisted category manifest.
+     * Length-prefix hashing happens in [GenerationContextFingerprint]; source text never enters
+     * GenerationRun JSON.
+     */
+    private fun promptContextManifest(
+        scope: PromptSourceScope,
+        snapshot: PromptSourceSnapshot,
+    ): GenerationContextManifest {
+        fun nullable(value: Any?): List<String> =
+            listOf(if (value == null) "0" else "1", value?.toString().orEmpty())
+
+        fun listed(values: List<*>): List<String> =
+            listOf(values.size.toString()) + values.map { it.toString() }
+
+        val embeddingBasis = snapshot.embeddingConfig?.let { config ->
+            listOf(
+                "1",
+                config.apiUrl,
+                config.model,
+                if (config.dimensions == null) "0" else "1",
+                config.dimensions?.toString().orEmpty(),
+            )
+        } ?: listOf("0")
+
+        return GenerationContextFingerprint.capture(
+            scope = "prompt:${scope.name}",
+            materials = listOf(
+                GenerationContextMaterial(
+                    "project",
+                    listOf(
+                        snapshot.project.id,
+                        snapshot.project.title,
+                        snapshot.project.genre,
+                        snapshot.project.description,
+                    ),
+                ),
+                GenerationContextMaterial("outline", nullable(snapshot.outline)),
+                GenerationContextMaterial("world_setting", nullable(snapshot.worldSetting)),
+                GenerationContextMaterial("timeline", nullable(snapshot.timeline)),
+                GenerationContextMaterial("realms", listed(snapshot.realms)),
+                GenerationContextMaterial("characters", listed(snapshot.characters)),
+                GenerationContextMaterial("character_growth", listed(snapshot.characterGrowth)),
+                GenerationContextMaterial("volumes", listed(snapshot.volumes)),
+                GenerationContextMaterial("arcs", listed(snapshot.arcs)),
+                GenerationContextMaterial("chapters", listed(snapshot.chapters)),
+                GenerationContextMaterial(
+                    "previous_bodies",
+                    listOf(snapshot.previousBodies.size.toString()) +
+                        snapshot.previousBodies.flatMap { (chapterId, body) ->
+                            listOf(chapterId, body.draft, body.final)
+                        },
+                ),
+                GenerationContextMaterial(
+                    "summaries",
+                    nullable(snapshot.summariesEnabled) + listed(snapshot.summaries),
+                ),
+                GenerationContextMaterial(
+                    "entities",
+                    nullable(snapshot.entitiesEnabled) + listed(snapshot.entities),
+                ),
+                GenerationContextMaterial("fact_evidence", listed(snapshot.factEvidence)),
+                GenerationContextMaterial(
+                    "knowledge_base",
+                    nullable(snapshot.knowledgeBaseEnabled) +
+                        embeddingBasis +
+                        listed(snapshot.chunks),
+                ),
+                GenerationContextMaterial("containers", listed(snapshot.containers)),
+                GenerationContextMaterial("container_values", listed(snapshot.containerValues)),
+                GenerationContextMaterial(
+                    "story_state_compiler",
+                    listOf(
+                        if (scope == PromptSourceScope.CHAPTER) {
+                            StoryStateCompiler.CONTRACT
+                        } else {
+                            "none"
+                        },
+                    ),
+                ),
+            ),
+        )
+    }
 
     /** Last 3 written chapters before [currentOrderIndex], formatted as PC-style context snippets. */
     private fun buildPreviousChapterSummary(projectId: String, currentOrderIndex: Int): String {
@@ -1947,6 +4133,17 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }.trimEnd()
     }
 
+    private fun PromptArcSource.toPlotArc(): PlotArc = PlotArc(
+        id = id,
+        title = title,
+        summary = summary,
+        order = order,
+        status = status,
+        chapterCount = chapterCount,
+        builtChapterIds = builtChapterIds,
+        volumeId = volumeId,
+    )
+
     private fun buildChapterList(projectId: String, currentChapterId: String): String {
         val chapters = repo.chapters(projectId).sortedBy { it.order_index }
         if (chapters.isEmpty()) return ""
@@ -1979,61 +4176,245 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * Assemble the KB augmentation block. Each layer is independent:
-     *   - summariesEnabled → book + active-arc summaries
-     *   - entitiesEnabled  → open foreshadowing list (helps long arcs land payoffs)
-     *   - knowledgeBaseEnabled + valid embedding cfg → cosine-retrieve top-K chunks vs this
-     *     chapter's title/goal/conflict, excluding chunks from the current chapter itself
-     *
-     * Returns null when no layer contributes — Prompts.chapterUser will then skip the block.
+     * Compile one bounded Story State from the exact prompt snapshot captured before provider I/O.
+     * No repository read occurs here: RAG ranking, summaries, entities, growth and container values
+     * all come from [snapshot], so the rendered prompt and persisted context manifest share one truth.
      */
-    private suspend fun buildKbAugmentation(projectId: String, chapter: Chapter, lang: String): String? {
-        val parts = mutableListOf<String>()
-
-        if (repo.summariesEnabled()) {
-            val all = repo.summaries(projectId)
-            val book = all.firstOrNull { it.scopeType == "book" && it.scopeId == projectId }
-            if (book != null && book.summaryText.isNotBlank()) {
-                val header = if (lang == "en") "[Book Synopsis]" else "【全书梗概】"
-                val staleTag = if (book.isStale) (if (lang == "en") " (may be stale)" else "（可能已过时）") else ""
-                parts += "$header$staleTag\n${book.summaryText}"
+    private suspend fun buildStoryStateContext(
+        snapshot: PromptSourceSnapshot,
+        chapter: Chapter,
+        lang: String,
+    ): String? {
+        val query = listOf(chapter.title, chapter.outline_goal, chapter.conflict)
+            .filterNot { it.isNullOrBlank() }
+            .joinToString("\n")
+        val embedding = snapshot.embeddingConfig
+        val retrieved = if (
+            snapshot.knowledgeBaseEnabled == true && embedding != null &&
+            embedding.isUsableApiConfig() && snapshot.chunks.isNotEmpty() && query.isNotBlank()
+        ) {
+            try {
+                kb.retrieveTopK(
+                    query = query,
+                    pool = snapshot.chunks,
+                    topK = 4,
+                    excludeSourceIds = setOf(chapter.id),
+                    cfg = embedding,
+                )
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Throwable) {
+                emptyList()
             }
-            val activeArc = repo.plotArcs(projectId).firstOrNull { it.status == "active" || it.status == "ending" }
-            if (activeArc != null) {
-                val arcSum = all.firstOrNull { it.scopeType == "arc" && it.scopeId == activeArc.id }
-                val summaryText = arcSum?.summaryText?.takeIf { it.isNotBlank() } ?: activeArc.summary
-                if (summaryText.isNotBlank()) {
-                    val header = if (lang == "en") "[Current Arc Progress]" else "【当前弧线进度】"
-                    parts += "$header\n${activeArc.title}\n$summaryText"
-                }
-            }
+        } else {
+            emptyList()
         }
 
-        if (repo.entitiesEnabled()) {
-            val open = repo.entities(projectId)
-                .filter { it.entityType == "foreshadowing" && it.status == "open" }
-            if (open.isNotEmpty()) {
-                val header = if (lang == "en") "[Open Foreshadowing — pay these off when natural]"
-                             else "【未回收伏笔 — 自然时机请回收】"
-                parts += "$header\n" + open.joinToString("\n") {
-                    "- ${it.canonicalName}：${it.summary}"
-                }
+        val characterNames = snapshot.characters.associate { it.id to it.name }
+        val chaptersById = snapshot.chapters.associateBy { it.id }
+        val containersById = snapshot.containers.associateBy { it.id }
+        val realmsById = snapshot.realms.associateBy { it.id }
+        val subRealmsById = snapshot.realms
+            .flatMap { it.subRealms.orEmpty() }
+            .associateBy { it.id }
+        val chapterSummaries = snapshot.summaries
+            .filter { it.scopeType == "chapter" && !it.isStale }
+            .associateBy { it.scopeId }
+        val evidenceStates = snapshot.factEvidence.flatMap { batch ->
+            val source = chaptersById[batch.chapterId] ?: return@flatMap emptyList()
+            batch.facts.map { fact ->
+                StoryStateCompiler.EvidenceState(
+                    entityId = fact.entityId,
+                    type = fact.factType,
+                    subject = fact.subject,
+                    claim = fact.claim,
+                    statusAfter = fact.statusAfter,
+                    sourceChapterId = batch.chapterId,
+                    sourceChapterOrder = source.orderIndex,
+                    sourceChapterTitle = source.title,
+                    evidenceText = fact.evidenceText,
+                )
             }
         }
-
-        run {
-            val query = listOf(chapter.title, chapter.outline_goal, chapter.conflict)
-                .filterNot { it.isNullOrBlank() }.joinToString("\n")
-            buildKbIndexRetrieval(projectId, query, lang, setOf(chapter.id))?.let { parts += it }
+        val evidenceByEntity = evidenceStates
+            .filter { !it.entityId.isNullOrBlank() }
+            .groupBy { checkNotNull(it.entityId) }
+        val ledgerCommitments = evidenceByEntity.mapNotNull { (entityId, observations) ->
+            val ordered = observations.sortedWith(
+                compareBy<StoryStateCompiler.EvidenceState>(
+                    { it.sourceChapterOrder },
+                    { it.sourceChapterId },
+                    { it.claim },
+                ),
+            )
+            val earliest = ordered.first()
+            val latest = ordered.last()
+            if (latest.statusAfter != "open") return@mapNotNull null
+            StoryStateCompiler.CommitmentState(
+                id = entityId,
+                type = latest.type,
+                name = latest.subject,
+                summary = latest.claim,
+                firstSeenChapterId = earliest.sourceChapterId,
+            )
         }
 
-        // Container guidance — soft, "evolve from here" reference state for affectsGeneration containers.
-        buildContainerGuidance(projectId, lang)?.let { parts += it }
+        val compilation = StoryStateCompiler.compile(
+            StoryStateCompiler.Input(
+                language = lang,
+                arcs = snapshot.arcs.map {
+                    StoryStateCompiler.ArcState(
+                        id = it.id,
+                        title = it.title,
+                        summary = it.summary,
+                        status = it.status,
+                        order = it.order,
+                    )
+                },
+                // Chapter summaries are represented in recentChapters below. Keeping them out of
+                // the general summary section avoids paying twice for the same continuity fact.
+                summaries = snapshot.summaries.filter { it.scopeType != "chapter" }.map {
+                    StoryStateCompiler.SummaryState(
+                        scope = it.scopeType,
+                        scopeId = it.scopeId,
+                        text = it.summaryText,
+                        stale = it.isStale,
+                    )
+                },
+                commitments = ledgerCommitments + snapshot.entities
+                    // Old projects without evidence retain the conservative aggregate fallback.
+                    .filter { it.id !in evidenceByEntity && it.status == "open" }
+                    .map {
+                        StoryStateCompiler.CommitmentState(
+                            id = it.id,
+                            type = it.entityType,
+                            name = it.canonicalName,
+                            summary = it.summary,
+                            firstSeenChapterId = it.firstSeenChapterId,
+                        )
+                    },
+                evidence = evidenceStates,
+                characters = snapshot.characters.mapNotNull { character ->
+                    val latest = snapshot.characterGrowth
+                        .firstOrNull { it.characterId == character.id }
+                        ?.latest
+                    // Unsafe historical currentRealm values were removed while capturing the same
+                    // immutable prompt snapshot used by the context manifest.
+                    val realm = character.currentRealmId
+                        ?.let(realmsById::get)
+                        ?.let { realm ->
+                            val subRealm = character.currentSubRealmId?.let(subRealmsById::get)
+                            listOfNotNull(realm.name, subRealm?.name).joinToString(" · ")
+                        }
+                    val value = buildList {
+                        realm?.takeIf { it.isNotBlank() }?.let {
+                            add(if (lang == "en") "Current realm: $it" else "当前境界：$it")
+                        }
+                        latest?.value?.takeIf { it.isNotBlank() }?.let(::add)
+                    }.joinToString("；")
+                    if (character.name.isBlank() || value.isBlank()) return@mapNotNull null
+                    StoryStateCompiler.CharacterState(
+                        characterId = character.id,
+                        name = character.name,
+                        value = value,
+                        chapterOrder = latest?.chapterOrder,
+                    )
+                },
+                trackedState = snapshot.containerValues.mapNotNull { source ->
+                    val container = containersById[source.containerId] ?: return@mapNotNull null
+                    val latest = source.latest?.value?.takeIf { it.isNotBlank() }
+                        ?: return@mapNotNull null
+                    val blockLabel = when (container.type) {
+                        Container.BY_CHARACTER -> characterNames[source.blockKey]
+                        Container.BY_CHAPTER -> chaptersById[source.blockKey]?.let {
+                            if (lang == "en") "Chapter ${it.orderIndex}: ${it.title}"
+                            else "第${it.orderIndex}章《${it.title}》"
+                        }
+                        else -> if (lang == "en") "Global" else "全局"
+                    } ?: source.blockKey
+                    StoryStateCompiler.TrackedState(
+                        containerId = container.id,
+                        containerName = container.name,
+                        blockKey = source.blockKey,
+                        blockLabel = blockLabel,
+                        value = latest,
+                    )
+                },
+                recentChapters = snapshot.previousBodies.mapNotNull { (chapterId, body) ->
+                    val source = chaptersById[chapterId] ?: return@mapNotNull null
+                    val effective = body.final.ifBlank { body.draft }
+                    val summary = chapterSummaries[chapterId]?.summaryText?.takeIf { it.isNotBlank() }
+                    if (effective.isBlank() && summary == null) return@mapNotNull null
+                    StoryStateCompiler.RecentChapterState(
+                        chapterId = chapterId,
+                        order = source.orderIndex,
+                        title = source.title,
+                        goal = source.outlineGoal,
+                        summary = summary,
+                        bodyTail = effective.takeLast(1_500).takeIf { it.isNotBlank() },
+                    )
+                },
+                retrievedMemory = retrieved.mapIndexed { index, chunk ->
+                    StoryStateCompiler.MemoryState(
+                        rank = index + 1,
+                        sourceId = chunk.sourceId,
+                        sourceTitle = chunk.sourceTitle,
+                        chunkIndex = chunk.chunkIndex,
+                        text = chunk.text.take(800),
+                    )
+                },
+            ),
+        )
+        return compilation.prompt.takeIf { it.isNotBlank() }
+    }
 
-        // Character growth routes — latest dev state per character (soft guidance for consistency).
-        buildCharacterGrowthGuidance(projectId, lang)?.let { parts += it }
-
-        return parts.takeIf { it.isNotEmpty() }?.joinToString("\n\n")
+    /**
+     * Fit semantic chapter-prompt blocks before rendering one combined user message. Fixed shares
+     * keep the slow prefix independent from later chapter-specific block sizes. Author drafts and
+     * the immediate task are required and therefore fail clearly instead of being truncated.
+     */
+    private fun budgetChapterContext(
+        cfg: TextModelConfig,
+        systemPrompt: String,
+        requiredTaskText: String,
+        worldSetting: String?,
+        timeline: String?,
+        charactersInfo: String?,
+        storyState: String?,
+        targetConstraints: String?,
+        chapterList: String?,
+        draftReference: String?,
+    ): BudgetedChapterContext {
+        val allocation = PromptRequestBudgeter.allocateSections(
+            config = cfg,
+            systemPrompt = systemPrompt,
+            requiredTaskText = requiredTaskText,
+            sections = listOf(
+                PromptRequestBudgeter.Section("world", worldSetting, weight = 25),
+                PromptRequestBudgeter.Section("timeline", timeline, weight = 10),
+                PromptRequestBudgeter.Section("characters", charactersInfo, weight = 15),
+                // Story State order is core -> recent -> RAG, so head clipping discards RAG first.
+                PromptRequestBudgeter.Section("story_state", storyState, weight = 35),
+                PromptRequestBudgeter.Section("target_constraints", targetConstraints, weight = 7),
+                PromptRequestBudgeter.Section("chapter_list", chapterList, weight = 8),
+                PromptRequestBudgeter.Section(
+                    "author_draft",
+                    draftReference,
+                    required = true,
+                    trimPolicy = PromptRequestBudgeter.TrimPolicy.MIDDLE,
+                ),
+            ),
+        )
+        fun value(key: String): String? = allocation.values[key]
+        return BudgetedChapterContext(
+            worldSetting = value("world"),
+            timeline = value("timeline"),
+            charactersInfo = value("characters"),
+            storyState = value("story_state"),
+            targetConstraints = value("target_constraints"),
+            chapterList = value("chapter_list"),
+            draftReference = value("author_draft"),
+        )
     }
 
     /** Settings-page knowledge base (embedding index): retrieve the top-K chunks most relevant to
@@ -2043,8 +4424,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     ): String? {
         if (!repo.knowledgeBaseEnabled() || query.isBlank()) return null
         val cfg = repo.embeddingConfig()
-        if (cfg.apiKey.isBlank() || cfg.apiUrl.isBlank() || cfg.model.isBlank()) return null
-        val pool = repo.chunks(projectId)
+        if (!cfg.isUsableApiConfig()) return null
+        // Never compare a query vector against chunks from another embedding model/space.
+        val pool = repo.chunks(projectId).filter { it.embeddingModel == cfg.model }
         if (pool.isEmpty()) return null
         return runCatching {
             kb.retrieveTopK(query = query, pool = pool, topK = 4, excludeSourceIds = excludeSourceIds, cfg = cfg)
@@ -2136,17 +4518,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         return blocks
     }
 
-    /** Inject the latest values of every affectsGeneration container as soft (non-forced) guidance. */
-    private fun buildContainerGuidance(projectId: String, lang: String): String? {
-        val blocks = renderContainerBlocks(projectId, repo.containers(projectId).filter { it.affectsGeneration }, recentChapters = 3)
-        if (blocks.isEmpty()) return null
-        val header = if (lang == "en")
-            "[Containers — reference state. Evolve naturally from here; do not contradict or regress these without an in-story reason.]"
-        else
-            "【资料容器 — 参考状态。请在此基础上自然演进，勿无理由跳变或倒退。】"
-        return header + "\n" + blocks.joinToString("\n\n")
-    }
-
     /** For PLANNING: surface ALL container knowledge (manual entries + AI-evolved values), regardless
      *  of the affectsGeneration flag, so the planner sees tracked stats / relations / items / 伏笔. */
     private fun buildContainerKnowledgeForPlanning(projectId: String, lang: String): String? {
@@ -2183,7 +4554,18 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }.getOrNull()
 
     private fun TextModelConfig.isValid(): Boolean =
-        apiKey.isNotBlank() && apiUrl.isNotBlank() && model.isNotBlank()
+        isUsableApiConfig()
+
+    /** Thinking tokens share the completion allowance, so only non-thinking stages use tight caps. */
+    private fun TextModelConfig.withStageOutputLimit(limit: Int): TextModelConfig {
+        val usesDeepSeekThinking = isDirectDeepSeek(this) &&
+            TextModelThinkingModes.normalize(thinkingMode) != TextModelThinkingModes.DISABLED
+        return if (usesDeepSeekThinking) this else copy(maxOutputTokens = minOf(maxOutputTokens, limit))
+    }
+
+    /** Reserve visible generated text conservatively; thinking models retain their full allowance. */
+    private fun stepwiseGeneratedTextReserve(config: TextModelConfig, marker: String): String =
+        marker.repeat(PromptRequestBudgeter.maxOutputTokens(config) * 3 / 2)
 
     private fun countWords(text: String): Int {
         // Mixed-script approximation: every CJK char counts as 1, latin words split on whitespace.
@@ -2226,12 +4608,52 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun kbStats(projectId: String) = repo.kbStats(projectId)
     fun summariesOf(projectId: String) = repo.summaries(projectId)
     fun entitiesOf(projectId: String) = repo.entities(projectId)
+    fun factEvidenceOf(projectId: String) = repo.factEvidence(projectId)
+    fun factEvidenceCoverageOf(projectId: String): FactEvidenceCoverage {
+        val eligible = repo.captureProjectSource(projectId)
+            ?.chapters
+            .orEmpty()
+            .filter { it.effectiveText.trim().length >= MIN_FACT_EXTRACTION_CHARS }
+        val batchesByChapter = repo.factEvidence(projectId).groupBy { it.chapterId }
+        val characterSignature = repo.characterSourceSignature(repo.characters(projectId))
+        val matching = eligible.flatMap { input ->
+            batchesByChapter[input.source.chapterId]
+                .orEmpty()
+                .filter { batch ->
+                    FactEvidenceLedger.isFresh(
+                        batch = batch,
+                        chapterId = input.source.chapterId,
+                        chapterTitle = input.source.title,
+                        sourceHash = input.source.textHash,
+                        characterSignature = characterSignature,
+                    )
+                }
+        }
+        return FactEvidenceCoverage(
+            claims = matching.sumOf { it.facts.size },
+            coveredChapters = eligible.count { input ->
+                matching.any { it.chapterId == input.source.chapterId }
+            },
+            eligibleChapters = eligible.size,
+        )
+    }
     fun setEntityStatus(projectId: String, entityId: String, status: String) =
         repo.setEntityStatus(projectId, entityId, status)
 
-    suspend fun testEmbeddingConnection(): Boolean = withContext(Dispatchers.IO) {
-        kb.testConnection(repo.embeddingConfig())
+    suspend fun testEmbeddingConnection(
+        config: EmbeddingConfig = repo.embeddingConfig(),
+    ): Boolean = withContext(Dispatchers.IO) {
+        config.isUsableApiConfig() && kb.testConnection(config)
     }
+
+    /** Bind an externally supplied save callback to the exact live title/effective prose. */
+    private fun matchingChapterSource(
+        projectId: String,
+        chapterId: String,
+        title: String,
+        text: String,
+    ): AppRepository.ChapterDerivedInput? = repo.captureChapterSource(projectId, chapterId)
+        ?.takeIf { it.source.title == title && it.effectiveText == text }
 
     /** Re-embed every written chapter for [projectId] using the current EmbeddingConfig. */
     fun rebuildKnowledgeBase(
@@ -2241,36 +4663,38 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         // can actually see WHY a rebuild failed (e.g. DashScope's "InvalidParameter.BatchSize"),
         // rather than just a tally of fails.
         onDone: (chapters: Int, chunks: Int, errors: Int, firstError: String?) -> Unit = { _, _, _, _ -> },
-    ) {
+    ): Job? {
         val cfg = repo.embeddingConfig()
-        if (cfg.apiKey.isBlank() || cfg.apiUrl.isBlank() || cfg.model.isBlank()) {
+        if (!cfg.isUsableApiConfig()) {
             _statusMessage.value = "请先在「本地知识库」中填写 Embedding 配置 / Configure Embedding first."
-            return
+            return null
         }
-        viewModelScope.launch(Dispatchers.IO) {
-            val eligible = repo.chapters(projectId).mapNotNull { ch ->
-                val body = repo.chapterBody(ch.id)
-                val text = body.final.ifBlank { body.draft }
-                if (text.trim().length > 200) Triple(ch.id, ch.title, text) else null
-            }
+        val baseline = repo.captureProjectSource(projectId) ?: run {
+            onDone(0, 0, 1, "项目已不存在，未开始重建")
+            return null
+        }
+        val embeddingSignature = repo.embeddingSourceSignature(cfg)
+        val eligible = baseline.chapters.filter { it.effectiveText.trim().length > 200 }
+        return viewModelScope.launch(Dispatchers.IO) {
             if (eligible.isEmpty()) {
                 _statusMessage.value = "无可索引章节（正文需 > 200 字） / No chapters > 200 chars to index."
                 onDone(0, 0, 0, null)
                 return@launch
             }
-            var totalChunks = 0
+            val stagedChunks = mutableListOf<KbChunk>()
+            val stagedHashes = mutableMapOf<String, String>()
             var errors = 0
             var firstError: String? = null
-            // Replace the whole KB to avoid stale chunks from removed chapters.
-            repo.setChunks(projectId, emptyList())
-            eligible.forEachIndexed { idx, (cid, title, text) ->
+            eligible.forEachIndexed { idx, input ->
+                val cid = input.source.chapterId
+                val title = input.source.title
+                val text = input.effectiveText
+                currentCoroutineContext().ensureActive()
                 onProgress(idx + 1, eligible.size, title)
-                runCatching { kb.indexChapter(cid, title, text, cfg) }
+                runSuspendCatching { kb.indexChapter(cid, title, text, cfg) }
                     .onSuccess { chunks ->
-                        repo.appendChunks(projectId, chunks)
-                        repo.setKbIndexHash(projectId, cid, com.example.novelseek_ultra.data.SnapshotStore.sha1(text))
-                        repo.clearKbStaleChapter(projectId, cid)
-                        totalChunks += chunks.size
+                        stagedChunks += chunks
+                        stagedHashes[cid] = com.example.novelseek_ultra.data.SnapshotStore.sha1(text)
                     }
                     .onFailure { err ->
                         errors += 1
@@ -2278,7 +4702,31 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         if (firstError == null) firstError = "「$title」→ $msg"
                     }
             }
-            onDone(eligible.size, totalChunks, errors, firstError)
+            currentCoroutineContext().ensureActive()
+            if (errors > 0) {
+                onDone(
+                    eligible.size - errors,
+                    0,
+                    errors,
+                    "重建未提交，已保留原索引；${firstError.orEmpty()}",
+                )
+                return@launch
+            }
+            // Commit only after every embedding succeeded. Cancellation/failure leaves the old KB
+            // and hashes untouched. The repository re-checks every chapter source at one boundary.
+            val committed = repo.commitRebuiltKbIfSourcesCurrent(
+                projectId = projectId,
+                expected = baseline.source,
+                expectedEmbeddingSignature = embeddingSignature,
+                expectedEmbeddingModel = cfg.model,
+                rebuiltChunks = stagedChunks,
+                rebuiltHashes = stagedHashes,
+            )
+            if (!committed) {
+                onDone(0, 0, 1, "重建期间章节集合、标题或正文已变化，旧结果未提交")
+                return@launch
+            }
+            onDone(eligible.size, stagedChunks.size, 0, null)
         }
     }
 
@@ -2291,10 +4739,15 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
      * All three are fire-and-forget; failures surface via [statusMessage] but never block the save.
      */
     fun onChapterSaved(projectId: String, chapterId: String, title: String, text: String) {
-        if (text.trim().length < 200) return
-        indexChapterIfEnabled(projectId, chapterId, title, text)
-        if (repo.summariesEnabled()) generateChapterSummary(projectId, chapterId, title, text)
-        if (repo.entitiesEnabled()) extractEntitiesForChapter(projectId, chapterId, title, text)
+        val textLength = text.trim().length
+        if (textLength == 0) return
+        if (textLength >= 200) {
+            indexChapterIfEnabled(projectId, chapterId, title, text)
+            if (repo.summariesEnabled()) generateChapterSummary(projectId, chapterId, title, text)
+        }
+        if (repo.entitiesEnabled() && textLength >= MIN_FACT_EXTRACTION_CHARS) {
+            extractEntitiesForChapter(projectId, chapterId, title, text)
+        }
         updateContainersForChapter(projectId, chapterId, title, text)
     }
 
@@ -2302,14 +4755,23 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun indexChapterIfEnabled(projectId: String, chapterId: String, title: String, text: String) {
         if (!repo.knowledgeBaseEnabled()) return
         val cfg = repo.embeddingConfig()
-        if (cfg.apiKey.isBlank() || cfg.apiUrl.isBlank() || cfg.model.isBlank()) return
+        if (!cfg.isUsableApiConfig()) return
         if (text.trim().length < 200) return
+        val input = matchingChapterSource(projectId, chapterId, title, text) ?: return
+        val embeddingSignature = repo.embeddingSourceSignature(cfg)
         viewModelScope.launch(Dispatchers.IO) {
-            runCatching {
-                val chunks = kb.indexChapter(chapterId, title, text, cfg)
-                repo.appendChunks(projectId, chunks)
-                repo.setKbIndexHash(projectId, chapterId, com.example.novelseek_ultra.data.SnapshotStore.sha1(text))
-                repo.clearKbStaleChapter(projectId, chapterId)
+            runSuspendCatching {
+                val chunks = kb.indexChapter(chapterId, title, input.effectiveText, cfg)
+                currentCoroutineContext().ensureActive()
+                val committed = repo.commitChapterKbIfSourceCurrent(
+                    projectId = projectId,
+                    expected = input.source,
+                    expectedEmbeddingSignature = embeddingSignature,
+                    expectedEmbeddingModel = cfg.model,
+                    newChunks = chunks,
+                    indexHash = com.example.novelseek_ultra.data.SnapshotStore.sha1(input.effectiveText),
+                )
+                if (!committed) _statusMessage.value = "章节已更新，已丢弃过期 KB 索引结果"
             }.onFailure { _statusMessage.value = "KB 索引失败：${it.message}" }
         }
     }
@@ -2324,14 +4786,17 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     ) {
         val cfg = repo.activeTextModelConfig()
         if (!cfg.isValid()) { _statusMessage.value = "请先配置文本模型"; onDone(null); return }
+        val input = matchingChapterSource(projectId, chapterId, chapterTitle, chapterText)
+            ?: run { onDone(null); return }
         val lang = _uiLanguage.value
         viewModelScope.launch(Dispatchers.IO) {
-            val text = runCatching {
+            val text = runSuspendCatching {
                 ai.chat(cfg, listOf(
                     ChatMessage("system", Prompts.chapterSummarySystem(lang)),
-                    ChatMessage("user", Prompts.chapterSummaryUser(chapterTitle, chapterText, lang)),
+                    ChatMessage("user", Prompts.chapterSummaryUser(input.source.title, input.effectiveText, lang)),
                 ))
             }.getOrNull()?.trim() ?: run { onDone(null); return@launch }
+            currentCoroutineContext().ensureActive()
             val payload = SummaryPayload(
                 id = "sum-ch-$chapterId",
                 scopeType = "chapter",
@@ -2340,12 +4805,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 isStale = false,
                 wordCount = text.length,
             )
-            repo.upsertSummary(projectId, payload)
-            // Mark book / arc roll-ups stale so the user knows to refresh them.
-            repo.setSummaries(projectId, repo.summaries(projectId).map {
-                if (it.scopeType != "chapter") it.copy(isStale = true) else it
-            })
-            onDone(payload)
+            val committed = repo.commitChapterSummaryIfSourceCurrent(projectId, input.source, payload)
+            onDone(payload.takeIf { committed })
         }
     }
 
@@ -2353,36 +4814,42 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         projectId: String,
         onProgress: (current: Int, total: Int, title: String) -> Unit = { _, _, _ -> },
         onDone: (ok: Int, errors: Int) -> Unit = { _, _ -> },
-    ) {
+    ): Job? {
         val cfg = repo.activeTextModelConfig()
-        if (!cfg.isValid()) { _statusMessage.value = "请先配置文本模型"; return }
+        if (!cfg.isValid()) { _statusMessage.value = "请先配置文本模型"; return null }
         val lang = _uiLanguage.value
-        viewModelScope.launch(Dispatchers.IO) {
-            val eligible = repo.chapters(projectId).mapNotNull { ch ->
-                val body = repo.chapterBody(ch.id)
-                val t = body.final.ifBlank { body.draft }
-                if (t.trim().length > 200) Triple(ch.id, ch.title, t) else null
-            }
+        val baseline = repo.captureProjectSource(projectId) ?: return null
+        val eligible = baseline.chapters.filter { it.effectiveText.trim().length > 200 }
+        return viewModelScope.launch(Dispatchers.IO) {
             var ok = 0; var errors = 0
-            eligible.forEachIndexed { idx, (cid, title, text) ->
+            eligible.forEachIndexed { idx, input ->
+                val cid = input.source.chapterId
+                val title = input.source.title
+                val text = input.effectiveText
+                currentCoroutineContext().ensureActive()
                 onProgress(idx + 1, eligible.size, title)
-                runCatching {
+                val summaryResult = runSuspendCatching {
                     ai.chat(cfg, listOf(
                         ChatMessage("system", Prompts.chapterSummarySystem(lang)),
                         ChatMessage("user", Prompts.chapterSummaryUser(title, text, lang)),
                     ))
                 }
-                    .onSuccess { reply ->
+                currentCoroutineContext().ensureActive()
+                summaryResult.onSuccess { reply ->
                         val s = reply.trim()
                         if (s.isNotBlank()) {
-                            repo.upsertSummary(projectId, SummaryPayload(
+                            val payload = SummaryPayload(
                                 id = "sum-ch-$cid",
                                 scopeType = "chapter",
                                 scopeId = cid,
                                 summaryText = s,
                                 wordCount = s.length,
-                            ))
-                            ok += 1
+                            )
+                            if (repo.commitChapterSummaryIfSourceCurrent(projectId, input.source, payload)) {
+                                ok += 1
+                            } else {
+                                errors += 1
+                            }
                         } else errors += 1
                     }
                     .onFailure { errors += 1 }
@@ -2395,26 +4862,38 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun generateBookSummary(
         projectId: String,
         onDone: (SummaryPayload?) -> Unit = {},
-    ) {
+    ): Job? {
         val cfg = repo.activeTextModelConfig()
-        if (!cfg.isValid()) { _statusMessage.value = "请先配置文本模型"; onDone(null); return }
-        val project = repo.project(projectId) ?: run { onDone(null); return }
+        if (!cfg.isValid()) { _statusMessage.value = "请先配置文本模型"; onDone(null); return null }
+        val projectInput = repo.captureProjectSource(projectId)
+            ?: run { onDone(null); return null }
+        val all = repo.summaries(projectId)
+        val summarySignature = repo.summarySourceSignature(all)
+        val chapterSums = all.filter { it.scopeType == "chapter" }.map { it.summaryText }
+        val arcSums = all.filter { it.scopeType == "arc" }.map { it.summaryText }
+        val layers = (arcSums + chapterSums).filter { it.isNotBlank() }
+        if (layers.isEmpty()) {
+            _statusMessage.value = "尚未有任何章节摘要，先生成章节摘要 / Build chapter summaries first."
+            onDone(null)
+            return null
+        }
         val lang = _uiLanguage.value
-        viewModelScope.launch(Dispatchers.IO) {
-            val all = repo.summaries(projectId)
-            val chapterSums = all.filter { it.scopeType == "chapter" }.map { it.summaryText }
-            val arcSums = all.filter { it.scopeType == "arc" }.map { it.summaryText }
-            val layers = (arcSums + chapterSums).filter { it.isNotBlank() }
-            if (layers.isEmpty()) {
-                _statusMessage.value = "尚未有任何章节摘要，先生成章节摘要 / Build chapter summaries first."
-                onDone(null); return@launch
-            }
-            val text = runCatching {
+        return viewModelScope.launch(Dispatchers.IO) {
+            val text = runSuspendCatching {
                 ai.chat(cfg, listOf(
                     ChatMessage("system", Prompts.bookSummarySystem(lang)),
-                    ChatMessage("user", Prompts.bookSummaryUser(project.title, project.description, layers, lang)),
+                    ChatMessage(
+                        "user",
+                        Prompts.bookSummaryUser(
+                            projectInput.source.projectTitle,
+                            projectInput.source.projectDescription,
+                            layers,
+                            lang,
+                        ),
+                    ),
                 ))
             }.getOrNull()?.trim() ?: run { onDone(null); return@launch }
+            currentCoroutineContext().ensureActive()
             val payload = SummaryPayload(
                 id = "sum-book-$projectId",
                 scopeType = "book",
@@ -2423,8 +4902,13 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 isStale = false,
                 wordCount = text.length,
             )
-            repo.upsertSummary(projectId, payload)
-            onDone(payload)
+            val committed = repo.commitBookSummaryIfSourceCurrent(
+                projectId = projectId,
+                expectedProject = projectInput.source,
+                expectedSummarySignature = summarySignature,
+                payload = payload,
+            )
+            onDone(payload.takeIf { committed })
         }
     }
 
@@ -2438,80 +4922,244 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     ) {
         val cfg = repo.activeTextModelConfig()
         if (!cfg.isValid()) { _statusMessage.value = "请先配置文本模型"; onDone(0, 0); return }
+        val ticket = repo.captureFactExtractionTicket(projectId, chapterId)
+            ?.takeIf { it.input.source.title == chapterTitle && it.input.effectiveText == chapterText }
+            ?: run { onDone(0, 0); return }
         val lang = _uiLanguage.value
         viewModelScope.launch(Dispatchers.IO) {
-            val knownNames = repo.characters(projectId).map { it.name }
-            val reply = runCatching {
-                ai.chat(cfg, listOf(
-                    ChatMessage("system", Prompts.entityExtractionSystem(lang)),
-                    ChatMessage("user", Prompts.entityExtractionUser(chapterTitle, chapterText, knownNames, lang)),
-                ))
-            }.getOrNull() ?: run { onDone(0, 0); return@launch }
-            val (added, updated) = mergeEntitiesFromJson(projectId, chapterId, reply)
-            onDone(added, updated)
+            val result = runSuspendCatching {
+                requestAndMergeChapterFacts(
+                    cfg = cfg,
+                    projectId = projectId,
+                    input = ticket.input,
+                    expectedCharacterSignature = ticket.characterSignature,
+                    expectedFactEvidenceEpoch = ticket.evidenceEpoch,
+                    knownNames = ticket.knownNames,
+                    lang = lang,
+                )
+            }.getOrNull()
+            onDone(result?.first ?: 0, result?.second ?: 0)
         }
     }
 
-    private fun mergeEntitiesFromJson(projectId: String, chapterId: String, raw: String): Pair<Int, Int> {
+    fun rebuildFactEvidenceForAll(
+        projectId: String,
+        onProgress: (current: Int, total: Int, title: String) -> Unit = { _, _, _ -> },
+        onDone: (ok: Int, errors: Int) -> Unit = { _, _ -> },
+    ): Job? {
+        val cfg = repo.activeTextModelConfig()
+        if (!cfg.isValid()) {
+            _statusMessage.value = "请先配置文本模型"
+            onDone(0, 1)
+            return null
+        }
+        val tickets = repo.captureProjectFactExtractionTickets(projectId)
+        if (tickets == null) {
+            onDone(0, 1)
+            return null
+        }
+        val eligible = tickets
+            .filter { it.input.effectiveText.trim().length >= MIN_FACT_EXTRACTION_CHARS }
+        val lang = _uiLanguage.value
+        return viewModelScope.launch(Dispatchers.IO) {
+            var ok = 0
+            var errors = 0
+            eligible.forEachIndexed { index, ticket ->
+                currentCoroutineContext().ensureActive()
+                onProgress(index + 1, eligible.size, ticket.input.source.title)
+                val result = runSuspendCatching {
+                    requestAndMergeChapterFacts(
+                        cfg = cfg,
+                        projectId = projectId,
+                        input = ticket.input,
+                        expectedCharacterSignature = ticket.characterSignature,
+                        expectedFactEvidenceEpoch = ticket.evidenceEpoch,
+                        knownNames = ticket.knownNames,
+                        lang = lang,
+                    )
+                }.getOrNull()
+                if (result != null) ok += 1 else errors += 1
+            }
+            onDone(ok, errors)
+        }
+    }
+
+    private suspend fun requestAndMergeChapterFacts(
+        cfg: TextModelConfig,
+        projectId: String,
+        input: AppRepository.ChapterDerivedInput,
+        expectedCharacterSignature: String,
+        expectedFactEvidenceEpoch: Long,
+        knownNames: List<String>,
+        lang: String,
+    ): Pair<Int, Int>? {
+        val reply = ai.chat(
+            cfg.withStageOutputLimit(BLUEPRINT_MAX_OUTPUT_TOKENS),
+            listOf(
+                ChatMessage("system", Prompts.entityExtractionSystem(lang)),
+                ChatMessage(
+                    "user",
+                    Prompts.entityExtractionUser(
+                        input.source.title,
+                        input.effectiveText,
+                        knownNames,
+                        lang,
+                    ),
+                ),
+            ),
+        )
+        currentCoroutineContext().ensureActive()
+        return mergeEntitiesFromJson(
+            projectId,
+            input.source,
+            expectedCharacterSignature,
+            expectedFactEvidenceEpoch,
+            input.effectiveText,
+            reply,
+        )
+    }
+
+    private fun mergeEntitiesFromJson(
+        projectId: String,
+        source: ChapterSourceVersion,
+        expectedCharacterSignature: String,
+        expectedFactEvidenceEpoch: Long,
+        sourceText: String,
+        raw: String,
+    ): Pair<Int, Int>? {
         val cleaned = raw.trim().removePrefix("```json").removePrefix("```").removeSuffix("```").trim()
         val root = runCatching {
             kotlinx.serialization.json.Json.parseToJsonElement(cleaned).jsonObject
-        }.getOrNull() ?: return 0 to 0
+        }.getOrNull() ?: return null
 
-        var added = 0; var updated = 0
-        val existing = repo.entities(projectId).toMutableList()
+        return repo.updateEntitiesAndEvidenceIfSourceCurrent(
+            projectId, source, expectedCharacterSignature, expectedFactEvidenceEpoch,
+        ) { current, currentEvidence, chapterOrders ->
+            var added = 0; var updated = 0
+            val existing = current.toMutableList()
+            val observations = mutableListOf<FactEvidenceLedger.Observation>()
 
-        fun upsert(name: String, type: String, summary: String, aliases: List<String> = emptyList(), status: String = "open") {
-            val canonical = name.trim().ifBlank { return }
-            val matchIdx = existing.indexOfFirst {
-                it.entityType == type && (it.canonicalName == canonical || canonical in it.aliases)
-            }
-            if (matchIdx >= 0) {
-                val cur = existing[matchIdx]
-                existing[matchIdx] = cur.copy(
-                    aliases = (cur.aliases + aliases).distinct(),
-                    summary = if (summary.isNotBlank()) summary else cur.summary,
-                    status = if (status == "paid_off" && cur.status == "open") "paid_off" else cur.status,
-                    lastSeenChapterId = chapterId,
-                )
-                updated += 1
-            } else {
-                existing += EntityPayload(
-                    id = "ent-${type}-${System.currentTimeMillis()}-${added + updated}",
+            fun upsert(
+                name: String,
+                type: String,
+                summary: String,
+                aliases: List<String> = emptyList(),
+                status: String = "open",
+                evidenceText: String = "",
+            ) {
+                val canonical = name.trim().ifBlank { return }
+                val normalizedStatus = status.takeIf {
+                    it == "open" || it == "paid_off" || it == "archived"
+                } ?: "open"
+                val matchIdx = EntityReconciliation.matchIndex(
+                    existing = existing,
                     entityType = type,
                     canonicalName = canonical,
-                    aliases = aliases.filter { it.isNotBlank() && it != canonical }.distinct(),
-                    summary = summary,
-                    status = status,
-                    firstSeenChapterId = chapterId,
-                    lastSeenChapterId = chapterId,
+                    sourceChapterId = source.chapterId,
                 )
-                added += 1
+                if (matchIdx >= 0) {
+                    val cur = existing[matchIdx]
+                    existing[matchIdx] = EntityReconciliation.merge(
+                        current = cur,
+                        sourceChapterId = source.chapterId,
+                        aliases = aliases,
+                        summary = summary,
+                        extractedStatus = normalizedStatus,
+                    )
+                    updated += 1
+                } else {
+                    existing += EntityPayload(
+                        id = "ent-${type}-${System.currentTimeMillis()}-${added + updated}",
+                        entityType = type,
+                        canonicalName = canonical,
+                        aliases = aliases.filter { it.isNotBlank() && it != canonical }.distinct(),
+                        summary = summary,
+                        status = normalizedStatus,
+                        firstSeenChapterId = source.chapterId,
+                        lastSeenChapterId = source.chapterId,
+                    )
+                    added += 1
+                }
+                val committedEntity = if (matchIdx >= 0) existing[matchIdx] else existing.last()
+                val verifiedEvidence = FactEvidenceLedger.verifiedExcerpt(sourceText, evidenceText)
+                if (verifiedEvidence.isNotBlank()) {
+                    observations += FactEvidenceLedger.Observation(
+                        entityId = committedEntity.id,
+                        factType = type,
+                        subject = committedEntity.canonicalName,
+                        claim = summary,
+                        statusAfter = normalizedStatus,
+                        evidenceText = verifiedEvidence,
+                    )
+                }
             }
-        }
 
-        fun processGroup(key: String, type: String) {
-            val arr = root[key]?.jsonArray ?: return
-            arr.forEach { e ->
-                val obj = e.jsonObject
-                val name = (obj["name"] as? kotlinx.serialization.json.JsonPrimitive)?.content.orEmpty()
-                val summary = (obj["summary"] as? kotlinx.serialization.json.JsonPrimitive)?.content.orEmpty()
-                val status = (obj["status"] as? kotlinx.serialization.json.JsonPrimitive)?.content ?: "open"
-                val aliases = obj["aliases"]?.jsonArray?.mapNotNull {
-                    (it as? kotlinx.serialization.json.JsonPrimitive)?.content
-                } ?: emptyList()
-                upsert(name = name, type = type, summary = summary, aliases = aliases, status = status)
+            fun processGroup(key: String, type: String) {
+                val arr = root[key]?.jsonArray ?: return
+                arr.forEach { e ->
+                    val obj = e.jsonObject
+                    val name = (obj["name"] as? kotlinx.serialization.json.JsonPrimitive)?.content.orEmpty()
+                    val summary = (obj["summary"] as? kotlinx.serialization.json.JsonPrimitive)?.content.orEmpty()
+                    val status = (obj["status"] as? kotlinx.serialization.json.JsonPrimitive)?.content ?: "open"
+                    val evidenceText = (obj["evidence"] as? kotlinx.serialization.json.JsonPrimitive)
+                        ?.content.orEmpty()
+                    val aliases = obj["aliases"]?.jsonArray?.mapNotNull {
+                        (it as? kotlinx.serialization.json.JsonPrimitive)?.content
+                    } ?: emptyList()
+                    upsert(
+                        name = name,
+                        type = type,
+                        summary = summary,
+                        aliases = aliases,
+                        status = status,
+                        evidenceText = evidenceText,
+                    )
+                }
             }
+
+            processGroup("characters", "character_ref")
+            processGroup("foreshadowing", "foreshadowing")
+            processGroup("locations", "location")
+            processGroup("events", "event")
+            processGroup("items", "item")
+
+            val nextEvidence = FactEvidenceLedger.replaceChapter(
+                existing = currentEvidence,
+                chapterId = source.chapterId,
+                sourceHash = source.textHash,
+                extractionInputHash = FactEvidenceLedger.extractionInputHash(
+                    chapterId = source.chapterId,
+                    chapterTitle = source.title,
+                    sourceHash = source.textHash,
+                    characterSignature = expectedCharacterSignature,
+                ),
+                observations = observations,
+            )
+            val evidenceByEntity = nextEvidence.asSequence()
+                .filterNot { it.isStale }
+                .flatMap { batch ->
+                    val order = chapterOrders[batch.chapterId] ?: return@flatMap emptySequence()
+                    batch.facts.asSequence().mapNotNull { fact ->
+                        fact.entityId?.let { entityId ->
+                            entityId to EntityReconciliation.TimedEvidence(
+                                chapterId = batch.chapterId,
+                                chapterOrder = order,
+                                summary = fact.claim,
+                                statusAfter = fact.statusAfter,
+                            )
+                        }
+                    }
+                }
+                .groupBy({ it.first }, { it.second })
+            val reconciled = existing.map { entity ->
+                EntityReconciliation.reconcileWithEvidence(
+                    current = entity,
+                    evidence = evidenceByEntity[entity.id].orEmpty(),
+                    chapterOrdersById = chapterOrders,
+                )
+            }
+            Triple(reconciled, nextEvidence, added to updated)
         }
-
-        processGroup("characters", "character_ref")
-        processGroup("foreshadowing", "foreshadowing")
-        processGroup("locations", "location")
-        processGroup("events", "event")
-        processGroup("items", "item")
-
-        repo.setEntities(projectId, existing)
-        return added to updated
     }
 
     fun forgetKbForChapter(projectId: String, chapterId: String) {
@@ -2532,8 +5180,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     /** Number of chapters whose KB vectors are stale for [projectId] (drives the rebuild banner). */
     fun kbStaleCount(projectId: String): Int = repo.kbStaleChapters(projectId).size
 
-    fun saveSnapshot(projectId: String, label: String, onDone: (Boolean) -> Unit = {}) {
-        viewModelScope.launch(Dispatchers.IO) {
+    fun saveSnapshot(projectId: String, label: String, onDone: (Boolean) -> Unit = {}): Job {
+        return viewModelScope.launch(Dispatchers.IO) {
             val meta = runCatching {
                 repo.createSnapshot(projectId, label, SnapshotMeta.TRIGGER_MANUAL)
             }.getOrNull()
@@ -2550,14 +5198,23 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun deleteSnapshot(projectId: String, snapshotId: String) =
         repo.deleteSnapshot(projectId, snapshotId)
 
-    fun restoreSnapshot(projectId: String, snapshotId: String, onDone: (RestoreResult) -> Unit = {}) {
-        viewModelScope.launch(Dispatchers.IO) {
-            val result = runCatching { repo.restoreSnapshot(projectId, snapshotId) }
-                .getOrDefault(RestoreResult())
+    fun restoreSnapshot(projectId: String, snapshotId: String, onDone: (RestoreResult) -> Unit = {}): Job {
+        return viewModelScope.launch(Dispatchers.IO) {
+            val result = runSuspendCatching { repo.restoreSnapshot(projectId, snapshotId) }
+                .getOrElse { error ->
+                    RestoreResult(
+                        success = false,
+                        errorMessage = error.message ?: error::class.simpleName ?: "未知错误",
+                    )
+                }
             withContext(Dispatchers.Main) {
-                _statusMessage.value = buildString {
-                    append("已回退到该版本")
-                    if (result.staleChapterIds.isNotEmpty()) append("，知识库有 ${result.staleChapterIds.size} 章待重建")
+                _statusMessage.value = if (result.success) {
+                    buildString {
+                        append("已回退到该版本")
+                        if (result.staleChapterIds.isNotEmpty()) append("，知识库有 ${result.staleChapterIds.size} 章待重建")
+                    }
+                } else {
+                    "版本回退失败：${result.errorMessage.orEmpty()}"
                 }
                 onDone(result)
             }
@@ -2570,37 +5227,63 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
      */
     fun rebuildStaleKb(projectId: String, onProgress: (done: Int, total: Int) -> Unit = { _, _ -> }, onDone: (Int) -> Unit = {}) {
         val cfg = repo.embeddingConfig()
-        if (cfg.apiKey.isBlank() || cfg.apiUrl.isBlank() || cfg.model.isBlank()) {
+        if (!cfg.isUsableApiConfig()) {
             _statusMessage.value = "请先在「本地知识库」中填写 Embedding 配置"
             onDone(0); return
         }
         viewModelScope.launch(Dispatchers.IO) {
             val stale = repo.kbStaleChapters(projectId)
-            val chapters = repo.chapters(projectId).associateBy { it.id }
+            val embeddingSignature = repo.embeddingSourceSignature(cfg)
             var rebuilt = 0
+            var skipped = 0
             stale.forEachIndexed { idx, cid ->
+                currentCoroutineContext().ensureActive()
                 onProgress(idx + 1, stale.size)
-                val ch = chapters[cid] ?: run { repo.clearKbStaleChapter(projectId, cid); return@forEachIndexed }
-                val body = repo.chapterBody(cid)
-                val text = body.final.ifBlank { body.draft }
-                if (text.trim().length < 200) {
-                    // Nothing worth indexing — drop any stale vectors and clear the flag.
-                    repo.forgetKbSource(projectId, "chapter", cid)
-                    repo.setKbIndexHash(projectId, cid, com.example.novelseek_ultra.data.SnapshotStore.sha1(text))
-                    repo.clearKbStaleChapter(projectId, cid)
+                val input = repo.captureChapterSource(projectId, cid) ?: run {
+                    if (!repo.clearKbStaleIfChapterMissing(projectId, cid)) skipped += 1
                     return@forEachIndexed
                 }
-                runCatching { kb.indexChapter(cid, ch.title, text, cfg) }
-                    .onSuccess { chunks ->
-                        repo.appendChunks(projectId, chunks)
-                        repo.setKbIndexHash(projectId, cid, com.example.novelseek_ultra.data.SnapshotStore.sha1(text))
-                        repo.clearKbStaleChapter(projectId, cid)
-                        rebuilt += 1
+                val text = input.effectiveText
+                val hash = com.example.novelseek_ultra.data.SnapshotStore.sha1(text)
+                if (text.trim().length < 200) {
+                    // Nothing worth indexing — drop any stale vectors and clear the flag.
+                    if (!repo.commitChapterKbIfSourceCurrent(
+                            projectId = projectId,
+                            expected = input.source,
+                            expectedEmbeddingSignature = embeddingSignature,
+                            expectedEmbeddingModel = cfg.model,
+                            newChunks = emptyList(),
+                            indexHash = hash,
+                        )
+                    ) {
+                        skipped += 1
                     }
-                    .onFailure { _statusMessage.value = "KB 重建失败「${ch.title}」：${it.message}" }
+                    return@forEachIndexed
+                }
+                runSuspendCatching { kb.indexChapter(cid, input.source.title, text, cfg) }
+                    .onSuccess { chunks ->
+                        if (repo.commitChapterKbIfSourceCurrent(
+                                projectId = projectId,
+                                expected = input.source,
+                                expectedEmbeddingSignature = embeddingSignature,
+                                expectedEmbeddingModel = cfg.model,
+                                newChunks = chunks,
+                                indexHash = hash,
+                            )
+                        ) {
+                            rebuilt += 1
+                        } else {
+                            skipped += 1
+                        }
+                    }
+                    .onFailure { _statusMessage.value = "KB 重建失败「${input.source.title}」：${it.message}" }
             }
             withContext(Dispatchers.Main) {
-                _statusMessage.value = "知识库重建完成（$rebuilt 章）"
+                _statusMessage.value = when {
+                    repo.project(projectId) == null -> "项目已不存在，知识库重建结果未提交"
+                    skipped > 0 -> "知识库重建完成（$rebuilt 章，跳过 $skipped 个已变化来源）"
+                    else -> "知识库重建完成（$rebuilt 章）"
+                }
                 onDone(rebuilt)
             }
         }
@@ -2618,9 +5301,13 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun stopAskNovel() {
-        qaJob?.cancel()
-        _qaGenerating.value = false
-        _qaStreamingText.value = ""
+        synchronized(qaGenerationLock) {
+            qaGenerationRevision++
+            qaJob?.cancel()
+            qaJob = null
+            _qaGenerating.value = false
+            _qaStreamingText.value = ""
+        }
     }
 
     /**
@@ -2631,54 +5318,93 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
      */
     fun askNovel(projectId: String, question: String) {
         val q = question.trim()
-        if (q.isEmpty() || _qaGenerating.value) return
+        if (q.isEmpty() || repo.project(projectId) == null) return
         val cfg = repo.activeTextModelConfig()
         val lang = repo.uiLanguage()
-
-        repo.appendNovelChat(
-            projectId,
-            NovelChatMessage(id = "qa-${System.currentTimeMillis()}", role = "user", content = q, createdAt = nowIso()),
-        )
-        _qaStreamingText.value = ""
-        _qaGenerating.value = true
-        qaJob?.cancel()
-        qaJob = viewModelScope.launch(Dispatchers.IO) {
+        val job = synchronized(qaGenerationLock) {
+            if (_qaGenerating.value) return
+            val revision = ++qaGenerationRevision
+            qaJob?.cancel()
+            repo.appendNovelChat(
+                projectId,
+                NovelChatMessage(
+                    id = "qa-${System.currentTimeMillis()}",
+                    role = "user",
+                    content = q,
+                    createdAt = nowIso(),
+                ),
+            )
+            _qaStreamingText.value = ""
+            _qaGenerating.value = true
+            val buffer = StringBuilder()
+            viewModelScope.launch(Dispatchers.IO, start = CoroutineStart.LAZY) {
             val context = runCatching { buildNovelQaContext(projectId, q, lang) }.getOrDefault("")
             // Prior turns (drop the question we just appended) give the agent follow-up memory.
             val history = repo.novelChatHistory(projectId).dropLast(1).takeLast(8)
             val messages = buildList {
                 add(ChatMessage("system", novelQaSystemPrompt(lang)))
-                history.forEach { add(ChatMessage(it.role, it.content)) }
+                // Put the large, mostly stable novel material before changing chat history and the
+                // current question. Prefix-caching providers can then reuse it across Q&A turns.
                 add(ChatMessage("user", buildString {
                     appendLine(if (lang == "en") "[Novel Material]" else "【小说资料】")
-                    appendLine(context.ifBlank { if (lang == "en") "(no material available)" else "（暂无资料）" })
-                    appendLine()
+                    append(context.ifBlank { if (lang == "en") "(no material available)" else "（暂无资料）" })
+                }))
+                history.forEach { add(ChatMessage(it.role, it.content)) }
+                add(ChatMessage("user", buildString {
                     appendLine(if (lang == "en") "[Question]" else "【问题】")
                     append(q)
                 }))
             }
             try {
-                ai.streamChat(cfg, messages).collect { ev ->
-                    when (ev) {
-                        is AiService.StreamEvent.Delta -> _qaStreamingText.value = _qaStreamingText.value + ev.text
-                        AiService.StreamEvent.Done -> {}
-                        is AiService.StreamEvent.Error -> _statusMessage.value = "问答失败：${ev.message}"
+                ai.streamChat(cfg, messages).collectCompleted(onDelta = { text ->
+                    currentCoroutineContext().ensureActive()
+                    synchronized(qaGenerationLock) {
+                        if (qaGenerationRevision != revision) {
+                            throw CancellationException("Novel Q&A request was superseded")
+                        }
+                        buffer.append(text)
+                        _qaStreamingText.value = buffer.toString()
+                    }
+                })
+                currentCoroutineContext().ensureActive()
+                val answer = buffer.toString()
+                synchronized(qaGenerationLock) {
+                    if (
+                        qaGenerationRevision == revision &&
+                        repo.project(projectId) != null &&
+                        answer.isNotBlank()
+                    ) {
+                        repo.appendNovelChat(
+                            projectId,
+                            NovelChatMessage(
+                                id = "qa-${System.currentTimeMillis()}",
+                                role = "assistant",
+                                content = answer,
+                                createdAt = nowIso(),
+                            ),
+                        )
                     }
                 }
-                val answer = _qaStreamingText.value
-                if (answer.isNotBlank()) {
-                    repo.appendNovelChat(
-                        projectId,
-                        NovelChatMessage(id = "qa-${System.currentTimeMillis()}", role = "assistant", content = answer, createdAt = nowIso()),
-                    )
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                synchronized(qaGenerationLock) {
+                    if (qaGenerationRevision == revision) {
+                        _statusMessage.value = "问答失败：${error.message}"
+                    }
                 }
-            } catch (e: Exception) {
-                _statusMessage.value = "问答失败：${e.message}"
             } finally {
-                _qaGenerating.value = false
-                _qaStreamingText.value = ""
+                synchronized(qaGenerationLock) {
+                    if (qaGenerationRevision == revision) {
+                        _qaGenerating.value = false
+                        _qaStreamingText.value = ""
+                        qaJob = null
+                    }
+                }
             }
+            }.also { qaJob = it }
         }
+        job.start()
     }
 
     private fun novelQaSystemPrompt(lang: String): String =
@@ -2783,7 +5509,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         // Vector RAG over chapter passages (only when embeddings are configured + indexed).
         if (repo.knowledgeBaseEnabled()) {
             val cfg = repo.embeddingConfig()
-            if (cfg.apiKey.isNotBlank() && cfg.apiUrl.isNotBlank() && cfg.model.isNotBlank()) {
+            if (cfg.isUsableApiConfig()) {
                 val pool = repo.chunks(projectId)
                 if (pool.isNotEmpty()) {
                     runCatching {
@@ -2832,25 +5558,27 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         else -> listOf(Container.SINGLE_BLOCK_KEY to "主块")
     }
 
-    private fun latestContainerValue(projectId: String, containerId: String, blockKey: String): String =
-        repo.containerEntries(projectId, containerId, blockKey).lastOrNull()?.value.orEmpty()
-
     /** Re-run the AI update for one container against the latest chapter (manual "立即更新" button). */
     fun updateContainerNow(projectId: String, containerId: String, onDone: (Boolean) -> Unit = {}) {
         val c = repo.container(projectId, containerId) ?: return onDone(false)
         val ch = repo.chapters(projectId).maxByOrNull { it.order_index }
         if (ch == null) { _statusMessage.value = "暂无章节可供更新"; return onDone(false) }
-        val body = repo.chapterBody(ch.id)
-        val text = body.final.ifBlank { body.draft }
-        if (text.isBlank()) { _statusMessage.value = "最新章节暂无正文"; return onDone(false) }
+        val input = repo.captureChapterSource(projectId, ch.id)
+            ?: run { _statusMessage.value = "章节已不存在"; return onDone(false) }
+        if (input.effectiveText.isBlank()) { _statusMessage.value = "最新章节暂无正文"; return onDone(false) }
         val cfg = repo.activeTextModelConfig()
         if (!cfg.isValid()) { _statusMessage.value = "请先配置文本模型"; return onDone(false) }
         viewModelScope.launch(Dispatchers.IO) {
-            val ok = runCatching {
-                updateOneContainer(projectId, c, ch.id, ch.order_index, ch.title, text, cfg, _uiLanguage.value)
-            }.isSuccess
+            val outcome = runSuspendCatching {
+                updateOneContainer(projectId, c, input.source, input.effectiveText, cfg, _uiLanguage.value)
+            }
+            val ok = outcome.getOrDefault(false)
             withContext(Dispatchers.Main) {
-                _statusMessage.value = if (ok) "容器《${c.name}》已更新" else "容器更新失败"
+                _statusMessage.value = when {
+                    outcome.isFailure -> "容器更新失败：${outcome.exceptionOrNull()?.message.orEmpty()}"
+                    ok -> "容器《${c.name}》已更新"
+                    else -> "章节或容器已变化，旧结果未写入"
+                }
                 onDone(ok)
             }
         }
@@ -2860,61 +5588,114 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private fun updateContainersForChapter(projectId: String, chapterId: String, title: String, text: String) {
         val cfg = repo.activeTextModelConfig()
         if (!cfg.isValid() || text.trim().length < 50) return
+        val input = matchingChapterSource(projectId, chapterId, title, text) ?: return
         val containers = repo.containers(projectId).filter { it.autoUpdatePerChapter }
         if (containers.isEmpty()) return
         val lang = _uiLanguage.value
-        val order = repo.chapters(projectId).firstOrNull { it.id == chapterId }?.order_index ?: 0
         viewModelScope.launch(Dispatchers.IO) {
             containers.forEach { c ->
-                runCatching { updateOneContainer(projectId, c, chapterId, order, title, text, cfg, lang) }
+                runSuspendCatching { updateOneContainer(projectId, c, input.source, input.effectiveText, cfg, lang) }
                     .onFailure { _statusMessage.value = "容器《${c.name}》更新失败：${it.message}" }
             }
         }
     }
 
     private suspend fun updateOneContainer(
-        projectId: String, container: Container, chapterId: String,
-        order: Int, title: String, text: String, cfg: TextModelConfig, lang: String,
-    ) {
+        projectId: String,
+        container: Container,
+        source: ChapterSourceVersion,
+        text: String,
+        cfg: TextModelConfig,
+        lang: String,
+    ): Boolean {
         fun entryFrom(value: String) = ContainerEntry(
             id = "ce-${System.currentTimeMillis()}-${(0..999).random()}",
             value = value.trim(),
-            sourceChapterId = chapterId, sourceChapterOrder = order, sourceChapterTitle = title,
+            sourceChapterId = source.chapterId,
+            sourceChapterOrder = source.orderIndex,
+            sourceChapterTitle = source.title,
             createdAt = nowIso(),
         )
-        when (container.type) {
+        return when (container.type) {
             Container.BY_CHARACTER -> {
                 val chars = repo.characters(projectId)
-                if (chars.isEmpty()) return
+                if (chars.isEmpty()) return false
+                val characterSignature = repo.characterSourceSignature(chars)
+                val latest = chars.associate { ch ->
+                    ch.id to repo.containerEntries(projectId, container.id, ch.id).lastOrNull()
+                }
                 val perChar = chars.joinToString("\n") { ch ->
-                    val v = latestContainerValue(projectId, container.id, ch.id)
+                    val v = latest[ch.id]?.value.orEmpty()
                     "【${ch.name}】${if (lang == "en") "current: " else "当前值："}${v.ifBlank { if (lang == "en") "(none)" else "（暂无）" }}"
                 }
                 val reply = ai.chat(cfg, listOf(
                     ChatMessage("system", Prompts.containerByCharacterSystem(container.name, lang)),
-                    ChatMessage("user", Prompts.containerByCharacterUser(container.name, perChar, order, title, text, lang)),
+                    ChatMessage("user", Prompts.containerByCharacterUser(container.name, perChar, source.orderIndex, source.title, text, lang)),
                 ))
+                currentCoroutineContext().ensureActive()
                 val updates = parseStringMap(reply)
-                updates.forEach { (name, value) ->
-                    if (value.isBlank()) return@forEach
-                    val ch = chars.firstOrNull { it.name == name } ?: return@forEach
-                    repo.appendContainerEntry(projectId, container.id, ch.id, entryFrom(value))
+                val additions = updates.mapNotNull { (name, value) ->
+                    if (value.isBlank()) return@mapNotNull null
+                    val ch = chars.firstOrNull { it.name == name } ?: return@mapNotNull null
+                    ch.id to entryFrom(value)
+                }
+                if (additions.isEmpty()) {
+                    repo.containerInputsAreCurrent(
+                        projectId, source, container, latest,
+                        expectedCharacterSignature = characterSignature,
+                    )
+                } else {
+                    repo.appendContainerEntriesIfSourceCurrent(
+                        projectId = projectId,
+                        expectedSource = source,
+                        expectedContainer = container,
+                        expectedLatestEntries = latest,
+                        expectedCharacterSignature = characterSignature,
+                        additions = additions,
+                    )
                 }
             }
             Container.BY_CHAPTER -> {
+                val latest = mapOf(
+                    source.chapterId to repo.containerEntries(projectId, container.id, source.chapterId).lastOrNull(),
+                )
                 val reply = ai.chat(cfg, listOf(
                     ChatMessage("system", Prompts.containerByChapterSystem(container.name, lang)),
-                    ChatMessage("user", Prompts.containerByChapterUser(container.name, order, title, text, lang)),
+                    ChatMessage("user", Prompts.containerByChapterUser(container.name, source.orderIndex, source.title, text, lang)),
                 )).trim()
-                if (!isNoChange(reply)) repo.appendContainerEntry(projectId, container.id, chapterId, entryFrom(reply))
+                currentCoroutineContext().ensureActive()
+                if (isNoChange(reply)) {
+                    repo.containerInputsAreCurrent(projectId, source, container, latest)
+                } else {
+                    repo.appendContainerEntriesIfSourceCurrent(
+                        projectId = projectId,
+                        expectedSource = source,
+                        expectedContainer = container,
+                        expectedLatestEntries = latest,
+                        additions = listOf(source.chapterId to entryFrom(reply)),
+                    )
+                }
             }
             else -> {
-                val cur = latestContainerValue(projectId, container.id, Container.SINGLE_BLOCK_KEY)
+                val latestEntry = repo.containerEntries(projectId, container.id, Container.SINGLE_BLOCK_KEY).lastOrNull()
+                val latest = mapOf(Container.SINGLE_BLOCK_KEY to latestEntry)
+                val cur = latestEntry?.value.orEmpty()
                 val reply = ai.chat(cfg, listOf(
                     ChatMessage("system", Prompts.containerSingleSystem(container.name, lang)),
-                    ChatMessage("user", Prompts.containerSingleUser(container.name, cur, order, title, text, lang)),
+                    ChatMessage("user", Prompts.containerSingleUser(container.name, cur, source.orderIndex, source.title, text, lang)),
                 )).trim()
-                if (!isNoChange(reply)) repo.appendContainerEntry(projectId, container.id, Container.SINGLE_BLOCK_KEY, entryFrom(reply))
+                currentCoroutineContext().ensureActive()
+                if (isNoChange(reply)) {
+                    repo.containerInputsAreCurrent(projectId, source, container, latest)
+                } else {
+                    repo.appendContainerEntriesIfSourceCurrent(
+                        projectId = projectId,
+                        expectedSource = source,
+                        expectedContainer = container,
+                        expectedLatestEntries = latest,
+                        additions = listOf(Container.SINGLE_BLOCK_KEY to entryFrom(reply)),
+                    )
+                }
             }
         }
     }
@@ -2936,6 +5717,15 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             }.toMap()
     }.getOrDefault(emptyMap())
 
+    private suspend fun <T> runSuspendCatching(block: suspend () -> T): Result<T> =
+        try {
+            Result.success(block())
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
+            Result.failure(error)
+        }
+
     data class ImportPreview(
         val bundle: BackupBundle,
         val fileName: String,
@@ -2944,5 +5734,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     companion object {
         private const val TARGET_WORDS = 2500
+        private const val MAX_CHAPTER_BEATS = 7
+        private const val BLUEPRINT_MAX_OUTPUT_TOKENS = 2_000
+        /** Two beats produce the largest per-beat output allowance: 1250 * 2 + 512. */
+        private const val STEPWISE_PREFLIGHT_OUTPUT_TOKENS = 3_012
+        private const val MIN_FACT_EXTRACTION_CHARS = 20
+        private val STEPWISE_WRITTEN_TAIL_RESERVE = "文".repeat(1_500)
     }
 }

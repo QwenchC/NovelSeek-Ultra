@@ -33,6 +33,41 @@ data class EntityPayload(
     val status: String = "open",   // "open" | "paid_off" | "archived"
     val firstSeenChapterId: String? = null,
     val lastSeenChapterId: String? = null,
+    val isStale: Boolean = false,
+)
+
+/**
+ * One chapter-anchored claim extracted from committed prose.
+ *
+ * Unlike [EntityPayload], which is the latest aggregate view of an entity, this record never
+ * overwrites an older claim. Re-extracting edited prose marks the old chapter evidence stale and
+ * appends/revives the new deterministic claim, giving historical generation an auditable
+ * "what was known before this chapter" ledger.
+ */
+@Serializable
+data class FactEvidence(
+    val id: String,
+    val entityId: String? = null,
+    val factType: String,
+    val subject: String,
+    val claim: String,
+    val statusAfter: String = "open",
+    /** Optional verbatim excerpt, retained only when it can be found in the source chapter. */
+    val evidenceText: String = "",
+)
+
+/** One immutable extraction result, including a successful result containing zero facts. */
+@Serializable
+data class ChapterFactEvidenceBatch(
+    val id: String,
+    val chapterId: String,
+    /** Digest of the exact effective chapter prose used by the extractor. */
+    val sourceHash: String,
+    /** Digest of every semantic extractor input; blank on legacy chapter_facts.v1 records. */
+    val extractionInputHash: String = "",
+    val extractorContract: String = "chapter_facts.v1",
+    val facts: List<FactEvidence> = emptyList(),
+    val isStale: Boolean = false,
 )
 
 /**

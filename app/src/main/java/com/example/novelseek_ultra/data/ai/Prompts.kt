@@ -492,26 +492,36 @@ Style:
         targetWords: Int,
         isContinuation: Boolean,
         language: String,
-        // KB-augmentation context (book/arc summaries, open foreshadowing, RAG-retrieved
-        // long-range memory). Emitted as its own labeled block when non-null.
+        // Compiled Story State (summaries, open commitments/facts, character growth, tracked
+        // containers, recent committed consequences and optional RAG memory).
         kbAugmentation: String? = null,
+        // Target chapter/volume constraints change more often than world/timeline/character data,
+        // so they deliberately sit after Story State at the dynamic cache boundary.
+        targetConstraints: String? = null,
         // The user's own draft of this chapter (from the editor's Draft tab), injected as a strong
         // reference when the "use draft" switch is on and the draft is non-empty.
         draftReference: String? = null,
     ): String = buildString {
         if (language == "en") {
-            chapterList?.takeIf { it.isNotBlank() }?.let { appendLine("[Novel Chapter Structure]\n$it\n") }
-            kbAugmentation?.takeIf { it.isNotBlank() }?.let {
-                appendLine("[Knowledge Base Augmentation - book/arc summaries, open foreshadowing, long-range relevant memory]\nUse this to keep continuity over the whole novel. Do NOT quote these blocks verbatim in prose.\n\n$it\n")
-            }
+            // Keep project-wide, slow-changing material first. Prefix-caching providers such as
+            // DeepSeek only reuse content that is identical from token zero.
             worldSetting?.takeIf { it.isNotBlank() }?.let {
-                appendLine("[Important: World Building - follow strictly]\nKeep all generated content consistent with this world setting:\n\n$it\n")
+                appendLine("[Important: World Building - follow strictly]\nKeep all generated content consistent with this world setting:\n\n${it.stablePromptBlock()}\n")
             }
             timeline?.takeIf { it.isNotBlank() }?.let {
-                appendLine("[Important: Timeline - follow strictly]\nKeep chronology consistent with these events:\n\n$it\n")
+                appendLine("[Important: Timeline - follow strictly]\nKeep chronology consistent with these events:\n\n${it.stablePromptBlock()}\n")
             }
             charactersInfo?.takeIf { it.isNotBlank() }?.let {
-                appendLine("[Important: Character Bible - follow strictly]\nKeep identity/personality/background/motivation consistent:\n\n$it\n")
+                appendLine("[Important: Character Bible - immutable and follow strictly]\nKeep identity/personality/background/motivation consistent. This block takes priority if later context contradicts it:\n\n${it.stablePromptBlock()}\n")
+            }
+            kbAugmentation?.takeIf { it.isNotBlank() }?.let {
+                appendLine("[Compiled Story State v2 — authoritative continuity state]\nTreat committed facts, chapter evidence and open promises as binding continuity input. Evolve soft tracked state only with an in-story cause. Do NOT quote this block verbatim in prose.\n\n${it.stablePromptBlock()}\n")
+            }
+            targetConstraints?.takeIf { it.isNotBlank() }?.let {
+                appendLine("[Target chapter constraints — obey for this chapter]\n${it.stablePromptBlock()}\n")
+            }
+            chapterList?.takeIf { it.isNotBlank() }?.let {
+                appendLine("[Novel Chapter Structure]\n${it.stablePromptBlock()}\n")
             }
             draftReference?.takeIf { it.isNotBlank() }?.let {
                 appendLine("[Author's draft reference — the user's own draft/outline of THIS chapter]\nBuild on it: adopt its plot direction, key events and intent, then expand and polish it into full prose. Stay consistent with the world/timeline/character/realm settings above. Do not copy it verbatim, and do not deviate from its core arrangement.\n\n$it\n")
@@ -528,22 +538,24 @@ Style:
                 }
                 appendLine("\nRequirements:\n1. Write around $targetWords words.\n2. Strictly follow world setting, timeline, and character bible.\n3. Strong scene immersion and visual details.\n4. Natural dialogues consistent with character voices.\n5. If previous chapter context exists, connect naturally.\n6. Output plain English prose only (no Markdown).\n7. NEVER include \"Chapter N\", \"in the last chapter\", or any structural meta-labels in your prose.\n\nStart writing the chapter content now:")
             }
-            charactersInfo?.takeIf { it.isNotBlank() }?.let {
-                appendLine("\n\n[PRE-WRITE CHARACTER LOCK — immutable, takes priority if anything above contradicts]\n$it\n\nBegin writing the chapter now:")
-            }
         } else {
-            chapterList?.takeIf { it.isNotBlank() }?.let { appendLine("【小说章节结构】\n$it\n") }
-            kbAugmentation?.takeIf { it.isNotBlank() }?.let {
-                appendLine("【知识库增强 — 全书梗概 / 当前弧线进度 / 未回收伏笔 / 长程相关记忆】\n以下信息用于保持全书连贯，请用作背景参考，不要在正文中原文引用这些 block 内容。\n\n$it\n")
-            }
             worldSetting?.takeIf { it.isNotBlank() }?.let {
-                appendLine("【重要：世界观设定 - 必须严格遵守】\n以下是本小说的世界观设定，生成内容时必须保持一致，不得与设定冲突：\n\n$it\n")
+                appendLine("【重要：世界观设定 - 必须严格遵守】\n以下是本小说的世界观设定，生成内容时必须保持一致，不得与设定冲突：\n\n${it.stablePromptBlock()}\n")
             }
             timeline?.takeIf { it.isNotBlank() }?.let {
-                appendLine("【重要：时间线事件 - 必须严格遵守】\n以下是本小说的时间线，生成内容时必须保持时间顺序一致，不得与已发生的事件冲突：\n\n$it\n")
+                appendLine("【重要：时间线事件 - 必须严格遵守】\n以下是本小说的时间线，生成内容时必须保持时间顺序一致，不得与已发生的事件冲突：\n\n${it.stablePromptBlock()}\n")
             }
             charactersInfo?.takeIf { it.isNotBlank() }?.let {
-                appendLine("【重要：角色设定 - 必须严格遵守】\n以下是本小说的角色设定，生成内容时必须保持角色身份、性格、背景完全一致，不得擅自更改：\n\n$it\n")
+                appendLine("【重要：角色设定 - 不可更改且必须严格遵守】\n以下是本小说的角色设定；若后续参考信息与它冲突，以本段为准：\n\n${it.stablePromptBlock()}\n")
+            }
+            kbAugmentation?.takeIf { it.isNotBlank() }?.let {
+                appendLine("【编译小说状态 v2 — 权威连续性状态】\n已发生事实、逐章证据与未闭合剧情承诺属于连续性约束；软追踪状态只有在情节中存在原因时才能演进。不要在正文中原文引用本状态块。\n\n${it.stablePromptBlock()}\n")
+            }
+            targetConstraints?.takeIf { it.isNotBlank() }?.let {
+                appendLine("【目标章节约束 — 本章必须遵守】\n${it.stablePromptBlock()}\n")
+            }
+            chapterList?.takeIf { it.isNotBlank() }?.let {
+                appendLine("【小说章节结构】\n${it.stablePromptBlock()}\n")
             }
             draftReference?.takeIf { it.isNotBlank() }?.let {
                 appendLine("【作者草稿参考 — 用户已起草的本章内容/要点】\n请据此创作：在保持上述世界观/时间线/角色/境界设定一致的前提下，充分采纳草稿的情节走向、关键事件与写作意图，对其润色、扩写、补全为完整正文；不要照抄草稿，也不要偏离草稿的核心安排。\n\n$it\n")
@@ -559,9 +571,6 @@ Style:
                     appendLine("\n【上章结尾内容（仅供行文衔接，绝对不要在正文中提及「第X章」或任何章节标记）】（请自然衔接，不要重复）\n$it\n")
                 }
                 appendLine("\n写作要求：\n1. 本次生成约${targetWords}字\n2. 【重要】必须严格遵守世界观设定、时间线和角色设定，不得与之冲突\n3. 场景描写要有画面感\n4. 对话要自然生动，符合角色性格\n5. 如果有前一章内容，请自然衔接，不要突兀\n6. 不要使用markdown格式，直接输出小说正文\n7. 【严禁】正文中绝对不能出现「第X章」、「上一章」、「章节」等元叙事信息，那些只是内部参考标记，不属于故事内容")
-            }
-            charactersInfo?.takeIf { it.isNotBlank() }?.let {
-                appendLine("\n\n【动笔前强制核对 — 以下角色设定绝对不可更改，如与上文任何内容矛盾，以此处为准】\n$it\n\n立即开始写作，直接输出正文，不要添加任何说明：")
             }
         }
     }
@@ -604,28 +613,31 @@ Rules:
         worldSetting: String?,
         timeline: String?,
         kbAugmentation: String?,
+        targetConstraints: String? = null,
         draftReference: String?,
         targetWords: Int,
         isContinuation: Boolean,
         language: String,
     ): String = buildString {
         if (language == "en") {
-            chapterList?.takeIf { it.isNotBlank() }?.let { appendLine("[Novel Chapter Structure]\n$it\n") }
-            kbAugmentation?.takeIf { it.isNotBlank() }?.let { appendLine("[Knowledge Base Augmentation]\n$it\n") }
-            worldSetting?.takeIf { it.isNotBlank() }?.let { appendLine("[World Building]\n$it\n") }
-            timeline?.takeIf { it.isNotBlank() }?.let { appendLine("[Timeline]\n$it\n") }
-            charactersInfo?.takeIf { it.isNotBlank() }?.let { appendLine("[Character Bible]\n$it\n") }
+            worldSetting?.takeIf { it.isNotBlank() }?.let { appendLine("[World Building]\n${it.stablePromptBlock()}\n") }
+            timeline?.takeIf { it.isNotBlank() }?.let { appendLine("[Timeline]\n${it.stablePromptBlock()}\n") }
+            charactersInfo?.takeIf { it.isNotBlank() }?.let { appendLine("[Character Bible]\n${it.stablePromptBlock()}\n") }
+            kbAugmentation?.takeIf { it.isNotBlank() }?.let { appendLine("[Compiled Story State v2]\n${it.stablePromptBlock()}\n") }
+            targetConstraints?.takeIf { it.isNotBlank() }?.let { appendLine("[Target chapter constraints]\n${it.stablePromptBlock()}\n") }
+            chapterList?.takeIf { it.isNotBlank() }?.let { appendLine("[Novel Chapter Structure]\n${it.stablePromptBlock()}\n") }
             prevSummary?.takeIf { it.isNotBlank() }?.let { appendLine("[Previous chapters tail — context only]\n$it\n") }
             draftReference?.takeIf { it.isNotBlank() }?.let { appendLine("[Author's draft of this chapter — base the beats on it]\n$it\n") }
             if (isContinuation) currentContent?.takeIf { it.isNotBlank() }?.let { appendLine("[Already-written content of this chapter so far]\n${it.takeLast(2000)}\n") }
             appendLine("Plan the beats for this chapter.\nTitle: $chapterTitle\nGoal: $outlineGoal\nCore conflict: ${conflict.orEmpty()}\nThe full chapter should total about $targetWords words across all beats.")
             append("Output the beat plan now, separating each beat with a line of exactly $BEAT_DELIM :")
         } else {
-            chapterList?.takeIf { it.isNotBlank() }?.let { appendLine("【小说章节结构】\n$it\n") }
-            kbAugmentation?.takeIf { it.isNotBlank() }?.let { appendLine("【知识库增强 — 全书梗概/弧线进度/未回收伏笔/长程记忆】\n$it\n") }
-            worldSetting?.takeIf { it.isNotBlank() }?.let { appendLine("【世界观设定】\n$it\n") }
-            timeline?.takeIf { it.isNotBlank() }?.let { appendLine("【时间线】\n$it\n") }
-            charactersInfo?.takeIf { it.isNotBlank() }?.let { appendLine("【角色设定】\n$it\n") }
+            worldSetting?.takeIf { it.isNotBlank() }?.let { appendLine("【世界观设定】\n${it.stablePromptBlock()}\n") }
+            timeline?.takeIf { it.isNotBlank() }?.let { appendLine("【时间线】\n${it.stablePromptBlock()}\n") }
+            charactersInfo?.takeIf { it.isNotBlank() }?.let { appendLine("【角色设定】\n${it.stablePromptBlock()}\n") }
+            kbAugmentation?.takeIf { it.isNotBlank() }?.let { appendLine("【编译小说状态 v2】\n${it.stablePromptBlock()}\n") }
+            targetConstraints?.takeIf { it.isNotBlank() }?.let { appendLine("【目标章节约束】\n${it.stablePromptBlock()}\n") }
+            chapterList?.takeIf { it.isNotBlank() }?.let { appendLine("【小说章节结构】\n${it.stablePromptBlock()}\n") }
             prevSummary?.takeIf { it.isNotBlank() }?.let { appendLine("【前几章结尾（仅供衔接参考）】\n$it\n") }
             draftReference?.takeIf { it.isNotBlank() }?.let { appendLine("【作者本章草稿 — 请据此规划节拍】\n$it\n") }
             if (isContinuation) currentContent?.takeIf { it.isNotBlank() }?.let { appendLine("【本章已写内容】\n${it.takeLast(2000)}\n") }
@@ -633,6 +645,10 @@ Rules:
             append("现在输出节拍规划，每个节拍之间用单独一行的精确分隔符隔开：$BEAT_DELIM ")
         }
     }
+
+    /** Normalizes imported/user-edited blocks so semantically identical prefixes tokenize alike. */
+    private fun String.stablePromptBlock(): String =
+        replace("\r\n", "\n").replace('\r', '\n').trim()
 
     fun chapterSegmentSystem(language: String) = if (language == "en") {
         """You are a skilled fiction writer executing a pre-approved chapter blueprint. You will be given the full blueprint, the prose written so far, and the SINGLE beat to write now. Write ONLY that beat as polished prose.
@@ -663,28 +679,31 @@ Hard rules:
         worldSetting: String?,
         timeline: String?,
         kbAugmentation: String?,
+        targetConstraints: String? = null,
         draftReference: String?,
         targetWords: Int,
         language: String,
     ): String = buildString {
         if (language == "en") {
-            worldSetting?.takeIf { it.isNotBlank() }?.let { appendLine("[World Building — obey strictly]\n$it\n") }
-            timeline?.takeIf { it.isNotBlank() }?.let { appendLine("[Timeline — obey strictly]\n$it\n") }
-            charactersInfo?.takeIf { it.isNotBlank() }?.let { appendLine("[Character Bible — obey strictly]\n$it\n") }
-            kbAugmentation?.takeIf { it.isNotBlank() }?.let { appendLine("[Knowledge Base Augmentation]\n$it\n") }
-            draftReference?.takeIf { it.isNotBlank() }?.let { appendLine("[Author's draft of this chapter — honor its intent]\n$it\n") }
-            appendLine("[Full chapter blueprint]\n$blueprint\n")
+            worldSetting?.takeIf { it.isNotBlank() }?.let { appendLine("[World Building — obey strictly]\n${it.stablePromptBlock()}\n") }
+            timeline?.takeIf { it.isNotBlank() }?.let { appendLine("[Timeline — obey strictly]\n${it.stablePromptBlock()}\n") }
+            charactersInfo?.takeIf { it.isNotBlank() }?.let { appendLine("[Character Bible — obey strictly]\n${it.stablePromptBlock()}\n") }
+            kbAugmentation?.takeIf { it.isNotBlank() }?.let { appendLine("[Compiled Story State v2]\n${it.stablePromptBlock()}\n") }
+            targetConstraints?.takeIf { it.isNotBlank() }?.let { appendLine("[Target chapter constraints]\n${it.stablePromptBlock()}\n") }
+            draftReference?.takeIf { it.isNotBlank() }?.let { appendLine("[Author's draft of this chapter — honor its intent]\n${it.stablePromptBlock()}\n") }
+            appendLine("[Full chapter blueprint]\n${blueprint.stablePromptBlock()}\n")
             writtenTail?.takeIf { it.isNotBlank() }?.let { appendLine("[Prose written so far — continue from its end, do not repeat]\n$it\n") }
             appendLine("Chapter: $chapterTitle")
             appendLine("Now write beat $beatIndex of $beatTotal ONLY:\n$currentBeat")
             append("Write about $targetWords words for this beat. ${if (beatIndex == beatTotal) "This is the final beat — bring the chapter to a natural close." else "Do not conclude the chapter yet; leave a smooth handoff to the next beat."} Output plain prose only:")
         } else {
-            worldSetting?.takeIf { it.isNotBlank() }?.let { appendLine("【世界观设定 — 必须遵守】\n$it\n") }
-            timeline?.takeIf { it.isNotBlank() }?.let { appendLine("【时间线 — 必须遵守】\n$it\n") }
-            charactersInfo?.takeIf { it.isNotBlank() }?.let { appendLine("【角色设定 — 必须遵守】\n$it\n") }
-            kbAugmentation?.takeIf { it.isNotBlank() }?.let { appendLine("【知识库增强】\n$it\n") }
-            draftReference?.takeIf { it.isNotBlank() }?.let { appendLine("【作者本章草稿 — 尊重其意图】\n$it\n") }
-            appendLine("【本章完整蓝图】\n$blueprint\n")
+            worldSetting?.takeIf { it.isNotBlank() }?.let { appendLine("【世界观设定 — 必须遵守】\n${it.stablePromptBlock()}\n") }
+            timeline?.takeIf { it.isNotBlank() }?.let { appendLine("【时间线 — 必须遵守】\n${it.stablePromptBlock()}\n") }
+            charactersInfo?.takeIf { it.isNotBlank() }?.let { appendLine("【角色设定 — 必须遵守】\n${it.stablePromptBlock()}\n") }
+            kbAugmentation?.takeIf { it.isNotBlank() }?.let { appendLine("【编译小说状态 v2】\n${it.stablePromptBlock()}\n") }
+            targetConstraints?.takeIf { it.isNotBlank() }?.let { appendLine("【目标章节约束】\n${it.stablePromptBlock()}\n") }
+            draftReference?.takeIf { it.isNotBlank() }?.let { appendLine("【作者本章草稿 — 尊重其意图】\n${it.stablePromptBlock()}\n") }
+            appendLine("【本章完整蓝图】\n${blueprint.stablePromptBlock()}\n")
             writtenTail?.takeIf { it.isNotBlank() }?.let { appendLine("【目前已写正文（请从其结尾自然续写，不要重复）】\n$it\n") }
             appendLine("章节标题：$chapterTitle")
             appendLine("现在只写第 $beatIndex / $beatTotal 拍：\n$currentBeat")
@@ -998,23 +1017,23 @@ Hard rules:
     fun entityExtractionSystem(language: String) = if (language == "en") {
         """You analyze novel chapters and extract structured entities. Output ONLY a valid JSON object (no markdown, no preamble) of the form:
 {
-  "characters":     [{"name": "...", "aliases": ["..."], "summary": "1-2 sentence role/action this chapter"}],
-  "foreshadowing":  [{"name": "concise label of the foreshadowed thread", "summary": "what was planted and why it matters", "status": "open" | "paid_off"}],
-  "locations":      [{"name": "...", "summary": "what happened here"}],
-  "events":         [{"name": "concise event label", "summary": "what happened"}],
-  "items":          [{"name": "...", "summary": "significance"}]
+  "characters":     [{"name": "...", "aliases": ["..."], "summary": "1-2 sentence role/action this chapter", "evidence": "exact excerpt from chapter, <=160 chars"}],
+  "foreshadowing":  [{"name": "concise label of the foreshadowed thread", "summary": "what was planted and why it matters", "status": "open" | "paid_off", "evidence": "exact excerpt"}],
+  "locations":      [{"name": "...", "summary": "what happened here", "evidence": "exact excerpt"}],
+  "events":         [{"name": "concise event label", "summary": "what happened", "evidence": "exact excerpt"}],
+  "items":          [{"name": "...", "summary": "significance", "evidence": "exact excerpt"}]
 }
-Any category may be omitted or be an empty array. Be selective — only entities that meaningfully advance plot or character."""
+Any category may be omitted or be an empty array. Every emitted entity MUST include evidence that is a verbatim chapter substring; if no concise excerpt exists, omit that entity. Be selective — only entities that meaningfully advance plot or character."""
     } else {
         """你是小说章节分析师。请从给定章节中抽取结构化实体。只输出合法 JSON（无 markdown 标记、无前置说明），格式：
 {
-  "characters":     [{"name": "角色名", "aliases": ["别名"], "summary": "本章中此角色做了什么 / 担任什么角色，1-2 句话"}],
-  "foreshadowing":  [{"name": "伏笔线的简洁标签", "summary": "埋下了什么、为何重要", "status": "open" 或 "paid_off"}],
-  "locations":      [{"name": "地名", "summary": "此处发生了什么"}],
-  "events":         [{"name": "事件标签", "summary": "事件经过"}],
-  "items":          [{"name": "物品名", "summary": "重要性"}]
+  "characters":     [{"name": "角色名", "aliases": ["别名"], "summary": "本章中此角色做了什么 / 担任什么角色，1-2 句话", "evidence": "章节原文中的精确摘录，不超过160字"}],
+  "foreshadowing":  [{"name": "伏笔线的简洁标签", "summary": "埋下了什么、为何重要", "status": "open" 或 "paid_off", "evidence": "原文精确摘录"}],
+  "locations":      [{"name": "地名", "summary": "此处发生了什么", "evidence": "原文精确摘录"}],
+  "events":         [{"name": "事件标签", "summary": "事件经过", "evidence": "原文精确摘录"}],
+  "items":          [{"name": "物品名", "summary": "重要性", "evidence": "原文精确摘录"}]
 }
-任何分类可省略或为空数组。要克制——只抽取真正推进剧情或人物的实体。"""
+任何分类可省略或为空数组。每个输出实体都必须包含逐字来自章节正文的 evidence；找不到简短原文时应省略该实体。要克制——只抽取真正推进剧情或人物的实体。"""
     }
 
     fun entityExtractionUser(

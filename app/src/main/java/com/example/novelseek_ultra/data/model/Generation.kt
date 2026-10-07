@@ -331,6 +331,8 @@ data class GenerationRun(
     val operation: String = OPERATION_GENERATE,
     /** Final, prompt-free execution metrics. Missing legacy JSON decodes as null. */
     val telemetry: GenerationTelemetry? = null,
+    val sceneReviewFindings: List<com.example.novelseek_ultra.data.writing.ReviewFinding> = emptyList(),
+    val reviewRevisions: List<CandidateReviewRevision> = emptyList(),
     val status: String = STATUS_RUNNING,
     val candidates: List<CandidateChapter> = emptyList(),
     val selectedCandidateId: String? = null,
@@ -436,6 +438,13 @@ object GenerationSourceFingerprint {
     }
 
 }
+
+@Serializable
+data class CandidateReviewRevision(
+    val beforeBody: String,
+    val instruction: String,
+    val createdAt: String,
+)
 
 /** Deterministic, order-stable manifest builder shared by runtime code and pure JVM tests. */
 object GenerationContextFingerprint {

@@ -69,6 +69,7 @@ import com.example.novelseek_ultra.ui.screens.NovelQaScreen
 import com.example.novelseek_ultra.ui.screens.SettingsScreen
 import com.example.novelseek_ultra.ui.screens.TutorialScreen
 import com.example.novelseek_ultra.ui.screens.VersionHistoryScreen
+import com.example.novelseek_ultra.ui.screens.WritingWorkspaceRoute
 
 private sealed class Tab(val route: String, val zh: String, val en: String, val icon: ImageVector) {
     data object Home : Tab("home", "短篇", "Short", Icons.Outlined.Book)
@@ -80,6 +81,7 @@ private sealed class Tab(val route: String, val zh: String, val en: String, val 
 private val TABS = listOf(Tab.Home, Tab.LongHome, Tab.Listen, Tab.Settings)
 
 object Routes {
+    const val WORKSPACE = "workspace/{id}"
     const val PROJECT = "project/{id}"
     const val OUTLINE = "outline/{id}"
     const val CHARACTERS = "characters/{id}"
@@ -95,6 +97,7 @@ object Routes {
     const val TUTORIAL = "tutorial"
 
     fun project(id: String) = "project/$id"
+    fun workspace(id: String) = "workspace/$id"
     fun outline(id: String) = "outline/$id"
     fun characters(id: String) = "characters/$id"
     fun export(id: String) = "export/$id"
@@ -192,14 +195,14 @@ private fun NavGraphBuilder.tabRoutes(nav: NavHostController, vm: AppViewModel) 
     composable(Tab.Home.route) {
         HomeScreen(
             vm,
-            onOpen = { id -> nav.navigate(Routes.project(id)) },
+            onOpen = { id -> nav.navigate(Routes.workspace(id)) },
             onOpenTutorial = { nav.navigate(Routes.TUTORIAL) },
         )
     }
     composable(Tab.LongHome.route) {
         LongNovelsHomeScreen(
             vm,
-            onOpen = { id -> nav.navigate(Routes.longProject(id)) },
+            onOpen = { id -> nav.navigate(Routes.workspace(id)) },
             onOpenTutorial = { nav.navigate(Routes.TUTORIAL) },
         )
     }
@@ -208,6 +211,18 @@ private fun NavGraphBuilder.tabRoutes(nav: NavHostController, vm: AppViewModel) 
 }
 
 private fun NavGraphBuilder.detailRoutes(nav: NavHostController, vm: AppViewModel) {
+    composable(Routes.WORKSPACE) { entry ->
+        val id = entry.arguments?.getString("id") ?: return@composable
+        val isLong = vm.novelType(id) == "long"
+        WritingWorkspaceRoute(
+            vm, id, onBack = { nav.popBackStack() },
+            onOpenChapter = { nav.navigate(Routes.editor(id, it)) },
+            onOpenOutline = { nav.navigate(if (isLong) Routes.longOutline(id) else Routes.outline(id)) },
+            onOpenCharacters = { nav.navigate(Routes.characters(id)) },
+            onOpenAgent = { nav.navigate(Routes.AGENT) },
+            onOpenLegacyProject = { nav.navigate(if (isLong) Routes.longProject(id) else Routes.project(id)) },
+        )
+    }
     composable(Routes.PROJECT) { entry ->
         val id = entry.arguments?.getString("id") ?: return@composable
         ProjectScreen(

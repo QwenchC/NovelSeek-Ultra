@@ -1,6 +1,7 @@
 package com.example.novelseek_ultra.data
 
 import android.content.Context
+import com.example.novelseek_ultra.agent.ImportedAgentSessionPolicy
 import com.example.novelseek_ultra.data.ai.EntityReconciliation
 import com.example.novelseek_ultra.data.model.APP_SETTINGS_FIELDS
 import com.example.novelseek_ultra.data.model.AgentIndex
@@ -49,6 +50,10 @@ import com.example.novelseek_ultra.data.model.TextModelConfig
 import com.example.novelseek_ultra.data.model.Volume
 import com.example.novelseek_ultra.data.model.TextModelProfile
 import com.example.novelseek_ultra.data.model.collectProjectIds
+import com.example.novelseek_ultra.data.writing.WritingWorkspace
+import com.example.novelseek_ultra.data.writing.WritingUsageEntry
+import com.example.novelseek_ultra.data.writing.SceneWritingStore
+import com.example.novelseek_ultra.data.writing.WritingArchive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -81,6 +86,7 @@ class AppRepository(context: Context) {
         File(appContext.filesDir, "generation_runs"),
         JSON,
     )
+    val sceneWritingStore = SceneWritingStore(File(appContext.filesDir, "scene_writing"))
 
     /** True when this process repaired an import that was interrupted before commit. */
     val recoveredInterruptedBackupImport: Boolean =
@@ -319,6 +325,7 @@ class AppRepository(context: Context) {
             if (generationRunStore.deleteProject(projectId)) {
                 _generationRunRevision.value += 1
             }
+            sceneWritingStore.deleteProject(projectId)
         }
         deleteSnapshotsForProject(projectId)
     }
@@ -658,6 +665,7 @@ class AppRepository(context: Context) {
                 if (generationRunStore.deleteChapter(projectId, expected.id)) {
                     _generationRunRevision.value += 1
                 }
+                sceneWritingStore.deleteChapter(projectId, expected.id)
             }
             AtomicTextFile.delete(File(appContext.filesDir, "chapters/${expected.id}.json"))
             synchronized(illustrationMutationLock) {
@@ -2885,6 +2893,126 @@ class AppRepository(context: Context) {
             .map { it.copy(apiKey = secureStore.get(SecureStore.profileKey(it.id))) }
     }
 
+    fun writingWorkspace(projectId: String): WritingWorkspace =
+        (_state.value["writingWorkspaceByProject"] as? JsonObject)?.get(projectId)?.let {
+            JSON.decodeFromJsonElement(WritingWorkspace.serializer(), it).validated()
+        } ?: WritingWorkspace()
+
+    /** Append-only manuscript import shares the same crash-recovery journal as backup restore. */
+    fun importManuscript(projectId: String, preview: com.example.novelseek_ultra.data.writing.ManuscriptPreview): Int = synchronized(chapterMutationLock) {
+        require(project(projectId) != null) { "项目已不存在" }
+        require(preview.chapters.isNotEmpty() && preview.chapters.size <= 2_000)
+        require(preview.chapters.sumOf { it.body.length.toLong() } <= com.example.novelseek_ultra.data.writing.ManuscriptImporter.MAX_CHARACTERS)
+        require(preview.chapters.all { it.title.isNotBlank() && it.title.length <= 256 && it.body.isNotBlank() })
+        val original = chapters(projectId)
+        val start = (original.maxOfOrNull { it.order_index } ?: 0) + 1
+        val now = nowIso()
+        val added = preview.chapters.mapIndexed { index, item -> Chapter(id = "c-${UUID.randomUUID()}",
+            project_id = projectId, title = item.title, order_index = start + index, status = "completed",
+            word_count = item.body.length, created_at = now, updated_at = now) }
+        val incoming = buildJsonObject {
+            put("chaptersByProject", buildJsonObject { put(projectId, JSON.encodeToJsonElement(ListSerializer(Chapter.serializer()), original + added)) })
+            put("chapterBodies", buildJsonObject {
+                added.zip(preview.chapters).forEach { (chapter, item) ->
+                    put(chapter.id, JSON.encodeToJsonElement(ChapterBody.serializer(), ChapterBody(item.body, item.body)))
+                }
+            })
+        }
+        importBackup(BackupBundle(exportedAt = now, data = incoming), includeAppSettings = false)
+        added.size
+    }
+
+    internal fun attachSceneReview(projectId: String, runId: String, findings: List<com.example.novelseek_ultra.data.writing.ReviewFinding>) {
+        synchronized(generationRunMutationLock) {
+            generationRunStore.update(projectId, runId) { run ->
+                if (run.status != GenerationRun.STATUS_COMPLETED) run else run.copy(sceneReviewFindings = findings)
+            }
+            _generationRunRevision.value++
+        }
+    }
+
+    /** Revise the same review candidate without rejecting it or bypassing source-bound adoption. */
+    fun reviseReviewCandidate(projectId: String, runId: String, candidateId: String, expectedBody: String,
+        replacement: String, instruction: String, currentManifest: () -> GenerationContextManifest?): Boolean =
+        synchronized(chapterMutationLock) {
+            synchronized(generationRunMutationLock) {
+                synchronized(kbMutationLock) {
+                    synchronized(stateMutationLock) reviewLock@{
+                        ensureWritesAllowed()
+                        val run = generationRunStore.get(projectId, runId) ?: return@reviewLock false
+                        val candidate = run.candidates.firstOrNull { it.id == candidateId } ?: return@reviewLock false
+                        if (run.status != GenerationRun.STATUS_COMPLETED || candidate.body != expectedBody ||
+                            run.reviewRevisions.size >= 8 || replacement.isBlank() || replacement.length > 1_000_000) return@reviewLock false
+                        val chapter = chapters(projectId).firstOrNull { it.id == run.chapterId } ?: return@reviewLock false
+                        val body = chapterBody(chapter.id)
+                        val hashes = GenerationSourceFingerprint.capture(chapter, body.draft, body.final)
+                        if (hashes.planHash != run.baselinePlanHash || hashes.bodyHash != run.baselineBodyHash) return@reviewLock false
+                        if (run.contextManifest != null && currentManifest()?.fingerprint != run.contextManifest.fingerprint) return@reviewLock false
+                        val quality = com.example.novelseek_ultra.data.ai.ChapterCandidateValidator.validate(
+                            replacement, body.final.ifBlank { body.draft }, true, run.spec.targetWords,
+                            requireNetNewBody = run.operation == GenerationRun.OPERATION_CONTINUE,
+                        )
+                        if (quality.blocking) return@reviewLock false
+                        generationRunStore.update(projectId, runId) { latest -> latest.copy(
+                            candidates = latest.candidates.map { if (it.id == candidateId) it.copy(body = replacement,
+                                wordCount = quality.wordCount, qualityReport = quality) else it },
+                            sceneReviewFindings = emptyList(),
+                            reviewRevisions = latest.reviewRevisions + com.example.novelseek_ultra.data.model.CandidateReviewRevision(
+                                candidate.body, instruction.take(4_000), nowIso()), updatedAt = nowIso(),
+                        ) }
+                        _generationRunRevision.value++
+                        true
+                    }
+                }
+            }
+        }
+
+    fun saveWritingWorkspace(projectId: String, workspace: WritingWorkspace) = synchronized(chapterMutationLock) {
+        require(project(projectId) != null) { "项目已不存在" }
+        val previous = writingWorkspace(projectId).notes.associateBy { it.id }
+        val validated = workspace.copy(notes = workspace.notes.map { note ->
+            val old = previous[note.id]
+            val contentChanged = old == null || old.copy(sourceBodyHash = null) != note.copy(sourceBodyHash = null)
+            if (note.sourceChapterId != null && chapters(projectId).any { it.id == note.sourceChapterId } && (contentChanged || note.sourceBodyHash == null)) {
+                val body = chapterBody(note.sourceChapterId)
+                note.copy(sourceBodyHash = com.example.novelseek_ultra.data.writing.TextRangeReader.hash(body.final.ifBlank { body.draft }))
+            } else note
+        }).validated()
+        val chapterIds = chapters(projectId).map { it.id }.toSet()
+        val characterIds = characters(projectId).map { it.id }.toSet()
+        validated.notes.forEach { note ->
+            val old = previous[note.id]
+            require(note.sourceChapterId == null || note.sourceChapterId in chapterIds || old?.sourceChapterId == note.sourceChapterId) { "故事卡片的来源章节已不存在" }
+            require(note.payoffChapterId == null || note.payoffChapterId in chapterIds || old?.payoffChapterId == note.payoffChapterId) { "伏笔回收章节已不存在" }
+            require(note.knownByCharacterIds.all { it in characterIds || it in old?.knownByCharacterIds.orEmpty() }) { "故事卡片的知情角色已不存在" }
+        }
+        mutateState { state ->
+            val map = state["writingWorkspaceByProject"] as? JsonObject ?: JsonObject(emptyMap())
+            state.with("writingWorkspaceByProject", JsonObject(map + (projectId to JSON.encodeToJsonElement(WritingWorkspace.serializer(), validated))))
+        }
+    }
+
+    fun textModelForRole(projectId: String, role: String): TextModelConfig {
+        val profileId = writingWorkspace(projectId).profileId(role) ?: return activeTextModelConfig()
+        val p = textModelProfiles().firstOrNull { it.id == profileId }
+            ?: throw IllegalArgumentException("$role 配置的模型已删除，请在创作偏好中重新选择")
+        return TextModelConfig(p.provider, p.apiKey, p.apiUrl, p.model, p.temperature,
+            p.thinkingMode, p.contextWindowTokens, p.maxOutputTokens)
+    }
+
+    fun writingUsage(projectId: String): List<WritingUsageEntry> =
+        (_state.value["writingUsageByProject"] as? JsonObject)?.get(projectId)?.let {
+            JSON.decodeFromJsonElement(ListSerializer(WritingUsageEntry.serializer()), it)
+        }.orEmpty()
+
+    fun recordWritingUsage(projectId: String, entry: WritingUsageEntry) = synchronized(chapterMutationLock) {
+        if (project(projectId) != null) mutateState { state ->
+            val map = state["writingUsageByProject"] as? JsonObject ?: JsonObject(emptyMap())
+            val entries = (writingUsage(projectId).filterNot { it.runId == entry.runId } + entry).takeLast(1_000)
+            state.with("writingUsageByProject", JsonObject(map + (projectId to JSON.encodeToJsonElement(ListSerializer(WritingUsageEntry.serializer()), entries))))
+        }
+    }
+
     fun setActiveProfile(profileId: String) = synchronized(secureMutationLock) {
         val profile = textModelProfiles().firstOrNull { it.id == profileId }
             ?: return@synchronized
@@ -3051,12 +3179,14 @@ class AppRepository(context: Context) {
 
     fun buildBackupBundle(includeSecrets: Boolean = false): BackupBundle =
         synchronized(chapterMutationLock) {
-            synchronized(illustrationMutationLock) {
-                synchronized(novelChatMutationLock) {
-                    synchronized(agentMutationLock) {
-                        synchronized(secureMutationLock) {
-                            synchronized(stateMutationLock) {
-                                buildBackupBundleLocked(includeSecrets)
+            synchronized(generationRunMutationLock) {
+                sceneWritingStore.withExclusiveAccess {
+                    synchronized(illustrationMutationLock) {
+                        synchronized(novelChatMutationLock) {
+                            synchronized(agentMutationLock) {
+                                synchronized(secureMutationLock) {
+                                    synchronized(stateMutationLock) { buildBackupBundleLocked(includeSecrets) }
+                                }
                             }
                         }
                     }
@@ -3079,6 +3209,21 @@ class AppRepository(context: Context) {
         // device (PC import ignores unknown keys).
         val merged = buildJsonObject {
             for ((k, v) in base) put(k, v)
+            val projectIds = readProjects(stateSnapshot).map { it.id }
+            val chapterIdsByProject = chapterIdsByProject(stateSnapshot, projectIds.toSet())
+            put("generationRunsByProject", buildJsonObject {
+                projectIds.forEach { id -> put(id, JSON.encodeToJsonElement(ListSerializer(GenerationRun.serializer()),
+                    generationRunStore.list(id).filter { it.chapterId in chapterIdsByProject[id].orEmpty() })) }
+            })
+            put("sceneWritingByProject", buildJsonObject {
+                projectIds.forEach { id ->
+                    val archive = sceneWritingStore.exportProject(id)
+                    val known = chapterIdsByProject[id].orEmpty()
+                    put(id, JSON.encodeToJsonElement(WritingArchive.serializer(), archive.copy(
+                        plans = archive.plans.filter { it.chapterId in known },
+                        checkpoints = archive.checkpoints.filter { it.plan.chapterId in known })))
+                }
+            })
             val chapterIds = allChapterIds(stateSnapshot)
             buildJsonObject {
                 chapterIds.forEach { cid ->
@@ -3183,6 +3328,8 @@ class AppRepository(context: Context) {
         val agentSessions: Map<String, AgentSession>,
         val agentIndex: AgentIndex?,
         val chunkProjectIdsToClear: Set<String>,
+        val writingFiles: Map<File, String>,
+        val writingFilesToDelete: Set<File>,
     )
 
     private data class ImportFileSnapshot(
@@ -3198,20 +3345,20 @@ class AppRepository(context: Context) {
      */
     fun importBackup(bundle: BackupBundle, includeAppSettings: Boolean) {
         synchronized(chapterMutationLock) {
-            synchronized(illustrationMutationLock) {
-                synchronized(kbMutationLock) {
-                    synchronized(novelChatMutationLock) {
-                        synchronized(agentMutationLock) {
-                            synchronized(secureMutationLock) {
-                                synchronized(stateMutationLock) {
-                                    ensureWritesAllowed()
-                                    val previousState = _state.value
-                                    val prepared = prepareBackupImport(
-                                        incoming = bundle.data,
-                                        current = previousState,
-                                        includeAppSettings = includeAppSettings,
-                                    )
-                                    applyPreparedBackupImport(prepared, previousState)
+            synchronized(generationRunMutationLock) {
+                sceneWritingStore.withExclusiveAccess {
+                    synchronized(illustrationMutationLock) {
+                        synchronized(kbMutationLock) {
+                            synchronized(novelChatMutationLock) {
+                                synchronized(agentMutationLock) {
+                                    synchronized(secureMutationLock) {
+                                        synchronized(stateMutationLock) {
+                                            ensureWritesAllowed()
+                                            val previousState = _state.value
+                                            val prepared = prepareBackupImport(bundle.data, previousState, includeAppSettings)
+                                            applyPreparedBackupImport(prepared, previousState)
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -3234,6 +3381,7 @@ class AppRepository(context: Context) {
         else incoming to emptyMap()
 
         var nextState = mergeBackupState(current, sanitizedIncoming, includeAppSettings)
+        nextState = JsonObject(nextState - setOf("generationRunsByProject", "sceneWritingByProject"))
         if (includeAppSettings) nextState = migrateTextModelState(nextState)
         val vectorSpaceChanged = includeAppSettings &&
             embeddingSourceSignature(current) != embeddingSourceSignature(nextState)
@@ -3272,6 +3420,7 @@ class AppRepository(context: Context) {
                         if (session.id != id) rejectImport("data.agentSessions[$id].id 与对象键不一致")
                     }
                 }
+                .mapValues { (_, session) -> ImportedAgentSessionPolicy.quarantine(session) }
         } else {
             emptyMap()
         }
@@ -3284,6 +3433,41 @@ class AppRepository(context: Context) {
         }
         if (includeAppSettings) validateAgentImportReferences(agentSessions, agentIndex)
 
+        val writingFiles = linkedMapOf<File, String>()
+        val writingFilesToDelete = linkedSetOf<File>()
+        // Old JSON backups do not describe writing records. Retain their historical files, but
+        // never replace chapter sources while those records still represent live work.
+        (incoming["chaptersByProject"] as? JsonObject)?.keys.orEmpty().forEach { id ->
+            require(generationRunStore.list(id).none { !it.isTerminal() } &&
+                sceneWritingStore.list(id).none { it.status == com.example.novelseek_ultra.data.writing.WritingStatus.RUNNING }) {
+                "项目 $id 还有运行中的写作任务，请先暂停任务再导入备份"
+            }
+        }
+        decodeImportMap(incoming, "generationRunsByProject", ListSerializer(GenerationRun.serializer())).forEach { (id, runs) ->
+            require(id in projectIds) { "生成记录指向缺失项目" }
+            writingFiles.putAll(generationRunStore.validatedImportFiles(id, runs, chapterIdsByProject[id].orEmpty()))
+            writingFilesToDelete.addAll(generationRunStore.filesForProject(id).filter { it !in writingFiles })
+        }
+        decodeImportMap(incoming, "sceneWritingByProject", WritingArchive.serializer()).forEach { (id, archive) ->
+            require(id in projectIds && archive.plans.all { it.chapterId in chapterIdsByProject[id].orEmpty() }) { "场景计划指向缺失项目或章节" }
+            writingFiles.putAll(sceneWritingStore.validatedImportFiles(id, archive, replace = true))
+            writingFilesToDelete.addAll(sceneWritingStore.filesForProject(id).filter { it !in writingFiles })
+        }
+        decodeImportMap(incoming, "writingWorkspaceByProject", WritingWorkspace.serializer()).forEach { (id, workspace) ->
+            require(id in projectIds) { "写作偏好指向缺失项目" }
+            // Author cards remain recoverable after referenced chapters/characters were deleted.
+            // Missing references are never used as paths and are excluded by the context selector.
+            workspace.validated()
+        }
+
+        decodeImportMap(incoming, "writingUsageByProject", ListSerializer(WritingUsageEntry.serializer())).forEach { (id, entries) ->
+            require(id in projectIds && entries.size <= 1_000 && entries.map { it.runId }.distinct().size == entries.size) { "写作统计过多或重复" }
+            entries.forEach { entry ->
+                require(entry.requestCount in 0..1_000 && entry.failedRequests in 0..entry.requestCount)
+                require(listOf(entry.promptTokens, entry.completionTokens, entry.cacheHitTokens).all { it == null || it >= 0 })
+            }
+        }
+
         return PreparedBackupImport(
             nextState = nextState,
             sensitives = sensitives,
@@ -3293,6 +3477,8 @@ class AppRepository(context: Context) {
             agentSessions = agentSessions,
             agentIndex = agentIndex,
             chunkProjectIdsToClear = if (vectorSpaceChanged) projectIds else emptySet(),
+            writingFiles = writingFiles,
+            writingFilesToDelete = writingFilesToDelete,
         )
     }
 
@@ -3507,6 +3693,8 @@ class AppRepository(context: Context) {
         previousState: JsonObject,
     ) {
         val targetFiles = buildList {
+            addAll(prepared.writingFiles.keys)
+            addAll(prepared.writingFilesToDelete)
             prepared.chapterBodies.keys.forEach { add(File(appContext.filesDir, "chapters/$it.json")) }
             prepared.chapterIllustrations.keys.forEach { add(File(appContext.filesDir, "illustrations/$it.json")) }
             prepared.novelChats.keys.forEach { add(novelChatFile(it)) }
@@ -3539,6 +3727,11 @@ class AppRepository(context: Context) {
         }
 
         try {
+            prepared.writingFilesToDelete.forEach { file ->
+                touchedFiles += file.absolutePath
+                check(AtomicTextFile.delete(file)) { "无法替换旧写作记录" }
+            }
+            prepared.writingFiles.forEach { (file, text) -> write(file, text) }
             prepared.chapterBodies.forEach { (chapterId, body) ->
                 write(
                     File(appContext.filesDir, "chapters/$chapterId.json"),
@@ -3581,6 +3774,7 @@ class AppRepository(context: Context) {
             BackupImportJournal.commit(journal, secureStore)
             if (prepared.novelChats.isNotEmpty()) _novelChatRevision.value += 1
             if (prepared.chunkProjectIdsToClear.isNotEmpty()) _kbRevision.value += 1
+            if (prepared.writingFiles.isNotEmpty() || prepared.writingFilesToDelete.isNotEmpty()) _generationRunRevision.value++
         } catch (error: Throwable) {
             val rollbackErrors = mutableListOf<Throwable>()
             touchedFiles.toList().asReversed().forEach { path ->
@@ -4336,7 +4530,7 @@ class AppRepository(context: Context) {
 
     companion object {
         private const val STATE_FILE_NAME = "app_state.json"
-        private const val ANDROID_APP_VERSION = "1.0.0-android"
+        private const val ANDROID_APP_VERSION = "1.6.0"
 
         val JSON = Json {
             prettyPrint = true

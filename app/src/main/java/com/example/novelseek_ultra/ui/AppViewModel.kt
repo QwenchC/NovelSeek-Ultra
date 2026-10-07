@@ -9,6 +9,19 @@ import com.example.novelseek_ultra.data.DerivedChapterMutation
 import com.example.novelseek_ultra.data.DerivedSourceFingerprint
 import com.example.novelseek_ultra.data.FactEvidenceLedger
 import com.example.novelseek_ultra.data.NovelGenerationEngine
+import com.example.novelseek_ultra.data.writing.WritingWorkspace
+import com.example.novelseek_ultra.data.writing.StoryNoteSelector
+import com.example.novelseek_ultra.data.writing.ChapterWritingService
+import com.example.novelseek_ultra.data.writing.PreparedChapterWriting
+import com.example.novelseek_ultra.data.writing.SceneWritingStore
+import com.example.novelseek_ultra.data.writing.ChapterScenePlan
+import com.example.novelseek_ultra.data.writing.WritingCheckpoint
+import com.example.novelseek_ultra.data.writing.WritingMode
+import com.example.novelseek_ultra.data.writing.WritingStatus
+import com.example.novelseek_ultra.data.writing.ManuscriptPreview
+import com.example.novelseek_ultra.data.writing.toWritingUsage
+import java.io.File
+import java.util.concurrent.ConcurrentHashMap
 import com.example.novelseek_ultra.data.ai.AiService
 import com.example.novelseek_ultra.data.ai.ChatMessage
 import com.example.novelseek_ultra.data.ai.ChatResponseFormat
@@ -76,6 +89,9 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -255,6 +271,7 @@ data class FactEvidenceCoverage(
 
 private data class PromptSourceSnapshot(
     val project: PromptProjectSource,
+    val writingWorkspace: WritingWorkspace = WritingWorkspace(),
     val outline: String? = null,
     val worldSetting: String? = null,
     val timeline: String? = null,
@@ -282,6 +299,14 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private val repo: AppRepository = AppRepository.get(application)
     private val ai = AiService()
     private val novelGenerationEngine = NovelGenerationEngine(repo)
+    private val sceneWritingStore = repo.sceneWritingStore
+    private val chapterWriter = ChapterWritingService(repo, ai, novelGenerationEngine, sceneWritingStore)
+    private val writingJobs = ConcurrentHashMap<String, Job>()
+    private val reviewLocks = ConcurrentHashMap<String, Mutex>()
+    private val _writingRevision = MutableStateFlow(0)
+    val writingRevision: StateFlow<Int> = _writingRevision.asStateFlow()
+    private val _writingStages = MutableStateFlow<Map<String, String>>(emptyMap())
+    val writingStages: StateFlow<Map<String, String>> = _writingStages.asStateFlow()
     /** Session-scoped provider token/cache telemetry; populated when the API returns usage. */
     val textUsageStats = ai.usageStats
 
@@ -363,6 +388,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     override fun onCleared() {
+        writingJobs.values.forEach { it.cancel() }
         audiobook.release()
         agent.close()
         super.onCleared()
@@ -389,6 +415,194 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun deleteTextModelProfile(profileId: String) = repo.deleteTextModelProfile(profileId)
     fun setActiveProfile(profileId: String) = repo.setActiveProfile(profileId)
     fun activeTextModelConfig(): TextModelConfig = repo.activeTextModelConfig()
+
+    fun writingWorkspace(projectId: String): WritingWorkspace = repo.writingWorkspace(projectId)
+    fun saveWritingWorkspace(projectId: String, workspace: WritingWorkspace) = repo.saveWritingWorkspace(projectId, workspace)
+    fun writingUsage(projectId: String) = repo.writingUsage(projectId)
+    fun storyNoteStatusReport(projectId: String): Map<String, String> {
+        val workspace = repo.writingWorkspace(projectId)
+        val chapterIds = repo.chapters(projectId).map { it.id }.toSet()
+        val characterIds = repo.characters(projectId).map { it.id }.toSet()
+        val hashes = workspace.notes.mapNotNull { it.sourceChapterId }.distinct().associateWith { id ->
+            if (id !in chapterIds) null else repo.chapterBody(id).let { body ->
+                com.example.novelseek_ultra.data.writing.TextRangeReader.hash(body.final.ifBlank { body.draft })
+            }
+        }
+        return workspace.notes.associate { note -> note.id to when {
+            note.knownByCharacterIds.any { it !in characterIds } -> "知情角色已删除，不用于生成"
+            note.sourceChapterId == null -> "作者设定/计划；不代表角色已知"
+            note.sourceChapterId !in chapterIds -> "来源章节已删除，不用于生成"
+            note.sourceBodyHash == null || note.sourceBodyHash != hashes[note.sourceChapterId] -> "来源已变化或未核对，不用于生成"
+            else -> "已绑定当前来源正文；仅在来源章之后可见"
+        } }
+    }
+    fun scenePlans(projectId: String): List<ChapterScenePlan> {
+        val chapterIds = repo.chapters(projectId).map { it.id }.toSet()
+        return sceneWritingStore.listPlans(projectId).filter { it.chapterId in chapterIds }
+    }
+    private fun writingStageLabel(stage: String): String = when (stage) {
+        "planning" -> if (_uiLanguage.value == "en") "Planning scenes" else "正在规划场景"
+        "writing" -> if (_uiLanguage.value == "en") "Writing scene" else "正在写作场景"
+        "scene_completed" -> if (_uiLanguage.value == "en") "Scene saved" else "场景已保存"
+        "reviewing" -> if (_uiLanguage.value == "en") "Reviewing candidate" else "正在审稿"
+        "completed" -> if (_uiLanguage.value == "en") "Candidate ready" else "候选稿已完成"
+        else -> stage
+    }
+    fun writingCheckpoints(projectId: String): List<WritingCheckpoint> {
+        val chapterIds = repo.chapters(projectId).map { it.id }.toSet()
+        return sceneWritingStore.list(projectId).filter { it.plan.chapterId in chapterIds }
+    }
+    fun saveScenePlan(plan: ChapterScenePlan) {
+        require(repo.chapters(plan.projectId).any { it.id == plan.chapterId }) { "章节已不存在" }
+        check(sceneWritingStore.savePlan(plan)) { "当前场景正在生成，请先暂停" }
+        _writingRevision.update { it + 1 }
+    }
+
+    private suspend fun prepareChapterWriting(projectId: String, chapter: Chapter): PreparedChapterWriting {
+        val sources = captureStablePromptSources(projectId, PromptSourceScope.CHAPTER, chapter.order_index)
+            ?: error("项目上下文正在变化，请稍后再试")
+        val baseline = repo.chapterBody(chapter.id)
+        val storyState = buildStoryStateContext(sources, chapter, _uiLanguage.value)
+        val cards = StoryNoteSelector.select(sources.writingWorkspace, chapter, repo.chapters(projectId),
+            sourceHashes = sources.previousBodies.associate { (id, body) -> id to com.example.novelseek_ultra.data.writing.TextRangeReader.hash(body.final.ifBlank { body.draft }) },
+            characterNames = repo.characters(projectId).associate { it.id to it.name })
+        val arcs = sources.arcs.map { it.toPlotArc() }
+        val arc = chapter.arcId?.let { id -> arcs.firstOrNull { it.id == id } }
+            ?: arcs.firstOrNull { it.builtChapterIds?.contains(chapter.id) == true }
+        val ceiling = arc?.volumeId?.let { id -> sources.volumes.firstOrNull { it.id == id } }
+            ?.let { buildVolumeRealmConstraint(it.realmPlan, it.name, _uiLanguage.value, phase = "generate") }
+        val stableContext = buildString {
+            appendLine("作者偏好：\n${sources.writingWorkspace.preferencePrompt()}")
+            appendLine("世界观：\n${sources.worldSetting.orEmpty().ifBlank { sources.outline.orEmpty() }}")
+            appendLine("时间线：\n${sources.timeline.orEmpty()}")
+            appendLine("角色资料：\n${buildCharactersInfo(projectId)}")
+            appendLine("境界体系：\n${buildRealmSystemContext(sources.realms, _uiLanguage.value)}")
+            if (!ceiling.isNullOrBlank()) appendLine("本卷硬约束：\n$ceiling")
+            appendLine("目标章节之前的故事状态：\n$storyState")
+            appendLine("分类故事卡片：\n${cards.prompt}")
+            appendLine("作者设定和未来计划不代表视角人物已知；人物只能依据正文中的知情过程行动。")
+        }
+        return PreparedChapterWriting(projectId, chapter, baseline,
+            promptContextManifest(PromptSourceScope.CHAPTER, sources), stableContext) {
+            capturePromptSources(projectId, PromptSourceScope.CHAPTER, chapter.order_index)?.let {
+                promptContextManifest(PromptSourceScope.CHAPTER, it)
+            }
+        }
+    }
+
+    fun generateScenePlan(projectId: String, chapterId: String) {
+        val key = "$projectId/$chapterId"
+        if (writingJobs[key]?.isActive == true) return
+        val job = viewModelScope.launchWithFailureBoundary(context = Dispatchers.IO, start = CoroutineStart.LAZY,
+            onFailure = { _statusMessage.value = it.message ?: "场景规划失败" }) {
+            try {
+                _writingStages.update { it + (key to "正在规划场景") }
+                val chapter = repo.chapters(projectId).firstOrNull { it.id == chapterId } ?: error("章节已不存在")
+                chapterWriter.plan(prepareChapterWriting(projectId, chapter), _uiLanguage.value)
+                _statusMessage.value = "场景计划已保存，可编辑后开始写作"
+            } finally {
+                if (writingJobs.remove(key, currentCoroutineContext()[Job])) _writingStages.update { it - key }
+                _writingRevision.update { it + 1 }
+            }
+        }
+        if (writingJobs.putIfAbsent(key, job) != null) { job.cancel(); return }
+        job.start()
+    }
+
+    fun startWorkspaceChapter(projectId: String, chapterId: String, resumeRunId: String? = null) {
+        val chapter = repo.chapters(projectId).firstOrNull { it.id == chapterId } ?: return
+        val checkpoint = resumeRunId?.let { sceneWritingStore.load(projectId, chapterId) }
+        val mode = checkpoint?.mode ?: when (repo.writingWorkspace(projectId).mode) {
+            "quick" -> WritingMode.FAST
+            "polish" -> WritingMode.POLISHED
+            else -> WritingMode.SCENES
+        }
+        startUnifiedChapter(projectId, chapter, mode, resumeRunId = resumeRunId)
+    }
+
+    fun pauseWritingTask(projectId: String, chapterId: String) {
+        writingJobs["$projectId/$chapterId"]?.cancel(CancellationException("用户暂停场景任务"))
+    }
+
+    fun cancelWritingTask(projectId: String, chapterId: String) {
+        val key = "$projectId/$chapterId"
+        val previousOwner = writingJobs[key]
+        val control = viewModelScope.launchWithFailureBoundary(context = Dispatchers.IO, start = CoroutineStart.LAZY,
+            onFailure = { _statusMessage.value = it.message ?: "取消任务失败" }) {
+            val owner = checkNotNull(currentCoroutineContext()[Job])
+            try {
+                previousOwner?.cancel(CancellationException("用户取消场景任务"))
+                previousOwner?.join()
+                val run = repo.latestGenerationRun(projectId, chapterId)
+                if (run?.status == GenerationRun.STATUS_COMPLETED) {
+                    _statusMessage.value = "候选稿已经完成，请审核后采用或拒绝"
+                    return@launchWithFailureBoundary
+                }
+                if (run?.status == GenerationRun.STATUS_RUNNING) repo.cancelGenerationRun(projectId, run.id, "用户取消已中断任务")
+                sceneWritingStore.withExclusiveAccess {
+                    var checkpoint = sceneWritingStore.load(projectId, chapterId)
+                    if (checkpoint?.status == WritingStatus.RUNNING) {
+                        val interrupted = checkpoint.copy(status = WritingStatus.INTERRUPTED, revision = checkpoint.revision + 1,
+                            updatedAt = System.currentTimeMillis(), error = "无运行执行者，用户已取消")
+                        check(sceneWritingStore.compareAndSet(checkpoint, interrupted)) { "任务已变化，请刷新后重试" }
+                        checkpoint = interrupted
+                    }
+                }
+                _statusMessage.value = "任务已取消；完成场景和计划保留，正式正文未修改"
+            } finally {
+                if (writingJobs.remove(key, owner)) _writingStages.update { it - key }
+                _writingRevision.update { it + 1 }
+            }
+        }
+        val registered = if (previousOwner == null) writingJobs.putIfAbsent(key, control) == null
+            else writingJobs.replace(key, previousOwner, control)
+        if (!registered) { control.cancel(); _statusMessage.value = "任务状态已变化，请刷新后重试"; return }
+        _writingStages.update { it + (key to "正在取消任务") }
+        control.start()
+    }
+
+    private fun startUnifiedChapter(projectId: String, chapter: Chapter, mode: WritingMode,
+        resumeRunId: String? = null, continuation: String? = null, draftReference: String? = null) {
+        val key = "$projectId/${chapter.id}"
+        if (writingJobs[key]?.isActive == true) { _statusMessage.value = "本章已有任务正在运行"; return }
+        val ticket = claimStreamingGeneration(continuation.orEmpty(), chapterGeneration = true)
+        launchStreamingGeneration(ticket) { revision, buffer ->
+            val owner = checkNotNull(currentCoroutineContext()[Job])
+            check(writingJobs.putIfAbsent(key, owner) == null) { "本章已有任务正在运行" }
+            var generationId: String? = null
+            try {
+                val source = prepareChapterWriting(projectId, chapter)
+                val body = chapterWriter.write(source, _uiLanguage.value, mode, GenerationRun.INITIATOR_EDITOR,
+                    resumeRunId = resumeRunId, continuation = continuation, draftReference = draftReference,
+                    onStarted = { active ->
+                        generationId = active.run.id
+                        ChapterGenerationExecutions.replace(projectId, chapter.id, active.run.id, owner)
+                    },
+                    onProgress = { progress ->
+                        ensureStreamingOwner(revision)
+                        _writingStages.update { it + (key to writingStageLabel(progress.stage)) }
+                        val checkpoint = progress.checkpoint
+                        val completed = checkpoint?.body.orEmpty()
+                        val text = listOfNotNull((checkpoint?.baselineText ?: continuation)?.takeIf(String::isNotBlank), completed.takeIf(String::isNotBlank),
+                            progress.preview.takeIf(String::isNotBlank)).joinToString("\n\n")
+                        replaceStreamingText(revision, buffer, text)
+                        if (progress.preview.isEmpty()) _writingRevision.update { it + 1 }
+                    })
+                ensureStreamingOwner(revision)
+                replaceStreamingText(revision, buffer, body)
+                _statusMessage.value = "候选稿已生成，请审核后采用"
+            } finally {
+                generationId?.let { ChapterGenerationExecutions.unregister(projectId, chapter.id, it) }
+                if (writingJobs.remove(key, owner)) _writingStages.update { it - key }
+                _writingRevision.update { it + 1 }
+            }
+        }
+    }
+
+    fun importManuscript(projectId: String, preview: ManuscriptPreview) {
+        val count = repo.importManuscript(projectId, preview)
+        _statusMessage.value = "已导入 $count 章；未调用 AI，可按需提取资料"
+    }
     fun pollinationsKey(): String = repo.pollinationsKey()
     fun setPollinationsKey(key: String) = repo.setPollinationsKey(key)
 
@@ -719,6 +933,87 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     /** Exact durable generation run used by agent review links. Call from a worker dispatcher. */
     fun chapterGenerationRun(projectId: String, runId: String): GenerationRun? =
         repo.getGenerationRun(projectId, runId)
+
+    fun reviewBaselineText(run: GenerationRun): String {
+        val body = repo.chapterBody(run.chapterId)
+        return body.final.ifBlank { body.draft }
+    }
+
+    private fun currentReviewManifest(projectId: String, run: GenerationRun): GenerationContextManifest? {
+        val expected = run.contextManifest ?: return null
+        return when {
+            expected.scope == "prompt:${PromptSourceScope.CHAPTER.name}" -> {
+                val chapter = repo.chapters(projectId).firstOrNull { it.id == run.chapterId } ?: return null
+                captureStablePromptSources(projectId, PromptSourceScope.CHAPTER, chapter.order_index)?.let {
+                    promptContextManifest(PromptSourceScope.CHAPTER, it)
+                }
+            }
+            expected.scope.startsWith("agent:") -> expected
+            else -> null
+        }
+    }
+
+    /** Failed or stale revisions never replace either the candidate or the official chapter. */
+    suspend fun reviseChapterCandidate(projectId: String, runId: String, candidateId: String,
+        instruction: String): GenerationRun = withContext(Dispatchers.IO) {
+        reviewLocks.getOrPut("$projectId/$runId") { Mutex() }.withLock {
+        require(instruction.isNotBlank() && instruction.length <= 4_000) { "请填写不超过 4,000 字符的修改意见" }
+        val run = repo.getGenerationRun(projectId, runId) ?: error("候选稿已不存在")
+        check(run.status == GenerationRun.STATUS_COMPLETED) { "候选稿已处理" }
+        val candidate = run.candidates.firstOrNull { it.id == candidateId } ?: error("候选稿已不存在")
+        check(run.reviewRevisions.size < 8) { "本稿修改轮数已达上限，请采用或拒绝后重新生成" }
+        val originalRequests = maxOf(run.telemetry?.requestCount ?: 0,
+            sceneWritingStore.load(projectId, run.chapterId)?.takeIf { it.sourceFingerprint == run.sourceHash }?.requestCount ?: 0)
+        val revisionRequests = repo.writingUsage(projectId).filter { it.parentRunId == runId }.sumOf { it.requestCount.toLong() }
+        check(originalRequests + revisionRequests < repo.writingWorkspace(projectId).maxRequestsPerRun) {
+            "本任务请求额度不足，请在写作偏好中提高额度后再修订"
+        }
+        val cfg = TextModelRequestPolicy.normalizeForRequest(repo.textModelForRole(projectId, "review"))
+        require(cfg.apiKey.isNotBlank()) { "请配置审稿模型 API" }
+        val source = repo.chapters(projectId).firstOrNull { it.id == run.chapterId } ?: error("章节已不存在")
+        val context = prepareChapterWriting(projectId, source)
+        val messages = listOf(ChatMessage("system", "你是小说编辑。依据作者意见修订候选稿，保持原稿语言，以及未要求修改的剧情和设定。只输出完整修订正文，不要说明、标题或代码块。"),
+            ChatMessage("user", "写作约束：\n${context.stableContext}\n章节规划：${source.outline_goal.orEmpty()}\n作者修改意见：\n$instruction\n待修订候选全文：\n${candidate.body}"))
+        val prepared = PromptRequestBudgeter.validate(cfg, messages).messages
+        val usageId = "review-${java.util.UUID.randomUUID()}"
+        // Reserve one attempt durably before calling the provider, including failed retries.
+        repo.recordWritingUsage(projectId, com.example.novelseek_ultra.data.writing.WritingUsageEntry(
+            runId = usageId, model = cfg.model, completedAt = nowIso(), requestCount = 1,
+            chapterId = run.chapterId, parentRunId = runId))
+        val telemetry = GenerationTelemetryCollector.forModel(cfg, "chapter.review.revise.v1")
+        val trace = telemetry.beginRequest("review_revision", prepared, false)
+        val revised = try {
+            ai.chat(cfg, prepared, onUsage = trace::onUsage).also { trace.onContent(it); trace.complete() }
+        } catch (cancelled: CancellationException) {
+            trace.cancel()
+            runCatching { repo.recordWritingUsage(projectId, telemetry.finishCancelled().toWritingUsage(usageId, nowIso(), run.chapterId, runId)) }
+            throw cancelled
+        } catch (failure: Throwable) {
+            trace.fail(GenerationTelemetryCollector.failureCategory(failure))
+            runCatching { repo.recordWritingUsage(projectId, telemetry.finishFailed(GenerationTelemetryCollector.failureCategory(failure)).toWritingUsage(usageId, nowIso(), run.chapterId, runId)) }
+            throw failure
+        }
+        runCatching { repo.recordWritingUsage(projectId, telemetry.completedSnapshot().toWritingUsage(usageId, nowIso(), run.chapterId, runId)) }
+        check(repo.reviseReviewCandidate(projectId, runId, candidateId, candidate.body, revised, instruction) {
+            currentReviewManifest(projectId, run)
+        }) { "修改稿未提交：来源或候选稿已改变，或输出不完整；原候选稿已保留" }
+        checkNotNull(repo.getGenerationRun(projectId, runId))
+        }
+    }
+
+    fun adoptReviewedCandidate(projectId: String, runId: String, candidateId: String,
+        expectedBody: String, selectedText: String): CandidateAdoptionResult {
+        val run = repo.getGenerationRun(projectId, runId)
+            ?: return CandidateAdoptionResult.Unavailable("missing_run")
+        val candidate = run.candidates.firstOrNull { it.id == candidateId }
+            ?: return CandidateAdoptionResult.Unavailable("missing_candidate")
+        if (candidate.body != expectedBody || selectedText == reviewBaselineText(run))
+            return CandidateAdoptionResult.Unavailable("stale_or_no_changes")
+        if (selectedText != expectedBody && !repo.reviseReviewCandidate(projectId, runId, candidateId,
+                expectedBody, selectedText, "作者逐段选择采用") { currentReviewManifest(projectId, run) })
+            return CandidateAdoptionResult.Unavailable("source_or_candidate_changed")
+        return adoptChapterCandidate(projectId, runId, candidateId)
+    }
 
     fun adoptChapterCandidate(
         projectId: String,
@@ -1133,7 +1428,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         continueFromExisting: Boolean = false,
         onComplete: (String) -> Unit = {},
     ) {
-        val cfg = repo.activeTextModelConfig()
+        val cfg = repo.textModelForRole(projectId, "planning")
         if (!cfg.isValid()) {
             _statusMessage.value = "请先在「设置」中配置可用的文本模型 / Configure a text model first."
             return
@@ -1214,387 +1509,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         stepwise: Boolean = false,       // logic-chain path: blueprint → per-beat prose (off = legacy one-shot)
         draftReference: String? = null,  // user's chapter draft (from the Draft tab), injected as a strong reference
     ) {
-        val cfg = try {
-            TextModelRequestPolicy.normalizeForRequest(repo.activeTextModelConfig())
-        } catch (error: IllegalArgumentException) {
-            _statusMessage.value = error.message.orEmpty()
-            return
-        }
-        if (!cfg.isValid()) {
-            _statusMessage.value = "请先在「设置」中配置可用的文本模型 / Configure a text model first."
-            return
-        }
-        val ticket = claimStreamingGeneration(currentContent ?: "", chapterGeneration = true)
-        val lang = _uiLanguage.value
-        val isContinuation = !currentContent.isNullOrBlank()
-        val baselineChapter = repo.chapters(projectId).firstOrNull { it.id == chapter.id }
-        if (baselineChapter == null) {
-            abandonStreamingGeneration(ticket, "章节不存在，无法生成正文")
-            return
-        }
-        val baselineBody = repo.chapterBody(chapter.id)
-        val promptSources = captureStablePromptSources(
-            projectId,
-            PromptSourceScope.CHAPTER,
-            baselineChapter.order_index,
-        )
-        if (promptSources == null) {
-            abandonStreamingGeneration(ticket, "章节规划上下文正在变化或项目已删除，请稍后重试")
-            return
-        }
-
-        val expectedSource = GenerationSourceFingerprint.capture(
-            baselineChapter,
-            baselineBody.draft,
-            baselineBody.final,
-        )
-        if (GenerationSourceFingerprint.plan(chapter) != expectedSource.planHash) {
-            abandonStreamingGeneration(ticket, "章节规划与刚保存的基线不一致，请重新生成")
-            return
-        }
-        // Build all context
-        val arcs = promptSources.arcs.map { it.toPlotArc() }
-        val realmCtx = buildRealmSystemContext(promptSources.realms, lang)
-        // Per-volume realm ceiling (hard limit) for THIS chapter's owning volume — prevents over-leveling /
-        // skips / drops across the volume. Goes right after the realm ladder so it reads as the binding rule.
-        val ownerArc = chapter.arcId?.let { aid -> arcs.firstOrNull { it.id == aid } }
-            ?: arcs.firstOrNull { (it.builtChapterIds ?: emptyList()).contains(chapter.id) }
-        val volRealmConstraint = ownerArc?.volumeId
-            ?.let { vid -> promptSources.volumes.firstOrNull { it.id == vid } }
-            ?.let { vol -> buildVolumeRealmConstraint(vol.realmPlan, vol.name, lang, phase = "generate") }
-            ?.takeIf { it.isNotBlank() }
-        val worldSettingRaw = promptSources.worldSetting.orEmpty()
-            .ifBlank { promptSources.outline.orEmpty() }
-        val worldParts = listOfNotNull(
-            worldSettingRaw.takeIf { it.isNotBlank() },
-            realmCtx.takeIf { it.isNotBlank() },
-        )
-        val worldSetting = worldParts.joinToString("\n\n").takeIf { it.isNotBlank() }
-        val targetConstraints = volRealmConstraint
-        val timeline = promptSources.timeline?.takeIf { it.isNotBlank() }
-        val charactersInfo = buildCharactersInfo(projectId)
-        // Recent history is already compiled once inside Story State v2; do not duplicate it here.
-        val prevSummary = ""
-        val chapterList = buildChapterList(projectId, chapter.id)
-
-        launchStreamingGeneration(ticket) { revision, buffer ->
-            // Finish potentially expensive local/RAG preparation before reserving a durable run.
-            // This removes the crash window where context preparation could strand RUNNING state.
-            val kbAugmentation = try {
-                buildStoryStateContext(promptSources, chapter, lang)
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (error: Throwable) {
-                streamingError(
-                    revision,
-                    "生成准备失败，请检查知识库配置与网络后重试",
-                )
-                return@launchStreamingGeneration
-            }
-            val budgetedContext = try {
-                val preparationConfig = if (stepwise) {
-                    cfg.withStageOutputLimit(BLUEPRINT_MAX_OUTPUT_TOKENS)
-                } else {
-                    cfg
-                }
-                if (stepwise) {
-                    val segmentPreflightConfig =
-                        cfg.withStageOutputLimit(STEPWISE_PREFLIGHT_OUTPUT_TOKENS)
-                    val blueprintTextReserve = stepwiseGeneratedTextReserve(
-                        preparationConfig,
-                        "蓝",
-                    )
-                    try {
-                        fun segmentRequiredText(writtenTail: String?): String = listOfNotNull(
-                                chapter.title,
-                                blueprintTextReserve,
-                                blueprintTextReserve,
-                                writtenTail,
-                                "beat=$MAX_CHAPTER_BEATS/$MAX_CHAPTER_BEATS",
-                                "targetWords=$TARGET_WORDS",
-                            ).joinToString("\n")
-                        fun segmentContext(writtenTail: String?) = budgetChapterContext(
-                                cfg = segmentPreflightConfig,
-                                systemPrompt = Prompts.chapterSegmentSystem(lang),
-                                requiredTaskText = segmentRequiredText(writtenTail),
-                                worldSetting = worldSetting,
-                                timeline = timeline,
-                                charactersInfo = charactersInfo,
-                                storyState = kbAugmentation,
-                                targetConstraints = targetConstraints,
-                                chapterList = null,
-                                draftReference = draftReference,
-                            )
-                        segmentContext(STEPWISE_WRITTEN_TAIL_RESERVE)
-                        // A syntactically valid but unusable blueprint falls back to the legacy
-                        // one-shot request. Validate that branch before paying for the blueprint.
-                        budgetChapterContext(
-                            cfg = cfg,
-                            systemPrompt = Prompts.chapterSystem(lang),
-                            requiredTaskText = listOfNotNull(
-                                chapter.title,
-                                chapter.outline_goal,
-                                chapter.conflict,
-                                currentContent?.takeLast(2_000),
-                                "targetWords=$TARGET_WORDS",
-                            ).joinToString("\n"),
-                            worldSetting = worldSetting,
-                            timeline = timeline,
-                            charactersInfo = charactersInfo,
-                            storyState = kbAugmentation,
-                            targetConstraints = targetConstraints,
-                            chapterList = chapterList.takeIf { it.isNotBlank() },
-                            draftReference = draftReference,
-                        )
-                    } catch (error: PromptRequestBudgeter.BudgetExceededException) {
-                        throw PromptRequestBudgeter.BudgetExceededException(
-                            "分步生成的分段必需输入无法装入当前上下文；" + error.message.orEmpty(),
-                        )
-                    }
-                }
-                budgetChapterContext(
-                    cfg = preparationConfig,
-                    systemPrompt = if (stepwise) {
-                        Prompts.chapterBlueprintSystem(lang)
-                    } else {
-                        Prompts.chapterSystem(lang)
-                    },
-                    requiredTaskText = listOfNotNull(
-                        chapter.title,
-                        chapter.outline_goal,
-                        chapter.conflict,
-                        currentContent?.takeLast(2_000),
-                        "targetWords=$TARGET_WORDS",
-                    ).joinToString("\n"),
-                    worldSetting = worldSetting,
-                    timeline = timeline,
-                    charactersInfo = charactersInfo,
-                    storyState = kbAugmentation,
-                    targetConstraints = targetConstraints,
-                    chapterList = chapterList.takeIf { it.isNotBlank() },
-                    draftReference = draftReference,
-                )
-            } catch (error: PromptRequestBudgeter.BudgetExceededException) {
-                streamingError(revision, error.message.orEmpty())
-                return@launchStreamingGeneration
-            }
-            if (!promptSourcesStillCurrent(
-                    projectId,
-                    PromptSourceScope.CHAPTER,
-                    promptSources,
-                    baselineChapter.order_index,
-                ) || repo.chapters(projectId).firstOrNull { it.id == chapter.id } != baselineChapter ||
-                repo.chapterBody(chapter.id) != baselineBody
-            ) {
-                streamingError(revision, "内容冲突：章节规划上下文在 AI 生成前已被修改，请重新生成")
-                return@launchStreamingGeneration
-            }
-            val activeGeneration = novelGenerationEngine.startWithContextRecheck(
-                NovelGenerationEngine.Request(
-                    projectId = projectId,
-                    chapter = chapter,
-                    targetWords = TARGET_WORDS,
-                    language = lang,
-                    mode = if (stepwise) ChapterSpec.MODE_STEPWISE else ChapterSpec.MODE_ONE_SHOT,
-                    baselineText = currentContent.orEmpty(),
-                    requireNetNewBody = isContinuation,
-                    contextManifest = promptContextManifest(
-                        PromptSourceScope.CHAPTER,
-                        promptSources,
-                    ),
-                    expectedSourceHash = expectedSource.sourceHash,
-                    initiator = GenerationRun.INITIATOR_EDITOR,
-                    operation = if (isContinuation) {
-                        GenerationRun.OPERATION_CONTINUE
-                    } else {
-                        GenerationRun.OPERATION_GENERATE
-                    },
-                ),
-                currentContextManifest = {
-                    capturePromptSources(
-                        projectId,
-                        PromptSourceScope.CHAPTER,
-                        baselineChapter.order_index,
-                    )?.let { live ->
-                        promptContextManifest(PromptSourceScope.CHAPTER, live)
-                    }
-                },
-            )
-            if (activeGeneration == null) {
-                streamingError(revision, "无法建立候选稿生成记录，请稍后重试")
-                return@launchStreamingGeneration
-            }
-            ChapterGenerationExecutions.replace(
-                projectId,
-                chapter.id,
-                activeGeneration.run.id,
-                checkNotNull(currentCoroutineContext()[Job]) { "Missing generation coroutine job" },
-            )
-            val generationTelemetry = GenerationTelemetryCollector.forModel(
-                cfg,
-                if (stepwise) "chapter.stepwise.v2" else "chapter.one_shot.v2",
-            )
-            try {
-            if (stepwise) {
-                // Logic-chain path: first draft a beat-by-beat blueprint bound to this chapter's
-                // plan/realm/containers/prior context, then write each beat in sequence.
-                generateChapterStepwise(
-                    cfg = cfg,
-                    chapter = chapter,
-                    currentContent = currentContent,
-                    isContinuation = isContinuation,
-                    lang = lang,
-                    chapterList = budgetedContext.chapterList,
-                    charactersInfo = budgetedContext.charactersInfo,
-                    worldSetting = budgetedContext.worldSetting,
-                    timeline = budgetedContext.timeline,
-                    prevSummary = prevSummary.takeIf { it.isNotBlank() },
-                    kbAugmentation = budgetedContext.storyState,
-                    targetConstraints = budgetedContext.targetConstraints,
-                    draftReference = budgetedContext.draftReference,
-                    generationRevision = revision,
-                    buffer = buffer,
-                    telemetry = generationTelemetry,
-                )
-            } else {
-                val messages = listOf(
-                    ChatMessage("system", Prompts.chapterSystem(lang)),
-                    ChatMessage("user", Prompts.chapterUser(
-                        chapterTitle = chapter.title,
-                        outlineGoal = chapter.outline_goal.orEmpty(),
-                        conflict = chapter.conflict,
-                        prevSummary = prevSummary.takeIf { it.isNotBlank() },
-                        currentContent = if (isContinuation) currentContent!!.takeLast(2000) else null,
-                        chapterList = budgetedContext.chapterList,
-                        charactersInfo = budgetedContext.charactersInfo,
-                        worldSetting = budgetedContext.worldSetting,
-                        timeline = budgetedContext.timeline,
-                        targetWords = TARGET_WORDS,
-                        isContinuation = isContinuation,
-                        language = lang,
-                        kbAugmentation = budgetedContext.storyState,
-                        targetConstraints = budgetedContext.targetConstraints,
-                        draftReference = budgetedContext.draftReference,
-                    )),
-                )
-                collectGenerationStream(
-                    cfg = cfg,
-                    messages = messages,
-                    telemetry = generationTelemetry,
-                    purpose = if (isContinuation) "chapter_continue" else "chapter_generate",
-                    onDelta = { text -> appendStreamingText(revision, buffer, text) },
-                    onFailure = { message -> streamingError(revision, "生成失败：$message") },
-                )
-            }
-            ensureStreamingOwner(revision)
-            val final = buffer.toString()
-            val sourceStillCurrent = repo.project(projectId) != null &&
-                repo.chapters(projectId).firstOrNull { it.id == chapter.id } == baselineChapter &&
-                repo.chapterBody(chapter.id) == baselineBody &&
-                promptSourcesStillCurrent(
-                    projectId,
-                    PromptSourceScope.CHAPTER,
-                    promptSources,
-                    baselineChapter.order_index,
-                )
-            if (!sourceStillCurrent) {
-                val category = GenerationTelemetry.FAILURE_SOURCE_CONFLICT
-                novelGenerationEngine.fail(
-                    activeGeneration,
-                    GenerationTelemetryCollector.persistedFailureMessage(category),
-                    generationTelemetry.finishFailed(category),
-                )
-                streamingError(
-                    revision,
-                    "内容冲突：章节或其规划上下文在 AI 生成期间已被修改，未覆盖正式正文",
-                )
-                return@launchStreamingGeneration
-            }
-
-            var completion: NovelGenerationEngine.Completion? = null
-            var completionAttempted = false
-            val persisted = commitIfStreamingOwner(revision) {
-                completionAttempted = true
-                completion = completeGenerationCandidate(
-                    activeGeneration,
-                    final,
-                    generationTelemetry,
-                )
-                completion != null
-            }
-            if (persisted) {
-                val qualityReport = checkNotNull(completion).report
-                streamingError(
-                    revision,
-                    if (qualityReport.blocking) {
-                        "候选稿已保存，但未通过硬性质量检查；正式正文未改变"
-                    } else {
-                        "候选稿已生成，请预览后选择采用或拒绝；正式正文尚未改变"
-                    },
-                )
-            } else {
-                val persistenceFailure = completionAttempted &&
-                    !generationRunWasSuperseded(projectId, activeGeneration.run.id)
-                val category = if (persistenceFailure) {
-                    GenerationTelemetry.FAILURE_PERSISTENCE
-                } else {
-                    GenerationTelemetry.FAILURE_SUPERSEDED
-                }
-                val terminal = if (persistenceFailure) {
-                    generationTelemetry.finishFailed(category)
-                } else {
-                    generationTelemetry.finishCancelled(category)
-                }
-                if (persistenceFailure) {
-                    novelGenerationEngine.fail(
-                        activeGeneration,
-                        GenerationTelemetryCollector.persistedFailureMessage(category),
-                        terminal,
-                    )
-                } else {
-                    novelGenerationEngine.cancel(
-                        activeGeneration,
-                        GenerationTelemetryCollector.persistedFailureMessage(category),
-                        terminal,
-                    )
-                }
-            }
-            } catch (cancelled: CancellationException) {
-                val category = generationCancellationCategory(
-                    projectId,
-                    activeGeneration.run.id,
-                )
-                val telemetry = generationTelemetry.finishCancelled(category)
-                novelGenerationEngine.cancel(
-                    activeGeneration,
-                    GenerationTelemetryCollector.persistedFailureMessage(category),
-                    telemetry.takeIf { it.outcome == GenerationTelemetry.OUTCOME_CANCELLED },
-                )
-                throw cancelled
-            } catch (error: Throwable) {
-                val category = GenerationTelemetryCollector.failureCategory(error)
-                val telemetry = generationTelemetry.finishFailed(category)
-                novelGenerationEngine.fail(
-                    activeGeneration,
-                    GenerationTelemetryCollector.persistedFailureMessage(category),
-                    telemetry.takeIf { it.outcome == GenerationTelemetry.OUTCOME_FAILED },
-                )
-                streamingError(
-                    revision,
-                    "生成失败：" + if (error is PromptRequestBudgeter.BudgetExceededException) {
-                        error.message.orEmpty()
-                    } else {
-                        GenerationTelemetryCollector.persistedFailureMessage(category)
-                    },
-                )
-            } finally {
-                ChapterGenerationExecutions.unregister(
-                    projectId,
-                    chapter.id,
-                    activeGeneration.run.id,
-                )
-            }
-        }
+        val workspaceMode = repo.writingWorkspace(projectId).mode
+        startUnifiedChapter(projectId, chapter,
+            if (stepwise || workspaceMode == "scene") WritingMode.SCENES
+            else if (workspaceMode == "polish") WritingMode.POLISHED else WritingMode.FAST,
+            continuation = currentContent, draftReference = draftReference)
+        return
     }
 
     /** Replace the visible cumulative preview (used by multi-request continuation/batch flows). */
@@ -1614,190 +1534,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /**
-     * Logic-chain chapter generation. Runs inside the same streaming job as [generateChapter]:
-     *   1) one-shot [AiService.chat] drafts a beat-by-beat blueprint bound to the chapter plan,
-     *      realm system, containers and prior context;
-     *   2) each beat is then written with a streamed call, accumulating into the caller's buffer.
-     * If the blueprint comes back empty (model/network hiccup), falls back to a single one-shot
-     * streamed generation so the user still gets a chapter.
-     * The caller owns the generation token, UI publication, and persistence of the final text.
-     */
-    private suspend fun generateChapterStepwise(
-        cfg: TextModelConfig,
-        chapter: Chapter,
-        currentContent: String?,
-        isContinuation: Boolean,
-        lang: String,
-        chapterList: String?,
-        charactersInfo: String?,
-        worldSetting: String?,
-        timeline: String?,
-        prevSummary: String?,
-        kbAugmentation: String?,
-        targetConstraints: String?,
-        draftReference: String?,
-        generationRevision: Long,
-        buffer: StringBuilder,
-        telemetry: GenerationTelemetryCollector,
-    ) {
-        val blueprintConfig = cfg.withStageOutputLimit(BLUEPRINT_MAX_OUTPUT_TOKENS)
-        // Stage 1 — blueprint (non-streaming, internal; not shown verbatim to the user).
-        // Use try/catch (not runCatching) so a CancellationException from stopGenerating() during the
-        // blueprint call propagates instead of being swallowed — otherwise an empty blueprint would
-        // wrongly fall through to the one-shot fallback after the user already asked to stop.
-        val blueprintMessages = listOf(
-                ChatMessage("system", Prompts.chapterBlueprintSystem(lang)),
-                ChatMessage("user", Prompts.chapterBlueprintUser(
-                    chapterTitle = chapter.title,
-                    outlineGoal = chapter.outline_goal.orEmpty(),
-                    conflict = chapter.conflict,
-                    prevSummary = prevSummary,
-                    currentContent = if (isContinuation) currentContent?.takeLast(2000) else null,
-                    chapterList = chapterList,
-                    charactersInfo = charactersInfo,
-                    worldSetting = worldSetting,
-                    timeline = timeline,
-                    kbAugmentation = kbAugmentation,
-                    targetConstraints = targetConstraints,
-                    draftReference = draftReference,
-                    targetWords = TARGET_WORDS,
-                    isContinuation = isContinuation,
-                    language = lang,
-                )),
-            )
-        val blueprint = generationChat(
-            cfg = blueprintConfig,
-            messages = blueprintMessages,
-            telemetry = telemetry,
-            purpose = "chapter_blueprint",
-        ).trim()
-        ensureStreamingOwner(generationRevision)
-
-        val beats = blueprint.split(Prompts.BEAT_DELIM)
-            .map { it.trim() }
-            .filter { it.isNotBlank() }
-            .take(MAX_CHAPTER_BEATS)
-
-        // Fallback: no usable blueprint → one-shot streamed generation (legacy behavior).
-        if (beats.size < 2) {
-            val fallbackContext = budgetChapterContext(
-                cfg = cfg,
-                systemPrompt = Prompts.chapterSystem(lang),
-                requiredTaskText = listOfNotNull(
-                    chapter.title,
-                    chapter.outline_goal,
-                    chapter.conflict,
-                    currentContent?.takeLast(2_000),
-                    "targetWords=$TARGET_WORDS",
-                ).joinToString("\n"),
-                worldSetting = worldSetting,
-                timeline = timeline,
-                charactersInfo = charactersInfo,
-                storyState = kbAugmentation,
-                targetConstraints = targetConstraints,
-                chapterList = chapterList,
-                draftReference = draftReference,
-            )
-            val messages = listOf(
-                ChatMessage("system", Prompts.chapterSystem(lang)),
-                ChatMessage("user", Prompts.chapterUser(
-                    chapterTitle = chapter.title,
-                    outlineGoal = chapter.outline_goal.orEmpty(),
-                    conflict = chapter.conflict,
-                    prevSummary = prevSummary,
-                    currentContent = if (isContinuation) currentContent?.takeLast(2000) else null,
-                    chapterList = fallbackContext.chapterList,
-                    charactersInfo = fallbackContext.charactersInfo,
-                    worldSetting = fallbackContext.worldSetting,
-                    timeline = fallbackContext.timeline,
-                    targetWords = TARGET_WORDS,
-                    isContinuation = isContinuation,
-                    language = lang,
-                    kbAugmentation = fallbackContext.storyState,
-                    targetConstraints = fallbackContext.targetConstraints,
-                    draftReference = fallbackContext.draftReference,
-                )),
-            )
-            collectGenerationStream(
-                cfg = cfg,
-                messages = messages,
-                telemetry = telemetry,
-                purpose = "chapter_fallback",
-                onDelta = { text -> appendStreamingText(generationRevision, buffer, text) },
-                onFailure = { message -> streamingError(generationRevision, "生成失败：$message") },
-            )
-            return
-        }
-
-        // Stage 2 — write each beat, streaming into the same _streamingText buffer.
-        val perBeatWords = (TARGET_WORDS / beats.size).coerceAtLeast(300)
-        val normalizedBlueprint = beats.joinToString("\n${Prompts.BEAT_DELIM}\n")
-        val longestBeat = beats.maxByOrNull(PromptRequestBudgeter::estimateText).orEmpty()
-        val segmentOutputLimit = (perBeatWords * 2 + 512).coerceIn(1_024, 4_096)
-        val segmentConfig = cfg.withStageOutputLimit(segmentOutputLimit)
-        // Allocate all slow-changing blocks once against the worst per-beat required tail. Every
-        // segment then carries the exact same cacheable prefix regardless of how much prose exists.
-        val fixedSegmentContext = budgetChapterContext(
-            cfg = segmentConfig,
-            systemPrompt = Prompts.chapterSegmentSystem(lang),
-            requiredTaskText = listOf(
-                chapter.title,
-                normalizedBlueprint,
-                longestBeat,
-                STEPWISE_WRITTEN_TAIL_RESERVE,
-                "beat=${beats.size}/${beats.size}",
-                "targetWords=$perBeatWords",
-            ).joinToString("\n"),
-            worldSetting = worldSetting,
-            timeline = timeline,
-            charactersInfo = charactersInfo,
-            storyState = kbAugmentation,
-            targetConstraints = targetConstraints,
-            chapterList = null,
-            draftReference = draftReference,
-        )
-        beats.forEachIndexed { i, beat ->
-            ensureStreamingOwner(generationRevision)
-            // Separate beats (and separate from any pre-existing continuation text) with a blank line.
-            val cur = buffer.toString()
-            if (cur.isNotEmpty() && !cur.endsWith("\n\n")) {
-                appendStreamingText(
-                    generationRevision,
-                    buffer,
-                    if (cur.endsWith("\n")) "\n" else "\n\n",
-                )
-            }
-            val writtenTail = buffer.toString().takeLast(1500).takeIf { it.isNotBlank() }
-            val messages = listOf(
-                ChatMessage("system", Prompts.chapterSegmentSystem(lang)),
-                ChatMessage("user", Prompts.chapterSegmentUser(
-                    chapterTitle = chapter.title,
-                    blueprint = normalizedBlueprint,
-                    currentBeat = beat,
-                    beatIndex = i + 1,
-                    beatTotal = beats.size,
-                    writtenTail = writtenTail,
-                    charactersInfo = fixedSegmentContext.charactersInfo,
-                    worldSetting = fixedSegmentContext.worldSetting,
-                    timeline = fixedSegmentContext.timeline,
-                    kbAugmentation = fixedSegmentContext.storyState,
-                    targetConstraints = fixedSegmentContext.targetConstraints,
-                    draftReference = fixedSegmentContext.draftReference,
-                    targetWords = perBeatWords,
-                    language = lang,
-                )),
-            )
-            collectGenerationStream(
-                cfg = segmentConfig,
-                messages = messages,
-                telemetry = telemetry,
-                purpose = "chapter_segment_${i + 1}",
-                onDelta = { text -> appendStreamingText(generationRevision, buffer, text) },
-                onFailure = { message -> streamingError(generationRevision, "生成失败：$message") },
-            )
-        }
-    }
 
     /** AI fill: generates a 3-line title/goal/conflict suggestion for the given chapter index. */
     fun generateChapterOutline(
@@ -1805,7 +1541,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         chapterOrderIndex: Int,
         userRequirements: String,
     ) {
-        val cfg = repo.activeTextModelConfig()
+        val cfg = repo.textModelForRole(projectId, "planning")
         if (!cfg.isValid()) {
             _statusMessage.value = "请先在「设置」中配置可用的文本模型 / Configure a text model first."
             return
@@ -1882,7 +1618,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     /** Generates a chapter-by-chapter plan for [arcId] and saves it as arc.miniOutline. */
     fun generateArcMiniOutline(projectId: String, arcId: String) {
-        val cfg = repo.activeTextModelConfig()
+        val cfg = repo.textModelForRole(projectId, "planning")
         if (!cfg.isValid()) {
             _statusMessage.value = "请先在「设置」中配置可用的文本模型 / Configure a text model first."
             return
@@ -2404,7 +2140,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         userIdea: String,
         targetChapterCount: Int?,
     ): PlotArc? {
-        val cfg = repo.activeTextModelConfig()
+        val cfg = repo.textModelForRole(projectId, "planning")
         if (!cfg.isValid()) return null
         val lang = _uiLanguage.value
         val project = repo.project(projectId) ?: return null
@@ -2470,7 +2206,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     /** Generate [count] volumes from the outline + realm system + influencing containers (no arcs).
      *  [requirements] is the user's free-form instruction (e.g. what the first/later volumes cover). */
     fun generateVolumes(projectId: String, count: Int, requirements: String? = null, onDone: (Int) -> Unit = {}): Job? {
-        val cfg = repo.activeTextModelConfig()
+        val cfg = repo.textModelForRole(projectId, "planning")
         if (!cfg.isValid()) { _statusMessage.value = "请先在「设置」中配置可用的文本模型"; onDone(0); return null }
         val lang = _uiLanguage.value
         return viewModelScope.launch(Dispatchers.IO) {
@@ -2542,7 +2278,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     /** Generate [count] plot arcs inside [volumeId] (no chapter planning). [requirements] is the
      *  user's free-form instruction (e.g. what specific arcs should cover). */
     fun generateArcsForVolume(projectId: String, volumeId: String, count: Int, requirements: String? = null, onDone: (Int) -> Unit = {}): Job? {
-        val cfg = repo.activeTextModelConfig()
+        val cfg = repo.textModelForRole(projectId, "planning")
         if (!cfg.isValid()) { _statusMessage.value = "请先在「设置」中配置可用的文本模型"; onDone(0); return null }
         val lang = _uiLanguage.value
         val volume = repo.volumes(projectId).firstOrNull { it.id == volumeId } ?: run { onDone(0); return null }
@@ -2821,7 +2557,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         throw IllegalStateException("内容冲突：$target 在 AI 处理期间已被修改，已保留用户的新内容")
 
     suspend fun agentGenerateOutline(projectId: String, onDelta: (String) -> Unit = {}): String? {
-        val cfg = repo.activeTextModelConfig(); if (!cfg.isValid()) return null
+        val cfg = repo.textModelForRole(projectId, "planning"); if (!cfg.isValid()) return null
         val promptSources = captureStablePromptSources(projectId, PromptSourceScope.OUTLINE) ?: return null
         val baselineOutline = promptSources.outline.orEmpty()
         val projectSource = promptSources.project
@@ -2869,191 +2605,39 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         agentActionId: String = "",
         onDelta: (String) -> Unit = {},
     ): String? {
-        val cfg = repo.activeTextModelConfig(); if (!cfg.isValid()) return null
-        val chapter = repo.chapters(projectId).firstOrNull { it.id == chapterId } ?: return null
-        val baselineBody = repo.chapterBody(chapterId)
-        val promptSources = captureStablePromptSources(
-            projectId,
-            PromptSourceScope.CHAPTER,
-            chapter.order_index,
-        ) ?: return null
-        val lang = _uiLanguage.value
+        val liveChapter = repo.chapters(projectId).firstOrNull { it.id == chapterId } ?: return null
         return withContext(Dispatchers.IO) {
-            val arcs = promptSources.arcs.map { it.toPlotArc() }
-            val realmCtx = buildRealmSystemContext(promptSources.realms, lang)
-            // Per-volume realm ceiling (hard limit) for THIS chapter's owning volume — same enforcement the
-            // manual generateChapter() path applies, so agent-written chapters can't drift past the limit either.
-            val ownerArc = chapter.arcId?.let { aid -> arcs.firstOrNull { it.id == aid } }
-                ?: arcs.firstOrNull { (it.builtChapterIds ?: emptyList()).contains(chapter.id) }
-            val volRealmConstraint = ownerArc?.volumeId
-                ?.let { vid -> promptSources.volumes.firstOrNull { it.id == vid } }
-                ?.let { vol -> buildVolumeRealmConstraint(vol.realmPlan, vol.name, lang, phase = "generate") }
-                ?.takeIf { it.isNotBlank() }
-            val worldRaw = promptSources.worldSetting.orEmpty()
-                .ifBlank { promptSources.outline.orEmpty() }
-            val worldSetting = listOfNotNull(worldRaw.ifBlank { null }, realmCtx.ifBlank { null })
-                .joinToString("\n\n").ifBlank { null }
-            val kbAug = buildStoryStateContext(promptSources, chapter, lang)
-            val chapterSystem = Prompts.chapterSystem(lang)
-            val budgetedContext = budgetChapterContext(
-                cfg = cfg,
-                systemPrompt = chapterSystem,
-                requiredTaskText = listOf(
-                    chapter.title,
-                    chapter.outline_goal.orEmpty(),
-                    chapter.conflict.orEmpty(),
-                    "targetWords=$TARGET_WORDS",
-                ).joinToString("\n"),
-                worldSetting = worldSetting,
-                timeline = promptSources.timeline?.ifBlank { null },
-                charactersInfo = buildCharactersInfo(projectId),
-                storyState = kbAug,
-                targetConstraints = volRealmConstraint,
-                chapterList = buildChapterList(projectId, chapter.id).ifBlank { null },
-                draftReference = null,
-            )
-            val messages = listOf(
-                ChatMessage("system", chapterSystem),
-                ChatMessage("user", Prompts.chapterUser(
-                    chapterTitle = chapter.title,
-                    outlineGoal = chapter.outline_goal.orEmpty(),
-                    conflict = chapter.conflict,
-                    prevSummary = null,
-                    currentContent = null,
-                    chapterList = budgetedContext.chapterList,
-                    charactersInfo = budgetedContext.charactersInfo,
-                    worldSetting = budgetedContext.worldSetting,
-                    timeline = budgetedContext.timeline,
-                    targetWords = TARGET_WORDS,
-                    isContinuation = false,
-                    language = lang,
-                    kbAugmentation = budgetedContext.storyState,
-                    targetConstraints = budgetedContext.targetConstraints,
-                )),
-            )
-            if (!promptSourcesStillCurrent(
-                    projectId,
-                    PromptSourceScope.CHAPTER,
-                    promptSources,
-                    chapter.order_index,
-                ) || repo.chapters(projectId).firstOrNull { it.id == chapterId } != chapter ||
-                repo.chapterBody(chapterId) != baselineBody
-            ) {
-                contentConflict("章节正文或完整规划上下文")
+            val source = prepareChapterWriting(projectId, liveChapter)
+            val mode = when (repo.writingWorkspace(projectId).mode) {
+                "quick" -> WritingMode.FAST; "polish" -> WritingMode.POLISHED; else -> WritingMode.SCENES
             }
-            val expectedSource = GenerationSourceFingerprint.capture(
-                chapter,
-                baselineBody.draft,
-                baselineBody.final,
-            )
-            val active = novelGenerationEngine.startWithContextRecheck(
-                NovelGenerationEngine.Request(
-                    projectId = projectId,
-                    chapter = chapter,
-                    targetWords = TARGET_WORDS,
-                    language = lang,
-                    baselineText = "",
-                    requireNetNewBody = false,
-                    contextManifest = promptContextManifest(PromptSourceScope.CHAPTER, promptSources),
-                    expectedSourceHash = expectedSource.sourceHash,
-                    initiator = GenerationRun.INITIATOR_AGENT,
-                    agentEngine = agentEngineMode,
-                    agentSessionId = agentSessionId.takeIf { it.isNotBlank() },
-                    agentActionId = agentActionId.takeIf { it.isNotBlank() },
-                    operation = GenerationRun.OPERATION_GENERATE,
-                ),
-                currentContextManifest = {
-                    capturePromptSources(
-                        projectId,
-                        PromptSourceScope.CHAPTER,
-                        chapter.order_index,
-                    )?.let { live ->
-                        promptContextManifest(PromptSourceScope.CHAPTER, live)
-                    }
-                },
-            ) ?: return@withContext null
-            ChapterGenerationExecutions.replace(
-                projectId,
-                chapterId,
-                active.run.id,
-                checkNotNull(currentCoroutineContext()[Job]) { "Missing generation coroutine job" },
-            )
-            val generationTelemetry = GenerationTelemetryCollector.forModel(
-                cfg,
-                "chapter.agent_generate.v2",
-            )
+            val key = "$projectId/$chapterId"
+            val owner = checkNotNull(currentCoroutineContext()[Job])
+            check(writingJobs.putIfAbsent(key, owner) == null) { "本章已有任务正在运行" }
+            var generationId: String? = null
             try {
-                if (!promptSourcesStillCurrent(
-                        projectId,
-                        PromptSourceScope.CHAPTER,
-                        promptSources,
-                        chapter.order_index,
-                    ) || repo.chapters(projectId).firstOrNull { it.id == chapterId } != chapter ||
-                    repo.chapterBody(chapterId) != baselineBody
-                ) {
-                    val category = GenerationTelemetry.FAILURE_SOURCE_CONFLICT
-                    novelGenerationEngine.fail(
-                        active,
-                        GenerationTelemetryCollector.persistedFailureMessage(category),
-                        generationTelemetry.finishFailed(category),
-                    )
-                    contentConflict("章节正文或完整规划上下文")
+                val previousRun = repo.latestGenerationRun(projectId, chapterId)
+                val checkpoint = sceneWritingStore.load(projectId, chapterId)
+                val resumeId = checkpoint?.runId?.takeIf {
+                    agentActionId.isNotBlank() && previousRun?.initiator == GenerationRun.INITIATOR_AGENT &&
+                        previousRun.agentActionId == agentActionId && previousRun.agentSessionId == agentSessionId &&
+                        previousRun.status in setOf(GenerationRun.STATUS_FAILED, GenerationRun.STATUS_CANCELLED, GenerationRun.STATUS_RUNNING) &&
+                        checkpoint.sourceFingerprint == source.sourceFingerprint && checkpoint.mode == mode &&
+                        checkpoint.status != WritingStatus.COMPLETED
                 }
-                val text = streamCollect(
-                    cfg,
-                    messages,
-                    onDelta,
-                    telemetry = generationTelemetry,
-                    purpose = "chapter_agent_generate",
-                ).takeIf { it.isNotEmpty() }
-                    ?: error("模型返回了空正文")
-                currentCoroutineContext().ensureActive()
-                if (
-                    repo.project(projectId) == null ||
-                    repo.chapters(projectId).firstOrNull { it.id == chapterId } != chapter ||
-                    repo.chapterBody(chapterId) != baselineBody ||
-                    !promptSourcesStillCurrent(
-                        projectId,
-                        PromptSourceScope.CHAPTER,
-                        promptSources,
-                        chapter.order_index,
-                    )
-                ) {
-                    val category = GenerationTelemetry.FAILURE_SOURCE_CONFLICT
-                    novelGenerationEngine.fail(
-                        active,
-                        GenerationTelemetryCollector.persistedFailureMessage(category),
-                        generationTelemetry.finishFailed(category),
-                    )
-                    contentConflict("章节正文、章节信息或完整规划上下文")
-                }
-                if (completeGenerationCandidate(active, text, generationTelemetry) == null) {
-                    if (generationRunWasSuperseded(projectId, active.run.id)) {
-                        throw CancellationException("Generation superseded")
-                    }
-                    error("候选稿完成状态写入失败")
-                }
-                text
-            } catch (cancelled: CancellationException) {
-                val category = generationCancellationCategory(projectId, active.run.id)
-                val telemetry = generationTelemetry.finishCancelled(category)
-                novelGenerationEngine.cancel(
-                    active,
-                    GenerationTelemetryCollector.persistedFailureMessage(category),
-                    telemetry.takeIf { it.outcome == GenerationTelemetry.OUTCOME_CANCELLED },
-                )
-                throw cancelled
-            } catch (error: Throwable) {
-                val category = GenerationTelemetryCollector.failureCategory(error)
-                val telemetry = generationTelemetry.finishFailed(category)
-                novelGenerationEngine.fail(
-                    active,
-                    GenerationTelemetryCollector.persistedFailureMessage(category),
-                    telemetry.takeIf { it.outcome == GenerationTelemetry.OUTCOME_FAILED },
-                )
-                throw error
+                chapterWriter.write(source, _uiLanguage.value, mode, GenerationRun.INITIATOR_AGENT,
+                    agentEngineMode, agentSessionId, agentActionId,
+                    resumeRunId = resumeId,
+                    onStarted = { active -> generationId = active.run.id; ChapterGenerationExecutions.replace(projectId, chapterId, active.run.id, owner) },
+                    onProgress = { progress ->
+                        _writingStages.update { it + (key to writingStageLabel(progress.stage)) }
+                        onDelta(listOf(progress.checkpoint?.baselineText.orEmpty(), progress.checkpoint?.body.orEmpty(), progress.preview).filter { it.isNotBlank() }.joinToString("\n\n"))
+                        if (progress.preview.isEmpty()) _writingRevision.update { it + 1 }
+                    })
             } finally {
-                ChapterGenerationExecutions.unregister(projectId, chapterId, active.run.id)
+                generationId?.let { ChapterGenerationExecutions.unregister(projectId, chapterId, it) }
+                if (writingJobs.remove(key, owner)) _writingStages.update { it - key }
+                _writingRevision.update { it + 1 }
             }
         }
     }
@@ -3061,7 +2645,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     /** Scan a chapter's text for characters (esp. new ones not yet registered) and add the new
      *  ones to the character manager. Returns the list of newly-added names. */
     suspend fun agentExtractCharactersFromChapter(projectId: String, chapterId: String): List<String> {
-        val cfg = repo.activeTextModelConfig()
+        val cfg = repo.textModelForRole(projectId, "extraction")
         if (!cfg.isValid()) throw IllegalStateException("角色提取失败：请先配置可用的文本模型")
         val chapter = repo.chapters(projectId).firstOrNull { it.id == chapterId }
             ?: throw IllegalStateException("角色提取失败：未找到章节")
@@ -3125,7 +2709,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     /** Refine a chapter's plan (goal + core conflict) before writing — batch-created blank chapters
      *  often have thin plans. Returns the refined "目标 / 冲突" summary, or null. */
     suspend fun agentRefineChapterPlan(projectId: String, chapterId: String): String? {
-        val cfg = repo.activeTextModelConfig(); if (!cfg.isValid()) return null
+        val cfg = repo.textModelForRole(projectId, "planning"); if (!cfg.isValid()) return null
         val chapter = repo.chapters(projectId).firstOrNull { it.id == chapterId } ?: return null
         val lang = _uiLanguage.value
         return withContext(Dispatchers.IO) {
@@ -3185,7 +2769,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         agentActionId: String = "",
         onDelta: (String) -> Unit = {},
     ): String? {
-        val cfg = repo.activeTextModelConfig(); if (!cfg.isValid()) return null
+        val cfg = repo.textModelForRole(projectId, "review"); if (!cfg.isValid()) return null
         val chapter = repo.chapters(projectId).firstOrNull { it.id == chapterId } ?: return null
         val body = repo.chapterBody(chapterId)
         val src = body.final.ifBlank { body.draft }
@@ -3415,7 +2999,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     /** Plan [count] chapters for an arc (AI → JSON), then create them via [addChaptersBatch]. */
     suspend fun agentPlanArcChapters(projectId: String, arcId: String, count: Int): Int {
-        val cfg = repo.activeTextModelConfig(); if (!cfg.isValid()) return 0
+        val cfg = repo.textModelForRole(projectId, "planning"); if (!cfg.isValid()) return 0
         val arc = repo.plotArcs(projectId).firstOrNull { it.id == arcId } ?: return 0
         val lang = _uiLanguage.value
         return withContext(Dispatchers.IO) {
@@ -3475,7 +3059,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     /** Review the project's chapters for contradictions / logic errors (streaming). */
     suspend fun agentReviewConsistency(projectId: String, onDelta: (String) -> Unit = {}): String? {
-        val cfg = repo.activeTextModelConfig(); if (!cfg.isValid()) return null
+        val cfg = repo.textModelForRole(projectId, "review"); if (!cfg.isValid()) return null
         val lang = _uiLanguage.value
         return withContext(Dispatchers.IO) {
             val chapters = repo.chapters(projectId).sortedBy { it.order_index }
@@ -3523,7 +3107,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         projectId: String,
         onComplete: (List<Character>, sourceOutline: String) -> Unit,
     ): Job? {
-        val cfg = repo.activeTextModelConfig()
+        val cfg = repo.textModelForRole(projectId, "extraction")
         if (!cfg.isValid()) {
             _statusMessage.value = "请先在「设置」中配置可用的文本模型 / Configure a text model first."
             return null
@@ -3656,21 +3240,34 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         return AppRepository.JSON.encodeToString(BackupBundle.serializer(), bundle)
     }
 
+    fun writeBackup(output: java.io.OutputStream, archive: Boolean = true, includeSecrets: Boolean = false) {
+        val bundle = repo.buildBackupBundle(includeSecrets)
+        if (archive) com.example.novelseek_ultra.data.backup.BackupArchiveCodec.write(output, bundle)
+        else com.example.novelseek_ultra.data.backup.BackupArchiveCodec.writeLegacyJson(output, bundle)
+    }
+
+    private val backupImportPreviewRevision = java.util.concurrent.atomic.AtomicLong()
+
     fun stageImport(fileName: String, jsonText: String) {
+        stageImport(fileName) { java.io.ByteArrayInputStream(jsonText.toByteArray(Charsets.UTF_8)) }
+    }
+
+    fun stageImport(fileName: String, openInput: () -> java.io.InputStream?) {
+        val revision = backupImportPreviewRevision.incrementAndGet()
+        _importPreview.value = null
+        _statusMessage.value = "正在读取并校验备份… / Reading and verifying backup…"
         viewModelScope.launch {
             val parsed = withContext(Dispatchers.IO) {
                 runCatching {
-                    Json { ignoreUnknownKeys = true }
-                        .decodeFromString(BackupBundle.serializer(), jsonText)
+                    val input = openInput() ?: error("无法打开备份文件 / Unable to open backup")
+                    val bundle = input.use { com.example.novelseek_ultra.data.backup.BackupArchiveCodec.read(it) }
+                    bundle to repo.summarizeBackup(bundle)
                 }
             }
+            if (backupImportPreviewRevision.get() != revision) return@launch
             parsed
-                .onSuccess { bundle ->
-                    _statusMessage.value =
-                        if (bundle.version != BackupBundle.BACKUP_VERSION)
-                            "⚠ Backup version ${bundle.version} differs from expected ${BackupBundle.BACKUP_VERSION} — proceeding."
-                        else ""
-                    val summary = repo.summarizeBackup(bundle)
+                .onSuccess { (bundle, summary) ->
+                    _statusMessage.value = ""
                     _importPreview.value = ImportPreview(bundle, fileName, summary)
                 }
                 .onFailure { err ->
@@ -3680,18 +3277,25 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun cancelImport() { _importPreview.value = null }
+    fun cancelImport() { backupImportPreviewRevision.incrementAndGet(); _importPreview.value = null }
 
     fun confirmImport(includeAppSettings: Boolean) {
         val preview = _importPreview.value ?: return
+        val revision = backupImportPreviewRevision.incrementAndGet()
         // Close the confirmation immediately so repeated taps cannot launch overlapping imports.
         // A failed import restores the preview, allowing the user to inspect/retry the same file.
         _importPreview.value = null
         viewModelScope.launch {
             _statusMessage.value = "正在校验并导入备份… / Validating and importing backup…"
-            val result = withContext(Dispatchers.IO) {
-                runCatching { repo.importBackup(preview.bundle, includeAppSettings) }
+            val result = try {
+                agent.importBackupWhileIdle { repo.importBackup(preview.bundle, includeAppSettings) }
+                Result.success(Unit)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                Result.failure(error)
             }
+            if (backupImportPreviewRevision.get() != revision) return@launch
             result.onSuccess {
                 val merged = preview.summary.projectIdsInBackup
                 _statusMessage.value = "Import done: merged metadata for $merged projects." +
@@ -3994,6 +3598,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         return PromptSourceSnapshot(
+            writingWorkspace = repo.writingWorkspace(projectId),
             project = PromptProjectSource(
                 id = project.id,
                 title = project.title.takeIf { fullProjectMetadata }.orEmpty(),
@@ -4102,6 +3707,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     ),
                 ),
                 GenerationContextMaterial("outline", nullable(snapshot.outline)),
+                GenerationContextMaterial("writing_workspace", snapshot.writingWorkspace.contentFingerprintMaterial()),
                 GenerationContextMaterial("world_setting", nullable(snapshot.worldSetting)),
                 GenerationContextMaterial("timeline", nullable(snapshot.timeline)),
                 GenerationContextMaterial("realms", listed(snapshot.realms)),
@@ -4848,7 +4454,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         chapterText: String,
         onDone: (SummaryPayload?) -> Unit = {},
     ) {
-        val cfg = repo.activeTextModelConfig()
+        val cfg = repo.textModelForRole(projectId, "extraction")
         if (!cfg.isValid()) { _statusMessage.value = "请先配置文本模型"; onDone(null); return }
         val input = matchingChapterSource(projectId, chapterId, chapterTitle, chapterText)
             ?: run { onDone(null); return }
@@ -4879,7 +4485,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         onProgress: (current: Int, total: Int, title: String) -> Unit = { _, _, _ -> },
         onDone: (ok: Int, errors: Int) -> Unit = { _, _ -> },
     ): Job? {
-        val cfg = repo.activeTextModelConfig()
+        val cfg = repo.textModelForRole(projectId, "extraction")
         if (!cfg.isValid()) { _statusMessage.value = "请先配置文本模型"; return null }
         val lang = _uiLanguage.value
         val baseline = repo.captureProjectSource(projectId) ?: return null
@@ -4927,7 +4533,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         projectId: String,
         onDone: (SummaryPayload?) -> Unit = {},
     ): Job? {
-        val cfg = repo.activeTextModelConfig()
+        val cfg = repo.textModelForRole(projectId, "extraction")
         if (!cfg.isValid()) { _statusMessage.value = "请先配置文本模型"; onDone(null); return null }
         val projectInput = repo.captureProjectSource(projectId)
             ?: run { onDone(null); return null }
@@ -4984,7 +4590,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         chapterText: String,
         onDone: (added: Int, updated: Int) -> Unit = { _, _ -> },
     ) {
-        val cfg = repo.activeTextModelConfig()
+        val cfg = repo.textModelForRole(projectId, "extraction")
         if (!cfg.isValid()) { _statusMessage.value = "请先配置文本模型"; onDone(0, 0); return }
         val ticket = repo.captureFactExtractionTicket(projectId, chapterId)
             ?.takeIf { it.input.source.title == chapterTitle && it.input.effectiveText == chapterText }
@@ -5011,7 +4617,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         onProgress: (current: Int, total: Int, title: String) -> Unit = { _, _, _ -> },
         onDone: (ok: Int, errors: Int) -> Unit = { _, _ -> },
     ): Job? {
-        val cfg = repo.activeTextModelConfig()
+        val cfg = repo.textModelForRole(projectId, "extraction")
         if (!cfg.isValid()) {
             _statusMessage.value = "请先配置文本模型"
             onDone(0, 1)
@@ -5650,7 +5256,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     /** Fan out per-chapter AI updates for every auto-update container (called from onChapterSaved). */
     private fun updateContainersForChapter(projectId: String, chapterId: String, title: String, text: String) {
-        val cfg = repo.activeTextModelConfig()
+        val cfg = repo.textModelForRole(projectId, "extraction")
         if (!cfg.isValid() || text.trim().length < 50) return
         val input = matchingChapterSource(projectId, chapterId, title, text) ?: return
         val containers = repo.containers(projectId).filter { it.autoUpdatePerChapter }

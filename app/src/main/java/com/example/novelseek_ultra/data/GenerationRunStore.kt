@@ -44,6 +44,44 @@ internal class GenerationRunStore(
     /** Hashed target used by the repository's durable multi-file adoption journal. */
     internal fun targetFile(projectId: String, runId: String): File = runFile(projectId, runId)
 
+    internal fun filesForProject(projectId: String): List<File> = synchronized(lock) {
+        listLocked(projectId).map { runFile(projectId, it.id) }
+    }
+
+    /** Read-only preflight. All actual writes join the repository rollback journal. */
+    internal fun validatedImportFiles(projectId: String, runs: List<GenerationRun>, chapterIds: Set<String>): Map<File, String> = synchronized(lock) {
+        require(runs.size <= 10_000 && runs.map { it.id }.distinct().size == runs.size) { "Duplicate or excessive generation records" }
+        require(listLocked(projectId).none { !it.isTerminal() }) { "请先停止项目中的生成任务再导入备份" }
+        val normalized = runs.map { run ->
+            validate(run)
+            require(run.status in GenerationRun.TERMINAL_STATUSES + GenerationRun.STATUS_RUNNING) { "Unknown generation status" }
+            require(run.projectId == projectId && run.chapterId in chapterIds) { "Generation record belongs to a missing chapter" }
+            val knownCandidateStatuses = com.example.novelseek_ultra.data.model.CandidateChapter.TERMINAL_STATUSES +
+                setOf(com.example.novelseek_ultra.data.model.CandidateChapter.STATUS_PENDING,
+                    com.example.novelseek_ultra.data.model.CandidateChapter.STATUS_RUNNING)
+            require(run.candidates.all { it.status in knownCandidateStatuses }) { "Unknown candidate status" }
+            if (run.status == GenerationRun.STATUS_COMPLETED) {
+                require(run.candidates.any { it.status == com.example.novelseek_ultra.data.model.CandidateChapter.STATUS_COMPLETED }) {
+                    "Completed generation record has no completed review candidate"
+                }
+            }
+            if (run.status == GenerationRun.STATUS_ACCEPTED) {
+                require(run.selectedCandidateId != null && run.candidates.any {
+                    it.id == run.selectedCandidateId && it.status == com.example.novelseek_ultra.data.model.CandidateChapter.STATUS_COMPLETED && it.body.isNotBlank()
+                }) { "Accepted generation record is missing its selected completed candidate" }
+            }
+            val safe = if (!run.isTerminal()) run.copy(status = GenerationRun.STATUS_CANCELLED,
+                error = "从备份恢复，原任务已中断", telemetry = null,
+                candidates = run.candidates.map { if (it.isTerminal()) it else it.copy(status = com.example.novelseek_ultra.data.model.CandidateChapter.STATUS_CANCELLED) }) else run
+            validate(safe)
+            safe
+        }
+        require(normalized.filter { it.status == GenerationRun.STATUS_COMPLETED }.groupBy { it.chapterId }.values.all { it.size <= 1 }) {
+            "同一章节存在重复待审核稿"
+        }
+        normalized.associate { run -> runFile(projectId, run.id) to json.encodeToString(GenerationRun.serializer(), run) }
+    }
+
     /** Returns false for a duplicate id or when this chapter already has active/reviewable work. */
     fun create(run: GenerationRun): Boolean = synchronized(lock) {
         validate(run)

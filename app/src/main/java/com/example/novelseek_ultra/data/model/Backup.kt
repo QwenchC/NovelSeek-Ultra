@@ -27,6 +27,8 @@ data class BackupBundle(
 
 /** Mirrors `PROJECT_MAP_FIELDS` in SettingsPage.tsx — per-project metadata maps. */
 val PROJECT_MAP_FIELDS = listOf(
+    "writingWorkspaceByProject",
+    "writingUsageByProject",
     "novelTypeByProject",
     "plotArcsByProject",
     "charactersByProject",

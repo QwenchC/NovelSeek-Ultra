@@ -18,6 +18,7 @@ object SnapshotStore {
      * chapter (ProjectSnapshot.promos) rather than by project id.
      */
     val PROJECT_KEYED_FIELDS = listOf(
+        "writingWorkspaceByProject",
         "novelTypeByProject",
         "plotArcsByProject",
         "charactersByProject",

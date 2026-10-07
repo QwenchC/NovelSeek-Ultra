@@ -181,13 +181,30 @@ fun EditorScreen(
     val prevChapter = orderedChapters.getOrNull(currentIdx - 1)
     val nextChapter = orderedChapters.getOrNull(currentIdx + 1)
 
+    var initialBody by remember(chapterId) { mutableStateOf<AppRepository.ChapterBody?>(null) }
+    var initialBodyError by remember(chapterId) { mutableStateOf<String?>(null) }
+    LaunchedEffect(chapterId) {
+        try { initialBody = withContext(Dispatchers.IO) { vm.chapterBody(chapterId) } }
+        catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
+        catch (failure: Throwable) { initialBodyError = failure.message }
+    }
+    val loadedBody = initialBody
+    if (loadedBody == null) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            if (initialBodyError == null) CircularProgressIndicator() else Text(initialBodyError.orEmpty())
+        }
+        return
+    }
     var tab by remember(chapterId) { mutableStateOf(EditorTab.Final) }
-    var draftText by remember(chapterId) { mutableStateOf(vm.chapterBody(chapterId).draft) }
-    var finalText by remember(chapterId) { mutableStateOf(vm.chapterBody(chapterId).final) }
+    var draftText by remember(chapterId) { mutableStateOf(loadedBody.draft) }
+    var finalText by remember(chapterId) { mutableStateOf(loadedBody.final) }
     var goal by remember(chapterId) { mutableStateOf(chapter.outline_goal.orEmpty()) }
     var conflict by remember(chapterId) { mutableStateOf(chapter.conflict.orEmpty()) }
-    val reviewRun = remember(generationRunRevision, projectId, chapterId) {
-        vm.latestReviewableGenerationRun(projectId, chapterId)
+    var reviewRun by remember(projectId, chapterId) { mutableStateOf<GenerationRun?>(null) }
+    LaunchedEffect(generationRunRevision, projectId, chapterId) {
+        try { reviewRun = withContext(Dispatchers.IO) { vm.latestReviewableGenerationRun(projectId, chapterId) } }
+        catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
+        catch (failure: Throwable) { snackbarHost.showSnackbar(failure.message ?: tx(lang, "候选稿读取失败", "Unable to load candidate")) }
     }
     val reviewCandidates = remember(reviewRun) {
         reviewRun?.candidates.orEmpty()
@@ -196,6 +213,7 @@ fun EditorScreen(
     }
     val hasReviewableCandidate = reviewCandidates.isNotEmpty()
     var previewCandidateId by remember(chapterId) { mutableStateOf<String?>(null) }
+    var previewRunId by remember(chapterId) { mutableStateOf<String?>(null) }
 
     // ── Dirty tracking ────────────────────────────────────────────────────────
     // Snapshot what's on disk so we can detect unsaved edits.
@@ -939,108 +957,11 @@ fun EditorScreen(
                                 Row(
                                     modifier = Modifier.fillMaxWidth(),
                                     horizontalArrangement = Arrangement.End,
-                                    verticalAlignment = Alignment.CenterVertically,
                                 ) {
-                                    TextButton(onClick = { previewCandidateId = candidate.id }) {
-                                        Text(tx(lang, "预览", "Preview"))
-                                    }
-                                    TextButton(
-                                        enabled = !isSaving && !isGenerating,
-                                        onClick = {
-                                            val run = reviewRun ?: return@TextButton
-                                            isSaving = true
-                                            scope.launch {
-                                                try {
-                                                    val rejected = withContext(Dispatchers.IO) {
-                                                        vm.rejectChapterGeneration(projectId, run.id)
-                                                    }
-                                                    val saved = if (rejected) persistCurrentChapter() else false
-                                                    snackbarHost.showSnackbar(
-                                                        if (rejected && saved) {
-                                                            tx(lang, "已拒绝，正文保持不变", "Rejected; official text unchanged")
-                                                        } else {
-                                                            tx(lang, "拒绝候选稿失败", "Failed to reject candidate")
-                                                        },
-                                                    )
-                                                } finally {
-                                                    previewCandidateId = null
-                                                    isSaving = false
-                                                }
-                                            }
-                                        },
-                                    ) {
-                                        Text(tx(lang, "拒绝", "Reject"))
-                                    }
                                     FilledTonalButton(
-                                        enabled = !isSaving && !isGenerating && report?.blocking != true,
-                                        onClick = {
-                                            val run = reviewRun ?: return@FilledTonalButton
-                                            val editorDraft = draftText
-                                            val editorFinal = finalText
-                                            val editorGoal = goal.ifBlank { null }
-                                            val editorConflict = conflict.ifBlank { null }
-                                            isSaving = true
-                                            scope.launch {
-                                                try {
-                                                    val editorMatchesPersistedSource = withContext(Dispatchers.IO) {
-                                                        val persistedBody = vm.chapterBody(chapterId)
-                                                        val persistedChapter = vm.chapters(projectId)
-                                                            .firstOrNull { it.id == chapterId }
-                                                        persistedChapter != null &&
-                                                            persistedBody.draft == editorDraft &&
-                                                            persistedBody.final == editorFinal &&
-                                                            persistedChapter.outline_goal == editorGoal &&
-                                                            persistedChapter.conflict == editorConflict
-                                                    }
-                                                    if (!editorMatchesPersistedSource) {
-                                                        snackbarHost.showSnackbar(
-                                                            tx(
-                                                                lang,
-                                                                "当前编辑内容在候选生成后发生了变化；为避免覆盖，不能直接采用",
-                                                                "The editor changed after this candidate was generated; acceptance was blocked to protect your edits.",
-                                                            ),
-                                                        )
-                                                        return@launch
-                                                    }
-                                                    val result = withContext(Dispatchers.IO) {
-                                                        vm.adoptChapterCandidate(projectId, run.id, candidate.id)
-                                                    }
-                                                    if (result is CandidateAdoptionResult.Adopted) {
-                                                        val body = vm.chapterBody(chapterId)
-                                                        val adopted = vm.chapters(projectId)
-                                                            .firstOrNull { it.id == chapterId }
-                                                        draftText = body.draft
-                                                        finalText = body.final
-                                                        goal = adopted?.outline_goal.orEmpty()
-                                                        conflict = adopted?.conflict.orEmpty()
-                                                        savedDraft = body.draft
-                                                        savedFinal = body.final
-                                                        savedGoal = goal
-                                                        savedConflict = conflict
-                                                        checkpointDraft = body.draft
-                                                        checkpointFinal = body.final
-                                                        tab = EditorTab.Final
-                                                        snackbarHost.showSnackbar(
-                                                            tx(lang, "已采用候选稿", "Candidate accepted"),
-                                                        )
-                                                    } else {
-                                                        snackbarHost.showSnackbar(
-                                                            tx(
-                                                                lang,
-                                                                "采用失败；候选稿已保留，请查看状态提示",
-                                                                "Acceptance failed; the candidate was kept. See status for details.",
-                                                            ),
-                                                        )
-                                                    }
-                                                } finally {
-                                                    previewCandidateId = null
-                                                    isSaving = false
-                                                }
-                                            }
-                                        },
-                                    ) {
-                                        Text(tx(lang, "采用", "Accept"))
-                                    }
+                                        onClick = { previewRunId = reviewRun?.id; previewCandidateId = candidate.id },
+                                        enabled = !isSaving && !isGenerating,
+                                    ) { Text(tx(lang, "审核与修订", "Review and revise")) }
                                 }
                             }
                         }
@@ -1392,45 +1313,43 @@ fun EditorScreen(
         }
     }
 
-    val previewCandidate = reviewCandidates.firstOrNull { it.id == previewCandidateId }
-    if (previewCandidate != null) {
-        AlertDialog(
-            onDismissRequest = { previewCandidateId = null },
-            title = { Text(tx(lang, "AI 候选稿预览", "AI Candidate Preview")) },
-            text = {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(max = 520.dp)
-                        .verticalScroll(rememberScrollState()),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    previewCandidate.qualityReport?.findings.orEmpty().forEach { finding ->
-                        Text(
-                            "• ${finding.message}",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = if (finding.severity == "error") {
-                                MaterialTheme.colorScheme.error
-                            } else {
-                                MaterialTheme.colorScheme.onSurfaceVariant
-                            },
-                        )
+    val selectedCandidateId = previewCandidateId
+    val selectedRunId = previewRunId
+    if (selectedCandidateId != null && selectedRunId != null) {
+        ChapterCandidateReviewDialog(
+            vm, projectId, selectedRunId, selectedCandidateId,
+            onDismiss = { previewCandidateId = null; previewRunId = null },
+            beforeAdopt = {
+                val editorDraft = draftText
+                val editorFinal = finalText
+                val editorGoal = goal.ifBlank { null }
+                val editorConflict = conflict.ifBlank { null }
+                withContext(Dispatchers.IO) {
+                    bodyWriteMutex.withLock {
+                        val body = vm.chapterBody(chapterId)
+                        val persistedChapter = vm.chapters(projectId).firstOrNull { it.id == chapterId }
+                        persistedChapter != null && body.draft == editorDraft && body.final == editorFinal &&
+                            persistedChapter.outline_goal == editorGoal && persistedChapter.conflict == editorConflict
                     }
-                    if (previewCandidate.qualityReport?.findings?.isNotEmpty() == true) {
-                        HorizontalDivider()
-                    }
-                    Text(
-                        previewCandidate.body.ifBlank {
-                            tx(lang, "候选正文为空", "Candidate body is empty")
-                        },
-                        style = MaterialTheme.typography.bodyMedium,
-                        fontFamily = FontFamily.Serif,
-                    )
                 }
             },
-            confirmButton = {
-                TextButton(onClick = { previewCandidateId = null }) {
-                    Text(tx(lang, "关闭", "Close"))
+            onAdopted = {
+                scope.launch {
+                    val adopted = withContext(Dispatchers.IO) {
+                        vm.chapterBody(chapterId) to vm.chapters(projectId).firstOrNull { it.id == chapterId }
+                    }
+                    draftText = adopted.first.draft
+                    finalText = adopted.first.final
+                    goal = adopted.second?.outline_goal.orEmpty()
+                    conflict = adopted.second?.conflict.orEmpty()
+                    savedDraft = draftText
+                    savedFinal = finalText
+                    savedGoal = goal
+                    savedConflict = conflict
+                    checkpointDraft = draftText
+                    checkpointFinal = finalText
+                    tab = EditorTab.Final
+                    snackbarHost.showSnackbar(tx(lang, "已采用审核稿", "Reviewed candidate adopted"))
                 }
             },
         )

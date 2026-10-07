@@ -10,6 +10,10 @@ import com.example.novelseek_ultra.data.model.GenerationModelSnapshot
 import com.example.novelseek_ultra.data.model.GenerationTelemetry
 import com.example.novelseek_ultra.data.model.GenerationSourceFingerprint
 import com.example.novelseek_ultra.data.model.GenerationTokenUsage
+import com.example.novelseek_ultra.data.ai.ChatMessage
+import com.example.novelseek_ultra.data.ai.GenerationTelemetryCollector
+import com.example.novelseek_ultra.data.model.TextModelConfig
+import com.example.novelseek_ultra.data.writing.writingTracePurpose
 import java.io.File
 import kotlinx.serialization.json.Json
 import org.junit.Assert.assertEquals
@@ -377,6 +381,128 @@ class GenerationRunStoreTest {
         assertThrows(IllegalArgumentException::class.java) { store.create(missing) }
         assertThrows(IllegalArgumentException::class.java) { store.create(invalid) }
         assertTrue(store.list("project-1").isEmpty())
+    }
+
+    @Test
+    fun `backup preflight normalizes running work without writing or losing completed drafts`() {
+        val store = GenerationRunStore(temporaryFolder.newFolder("preflight-running"), json)
+        val original = run("running-backup").copy(candidates = listOf(
+            CandidateChapter("pending", 1),
+            CandidateChapter("active", 2, status = CandidateChapter.STATUS_RUNNING, body = "未完成"),
+            CandidateChapter("done", 3, status = CandidateChapter.STATUS_COMPLETED, body = "完整稿"),
+        ))
+        val files = store.validatedImportFiles("project-1", listOf(original), setOf("chapter-1"))
+        assertEquals(1, files.size)
+        assertTrue(store.list("project-1").isEmpty())
+        assertTrue(files.keys.none { it.exists() })
+        val restored = json.decodeFromString(GenerationRun.serializer(), files.values.single())
+        assertEquals(GenerationRun.STATUS_CANCELLED, restored.status)
+        assertNull(restored.telemetry)
+        assertEquals(listOf(CandidateChapter.STATUS_CANCELLED, CandidateChapter.STATUS_CANCELLED,
+            CandidateChapter.STATUS_COMPLETED), restored.candidates.map { it.status })
+        assertEquals("完整稿", restored.candidates.last().body)
+        assertTrue(restored.error!!.contains("中断"))
+    }
+
+    @Test
+    fun `backup preflight rejects duplicate missing chapter foreign project and mismatched spec`() {
+        val store = GenerationRunStore(temporaryFolder.newFolder("preflight-identity"), json)
+        val valid = run("record")
+        val payloads = listOf(listOf(valid, valid), listOf(valid.copy(chapterId = "missing",
+            spec = valid.spec.copy(chapterId = "missing"))),
+            listOf(valid.copy(projectId = "other", spec = valid.spec.copy(projectId = "other"))),
+            listOf(valid.copy(spec = valid.spec.copy(chapterId = "wrong"))))
+        payloads.forEach { payload ->
+            assertThrows(IllegalArgumentException::class.java) {
+                store.validatedImportFiles("project-1", payload, setOf("chapter-1"))
+            }
+            assertTrue(store.list("project-1").isEmpty())
+        }
+    }
+
+    @Test
+    fun `backup preflight cannot replace a live project task and preserves exact existing record`() {
+        val store = GenerationRunStore(temporaryFolder.newFolder("preflight-live"), json)
+        val live = run("live")
+        assertTrue(store.create(live))
+        assertThrows(IllegalArgumentException::class.java) {
+            store.validatedImportFiles("project-1", listOf(run("imported")), setOf("chapter-1"))
+        }
+        assertEquals(listOf(live), store.list("project-1"))
+        assertThrows(IllegalArgumentException::class.java) {
+            store.validatedImportFiles("project-1", emptyList(), setOf("chapter-1"))
+        }
+        assertEquals(live, store.get("project-1", "live"))
+    }
+
+    @Test
+    fun `backup preflight rejects multiple unresolved reviews in one chapter but accepts distinct chapters`() {
+        val store = GenerationRunStore(temporaryFolder.newFolder("preflight-review"), json)
+        val first = run("first", status = GenerationRun.STATUS_COMPLETED).copy(
+            candidates = listOf(CandidateChapter("first-draft", 1, CandidateChapter.STATUS_COMPLETED, "第一稿")))
+        val second = run("second", status = GenerationRun.STATUS_COMPLETED).copy(
+            candidates = listOf(CandidateChapter("second-draft", 1, CandidateChapter.STATUS_COMPLETED, "第二稿")))
+        assertThrows(IllegalArgumentException::class.java) {
+            store.validatedImportFiles("project-1", listOf(first, second), setOf("chapter-1"))
+        }
+        assertTrue(store.list("project-1").isEmpty())
+        val files = store.validatedImportFiles("project-1", listOf(first,
+            second.copy(chapterId = "chapter-2", spec = second.spec.copy(chapterId = "chapter-2"))),
+            setOf("chapter-1", "chapter-2"))
+        assertEquals(2, files.size)
+        assertTrue(files.keys.none { it.exists() })
+    }
+
+    @Test
+    fun `backup preflight rejects unknown statuses and preserves accepted terminal telemetry`() {
+        val store = GenerationRunStore(temporaryFolder.newFolder("preflight-status"), json)
+        assertThrows(IllegalArgumentException::class.java) {
+            store.validatedImportFiles("project-1", listOf(run("unknown", status = "unknown")), setOf("chapter-1"))
+        }
+        val accepted = run("accepted", status = GenerationRun.STATUS_ACCEPTED).copy(telemetry = telemetry(),
+            selectedCandidateId = "accepted-draft", candidates = listOf(
+                CandidateChapter("accepted-draft", 1, CandidateChapter.STATUS_COMPLETED, "已采用的正文")))
+        val files = store.validatedImportFiles("project-1", listOf(accepted), setOf("chapter-1"))
+        assertEquals(accepted, json.decodeFromString(GenerationRun.serializer(), files.values.single()))
+    }
+
+    @Test
+    fun `backup preflight rejects unreviewable completed records and missing accepted selection`() {
+        val store = GenerationRunStore(temporaryFolder.newFolder("preflight-candidate-shape"), json)
+        val valid = run("review", status = GenerationRun.STATUS_COMPLETED).copy(candidates = listOf(
+            CandidateChapter("draft", 1, CandidateChapter.STATUS_COMPLETED, "可审核正文")))
+        val invalid = listOf(valid.copy(candidates = emptyList()),
+            valid.copy(candidates = listOf(CandidateChapter("draft", 1, CandidateChapter.STATUS_PENDING))),
+            valid.copy(candidates = listOf(CandidateChapter("draft", 1, "unknown"))),
+            valid.copy(status = GenerationRun.STATUS_ACCEPTED, selectedCandidateId = null),
+            valid.copy(status = GenerationRun.STATUS_ACCEPTED, selectedCandidateId = "missing"),
+            valid.copy(status = GenerationRun.STATUS_ACCEPTED, selectedCandidateId = "draft",
+                candidates = listOf(CandidateChapter("draft", 1, CandidateChapter.STATUS_COMPLETED, ""))))
+        invalid.forEach { record ->
+            assertThrows(IllegalArgumentException::class.java) {
+                store.validatedImportFiles("project-1", listOf(record), setOf("chapter-1"))
+            }
+            assertTrue(store.list("project-1").isEmpty())
+        }
+        assertEquals(1, store.validatedImportFiles("project-1", listOf(valid), setOf("chapter-1")).size)
+    }
+
+    @Test
+    fun `shared writing stage telemetry survives generation record validation for custom model names`() {
+        val store = GenerationRunStore(temporaryFolder.newFolder("writing-telemetry"), json)
+        val collector = GenerationTelemetryCollector.forModel(
+            TextModelConfig(provider = "custom", model = "Org/Novel:Model 中文", apiUrl = "https://example.com/v1"),
+            "chapter.scenes.v1",
+        )
+        val purposes = listOf("scene_plan", "scene_draft", "scene_continue", "scene_review")
+        purposes.forEach { purpose ->
+            collector.beginRequest(writingTracePurpose(purpose, "Org/Novel:Model 中文"),
+                listOf(ChatMessage("user", "测试")), false).complete()
+        }
+        val completed = run("pipeline-telemetry", status = GenerationRun.STATUS_COMPLETED)
+            .copy(telemetry = collector.finishCompleted())
+        assertTrue(store.create(completed))
+        assertEquals(completed.telemetry, store.get("project-1", completed.id)!!.telemetry)
     }
 
     private fun run(

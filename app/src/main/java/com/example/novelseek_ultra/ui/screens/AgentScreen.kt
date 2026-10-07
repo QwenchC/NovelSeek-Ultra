@@ -110,6 +110,7 @@ import com.example.novelseek_ultra.ui.components.AppTopBar
 import com.example.novelseek_ultra.ui.components.ConfirmDialog
 import com.example.novelseek_ultra.ui.components.MarkdownText
 import com.example.novelseek_ultra.ui.components.RenameDialog
+import com.example.novelseek_ultra.ui.components.ChapterReviewWorkbench
 import com.example.novelseek_ultra.util.tx
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -185,7 +186,8 @@ fun AgentScreen(
     val listState = rememberLazyListState()
     val dialogReview = pendingReview?.takeIf { agentReviewKey(it) == reviewDialogKey }
 
-    LaunchedEffect(reviewDialogKey, dialogReview, reviewReloadRevision, generationRunRevision, lang) {
+    LaunchedEffect(reviewDialogKey, dialogReview, reviewReloadRevision, generationRunRevision, lang, reviewActionInProgress) {
+        if (reviewActionInProgress) return@LaunchedEffect
         val expected = dialogReview
         if (reviewDialogKey == null) return@LaunchedEffect
         if (expected == null) {
@@ -196,9 +198,12 @@ fun AgentScreen(
         reviewLoadError = null
         reviewPayload = null
         val loaded = withContext(Dispatchers.IO) {
-            runCatching { vm.chapterGenerationRun(expected.projectId, expected.runId) }
+            runCatching {
+                val run = vm.chapterGenerationRun(expected.projectId, expected.runId)
+                run to run?.let(vm::reviewBaselineText).orEmpty()
+            }
         }
-        val run = loaded.getOrNull()
+        val run = loaded.getOrNull()?.first
         val candidate = run?.candidates?.firstOrNull { it.id == expected.candidateId }
         when {
             loaded.isFailure -> reviewLoadError = tx(
@@ -228,7 +233,7 @@ fun AgentScreen(
                     "候选正文不完整或已失效。",
                     "The candidate text is incomplete or no longer available.",
                 )
-            else -> reviewPayload = AgentChapterReviewPayload(run, candidate)
+            else -> reviewPayload = AgentChapterReviewPayload(run, candidate, loaded.getOrNull()?.second.orEmpty())
         }
         reviewLoading = false
     }
@@ -649,19 +654,22 @@ fun AgentScreen(
                     }
                 }
             },
-            onAccept = {
+            onAccept = { selectedText ->
                 if (!reviewActionInProgress && reviewPayload != null && agent.pendingReview.value == review) {
                     val expectedKey = agentReviewKey(review)
                     val expectedSessionId = agent.currentSessionId.value
+                    val expectedBody = reviewPayload?.candidate?.body.orEmpty()
                     reviewActionInProgress = true
                     reviewActionMessage = null
                     screenScope.launch {
                         val outcome: Result<CandidateAdoptionResult> = try {
                             Result.success(withContext(Dispatchers.IO) {
-                                vm.adoptChapterCandidate(
+                                vm.adoptReviewedCandidate(
                                     review.projectId,
                                     review.runId,
                                     review.candidateId,
+                                    expectedBody,
+                                    selectedText,
                                 )
                             })
                         } catch (cancelled: CancellationException) {
@@ -696,6 +704,30 @@ fun AgentScreen(
                                     )
                                 }
                             }
+                        }
+                    }
+                }
+            },
+            onRevision = { instruction ->
+                if (!reviewActionInProgress && reviewPayload != null && agent.pendingReview.value == review) {
+                    val expectedKey = agentReviewKey(review)
+                    val expectedSessionId = agent.currentSessionId.value
+                    reviewActionInProgress = true
+                    reviewActionMessage = null
+                    screenScope.launch {
+                        try {
+                            val revised = vm.reviseChapterCandidate(review.projectId, review.runId, review.candidateId, instruction)
+                            if (reviewDialogKey == expectedKey && agent.currentSessionId.value == expectedSessionId && agent.pendingReview.value == review) {
+                                revised.candidates.firstOrNull { it.id == review.candidateId }?.let { candidate ->
+                                    reviewPayload = AgentChapterReviewPayload(revised, candidate, reviewPayload?.baselineText.orEmpty())
+                                }
+                                reviewReloadRevision++
+                            }
+                        } catch (cancelled: CancellationException) { throw cancelled }
+                        catch (failure: Throwable) {
+                            if (reviewDialogKey == expectedKey && agent.currentSessionId.value == expectedSessionId) reviewActionMessage = failure.message ?: tx(lang, "修订失败，原候选稿已保留。", "Revision failed; original candidate kept.")
+                        } finally {
+                            if (reviewDialogKey == expectedKey && agent.currentSessionId.value == expectedSessionId) reviewActionInProgress = false
                         }
                     }
                 }
@@ -924,6 +956,7 @@ fun AgentScreen(
 private data class AgentChapterReviewPayload(
     val run: GenerationRun,
     val candidate: CandidateChapter,
+    val baselineText: String,
 )
 
 internal data class AgentReviewTextSlice(
@@ -980,209 +1013,40 @@ private fun AgentChapterReviewDialog(
     onDismiss: () -> Unit,
     onRetry: () -> Unit,
     onReject: () -> Unit,
-    onAccept: () -> Unit,
+    onAccept: (String) -> Unit,
+    onRevision: (String) -> Unit,
 ) {
     val candidate = payload?.candidate
-    val report = candidate?.qualityReport
-    val canAccept = candidate != null &&
-        candidate.body.isNotBlank() &&
-        report?.completedStream == true &&
-        !report.blocking
-    val textSlices = remember(candidate?.id) {
-        candidate?.body?.let(::agentReviewTextSlices).orEmpty()
-    }
-    val operationLabel = when (payload?.run?.operation) {
-        GenerationRun.OPERATION_GENERATE -> tx(lang, "生成", "Generate")
-        GenerationRun.OPERATION_CONTINUE -> tx(lang, "续写", "Continue")
-        GenerationRun.OPERATION_REVISE -> tx(lang, "整章修订", "Revise")
-        GenerationRun.OPERATION_REPLACE -> tx(lang, "精确替换", "Replace")
-        GenerationRun.OPERATION_EDIT_PARAGRAPH -> tx(lang, "段落编辑", "Edit paragraph")
-        GenerationRun.OPERATION_SET_BODY -> tx(lang, "设置正文", "Set body")
-        else -> null
-    }
-
-    Dialog(
-        onDismissRequest = { if (!actionInProgress) onDismiss() },
-        properties = DialogProperties(
-            dismissOnBackPress = !actionInProgress,
-            dismissOnClickOutside = false,
-            usePlatformDefaultWidth = false,
-        ),
-    ) {
-        Surface(
-            modifier = Modifier.fillMaxSize(),
-            color = MaterialTheme.colorScheme.surface,
-        ) {
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .windowInsetsPadding(WindowInsets.systemBars),
-            ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Column(Modifier.weight(1f)) {
-                        Text(
-                            tx(lang, "章节候选稿审核", "Review chapter candidate"),
-                            style = MaterialTheme.typography.titleLarge,
-                            fontWeight = FontWeight.Bold,
-                            modifier = Modifier.semantics { heading() },
-                        )
-                        Text(
-                            listOfNotNull(projectTitle, chapterTitle).joinToString(" · ").ifBlank {
-                                tx(lang, "目标章节", "Target chapter")
-                            },
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                    IconButton(onClick = onDismiss, enabled = !actionInProgress) {
-                        Icon(
-                            Icons.Outlined.Close,
-                            contentDescription = tx(lang, "关闭正文预览", "Close text preview"),
-                        )
-                    }
-                }
-                HorizontalDivider()
-
-                when {
-                    loading -> Box(
-                        modifier = Modifier.fillMaxWidth().weight(1f),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Column(
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                            verticalArrangement = Arrangement.spacedBy(10.dp),
-                        ) {
-                            CircularProgressIndicator()
-                            Text(tx(lang, "正在读取候选正文…", "Loading candidate text…"))
-                        }
-                    }
-                    candidate != null -> LazyColumn(
-                        modifier = Modifier.fillMaxWidth().weight(1f),
-                        state = rememberLazyListState(),
-                        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
-                    ) {
-                        item {
-                            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                                val meta = buildList {
-                                    operationLabel?.let { add(tx(lang, "操作：$it", "Operation: $it")) }
-                                    add(tx(lang, "${candidate.wordCount} 字", "${candidate.wordCount} words"))
-                                }.joinToString(" · ")
-                                Text(
-                                    meta,
-                                    style = MaterialTheme.typography.labelMedium,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                                report?.findings.orEmpty().forEach { finding ->
-                                    Text(
-                                        "• ${finding.message}",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = if (finding.severity == "error") {
-                                            MaterialTheme.colorScheme.error
-                                        } else {
-                                            MaterialTheme.colorScheme.onSurfaceVariant
-                                        },
-                                    )
-                                }
-                                if (!canAccept) {
-                                    Text(
-                                        tx(
-                                            lang,
-                                            "该候选稿未通过完整性或硬性质量检查，不能采用，但可以拒绝。",
-                                            "This candidate failed completeness or blocking quality checks. It cannot be accepted, but it can be rejected.",
-                                        ),
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = MaterialTheme.colorScheme.error,
-                                    )
-                                }
-                                HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
-                            }
-                        }
-                        if (textSlices.isEmpty()) {
-                            item {
-                                Text(
-                                    tx(lang, "候选正文为空", "Candidate body is empty"),
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    color = MaterialTheme.colorScheme.error,
-                                )
-                            }
-                        } else {
-                            items(textSlices, key = { it.start }) { slice ->
-                                val chunk = remember(candidate.id, slice.start, slice.endExclusive) {
-                                    candidate.body.substring(slice.start, slice.endExclusive)
-                                }
-                                Text(
-                                    chunk,
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    fontFamily = FontFamily.Serif,
-                                )
-                            }
-                        }
-                    }
-                    else -> Box(
-                        modifier = Modifier.fillMaxWidth().weight(1f).padding(24.dp),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Text(
-                            loadError ?: tx(lang, "候选正文暂不可用。", "Candidate text is unavailable."),
-                            color = MaterialTheme.colorScheme.error,
-                            style = MaterialTheme.typography.bodyMedium,
-                        )
-                    }
-                }
-
-                HorizontalDivider()
-                Column(
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    val feedback = when {
-                        actionInProgress -> tx(lang, "正在提交审核结果…", "Submitting review decision…")
-                        actionMessage != null -> actionMessage
-                        loadError != null -> loadError
-                        else -> null
-                    }
-                    feedback?.let {
-                        Text(
-                            it,
-                            style = MaterialTheme.typography.labelMedium,
-                            color = if (actionInProgress) {
-                                MaterialTheme.colorScheme.onSurfaceVariant
-                            } else {
-                                MaterialTheme.colorScheme.error
-                            },
-                            modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
-                        )
-                    }
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.End,
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        if (loadError != null && !loading) {
-                            TextButton(onClick = onRetry, enabled = !actionInProgress) {
-                                Text(tx(lang, "重试", "Retry"))
-                            }
-                        }
-                        TextButton(
-                            onClick = onReject,
-                            enabled = candidate != null && !loading && !actionInProgress,
-                        ) {
-                            Text(tx(lang, "拒绝", "Reject"))
-                        }
-                        Spacer(Modifier.width(8.dp))
-                        FilledTonalButton(
-                            onClick = onAccept,
-                            enabled = canAccept && !loading && !actionInProgress,
-                        ) {
-                            Text(tx(lang, "通过并采用", "Accept"))
-                        }
-                    }
-                }
-            }
-        }
+    if (payload != null && candidate != null && !loading) {
+        ChapterReviewWorkbench(
+            language = lang,
+            title = listOfNotNull(projectTitle, chapterTitle).joinToString(" · "),
+            baselineText = payload.baselineText,
+            candidateText = candidate.body,
+            findings = chapterCandidateFindings(payload.run, candidate, lang),
+            isBusy = actionInProgress,
+            canAdopt = candidate.qualityReport?.let { it.completedStream && !it.blocking } == true,
+            errorMessage = actionMessage,
+            onDismiss = onDismiss,
+            onAdopt = onAccept,
+            onReject = onReject,
+            onRequestRevision = onRevision,
+        )
+    } else {
+        AlertDialog(
+            onDismissRequest = { if (!actionInProgress) onDismiss() },
+            title = { Text(tx(lang, "读取章节候选稿", "Load chapter candidate")) },
+            text = {
+                if (loading) CircularProgressIndicator()
+                else Text(loadError ?: tx(lang, "候选正文暂不可用。", "Candidate text unavailable."))
+            },
+            confirmButton = {
+                TextButton(onClick = onRetry, enabled = !loading && !actionInProgress) { Text(tx(lang, "重试", "Retry")) }
+            },
+            dismissButton = {
+                TextButton(onClick = onDismiss, enabled = !actionInProgress) { Text(tx(lang, "关闭", "Close")) }
+            },
+        )
     }
 }
 

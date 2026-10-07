@@ -3,6 +3,7 @@ package com.example.novelseek_ultra.agent
 import android.os.SystemClock
 import android.util.Base64
 import com.example.novelseek_ultra.data.AppRepository
+import com.example.novelseek_ultra.data.AtomicTextFile
 import com.example.novelseek_ultra.data.ai.ChatMessage
 import com.example.novelseek_ultra.data.ai.StreamUsage
 import com.example.novelseek_ultra.data.ai.WebSearchService
@@ -28,6 +29,7 @@ import com.example.novelseek_ultra.data.model.GenerationRun
 import com.example.novelseek_ultra.data.model.Project
 import com.example.novelseek_ultra.data.model.Volume
 import com.example.novelseek_ultra.data.nowIso
+import com.example.novelseek_ultra.data.writing.TextRangeReader
 import com.example.novelseek_ultra.ui.AppViewModel
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CancellableContinuation
@@ -36,12 +38,14 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -49,9 +53,63 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.encodeToString
 import kotlin.coroutines.resume
+import java.io.File
+
+/** Data quoted by a successful read must not be interpreted as the tool's own error message. */
+internal object AgentStructuredReadResultPolicy {
+    private val structuredTools = setOf("read_chapter", "get_outline", "search_project_text")
+
+    fun isSemanticFailure(toolName: String, observation: String): Boolean {
+        if (toolName !in structuredTools) return AgentToolOutcome.isSemanticFailure(observation)
+        val response = runCatching { Json.parseToJsonElement(observation) as? JsonObject }.getOrNull()
+            ?: return true
+        val offset = response.number("offset") ?: return true
+        val total = response.number("total") ?: return true
+        if (offset < 0 || total < 0 || "nextOffset" !in response) return true
+        val next = response["nextOffset"]
+        val nextOffset = if (next == JsonNull) null else (response.number("nextOffset") ?: return true)
+        val hits = response["hits"] as? JsonArray
+        if (hits != null) {
+            val query = response.string("query") ?: return true
+            if (hits.size > TextRangeReader.MAX_SEARCH_RESULTS || query.isBlank() || query.length > 500) return true
+            val nextMatch = offset.toLong() + hits.size
+            if (if (nextMatch < total) nextOffset?.toLong() != nextMatch else nextOffset != null) return true
+            for (item in hits) {
+                val hit = item as? JsonObject ?: return true
+                val start = hit.number("offset") ?: return true
+                val end = hit.number("endOffset") ?: return true
+                val contextStart = hit.number("contextOffset") ?: return true
+                val length = hit.number("total") ?: return true
+                val context = hit.string("context") ?: return true
+                if (start < 0 || end > length || end.toLong() - start != query.length.toLong() ||
+                    contextStart < 0 || contextStart > start || contextStart.toLong() + context.length < end ||
+                    contextStart.toLong() + context.length > length || hit.string("sourceId").isNullOrBlank() ||
+                    hit.string("sourceHash")?.matches(Regex("[a-f0-9]{64}")) != true) return true
+            }
+            return false
+        }
+        if (toolName == "search_project_text") return true
+        val text = response.string("text") ?: return true
+        val end = response.number("endOffset") ?: return true
+        val hash = response.string("sourceHash") ?: return true
+        return end < offset || end > total || end.toLong() - offset != text.length.toLong() || text.length > TextRangeReader.MAX_READ_LENGTH ||
+            !hash.matches(Regex("[a-f0-9]{64}")) ||
+            (if (end < total) nextOffset != end else nextOffset != null)
+    }
+
+    private fun JsonObject.number(key: String): Int? =
+        (this[key] as? JsonPrimitive)?.takeIf { !it.isString }?.intOrNull
+    private fun JsonObject.string(key: String): String? =
+        (this[key] as? JsonPrimitive)?.takeIf { it.isString }?.contentOrNull
+}
 
 internal data class AgentContextUsageRefreshIdentity(
     val sessionId: String,
@@ -215,10 +273,15 @@ class AgentController(
     private var sessionTransitionRevision: Long = 0
     @Volatile
     private var sessionTransitionPending: Boolean = false
+    /** Independent from ordinary session switches: no old writer may cross an import boundary. */
+    @Volatile
+    private var backupImportPending: Boolean = false
     @Volatile
     private var runControlRevision: Long = 0
     @Volatile
     private var instructionRevision: Long = 0
+    @Volatile
+    private var persistenceSnapshotRevision: Long = 0L
 
     // Kotlin runs property initializers and init blocks in source order. Session restoration calls
     // sensitiveToolNames(), so these lazy delegates must exist before the init block can load a
@@ -233,7 +296,7 @@ class AgentController(
     }
 
     init {
-        synchronized(ACTIVE_CONTROLLER_LOCK) {
+        val inheritedImport = synchronized(ACTIVE_CONTROLLER_LOCK) {
             val previous = active?.takeUnless { it === this }
             // Fence the previous writer, then drain the process-wide writer before loading state.
             // This guarantees initialization observes the final durable snapshot from the old owner
@@ -244,12 +307,47 @@ class AgentController(
             }
             previous?.cancelObsoleteLocalWork()
 
-            val idx = repo.loadAgentIndex()
-            _sessions.value = idx.items.sortedByDescending { it.createdAt }
-            val curId = idx.currentId ?: idx.items.firstOrNull()?.id
-            if (curId != null && repo.loadAgentSessionById(curId) != null) loadSession(curId)
-            else newSession()
+            val pendingImport = activeBackupImport
+            if (pendingImport != null) {
+                // A new ViewModel must not read a half-applied import or write an old snapshot.
+                // Do not block its main-thread constructor waiting for the transaction's I/O.
+                backupImportPending = true
+                sessionTransitionPending = true
+            } else {
+                val idx = repo.loadAgentIndex()
+                _sessions.value = idx.items.sortedByDescending { it.createdAt }
+                val curId = idx.currentId ?: idx.items.firstOrNull()?.id
+                if (curId != null && repo.loadAgentSessionById(curId) != null) loadSession(curId)
+                else newSession()
+            }
             active = this
+            pendingImport
+        }
+        if (inheritedImport != null) {
+            scope.launch(Dispatchers.IO) {
+                try {
+                    inheritedImport.completion.await()
+                    if (!closedOrObsolete && active === this@AgentController) {
+                        reloadSessionsAfterBackupImport()
+                    }
+                    synchronized(stateMutationLock) {
+                        backupImportPending = false
+                        sessionTransitionPending = false
+                    }
+                    if (!closedOrObsolete && active === this@AgentController) {
+                        reconcilePendingReview(resumeAccepted = false)
+                        persist()
+                        refreshContextUsage()
+                    }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Throwable) {
+                    // Keep the local writer/command fence closed if reload fails. Completing the
+                    // global transaction must not turn this incomplete snapshot into a writer.
+                    closedOrObsolete = true
+                    vm.showStatus("备份事务已结束，但会话重载失败；请完全退出并重新启动应用以读取已保存数据。")
+                }
+            }
         }
         // Only active network/tool work consumes the dataSync FGS allowance. Paused gates keep a
         // normal status notification and are fully restorable from the durable session.
@@ -300,10 +398,116 @@ class AgentController(
 
     // ── control surface ──────────────────────────────────────────────────────
 
+    private data class BackupImportLease(
+        val token: Long,
+        val completion: CompletableDeferred<Unit> = CompletableDeferred(),
+    )
+
+    private fun backupImportBlocked(): Boolean = backupImportPending || activeBackupImport != null
+
+    /**
+     * Admit only a fully idle controller, drain old writers off-main, then run the repository's
+     * transaction. No state/global monitor is held across import I/O or reloading disk records.
+     * Once admitted, cancellation cannot release the fence before commit/rollback and reload.
+     */
+    suspend fun importBackupWhileIdle(importAction: () -> Unit) {
+        currentCoroutineContext().ensureActive()
+        val lease = synchronized(ACTIVE_CONTROLLER_LOCK) {
+            synchronized(stateMutationLock) {
+                val snapshot = AgentBackupImportLeasePolicy.Snapshot(
+                    runIsActive = _status.value in setOf(Status.RUNNING, Status.AWAITING_USER, Status.AWAITING_CONFIRM, Status.AWAITING_REVIEW),
+                    hasIncompleteJob = listOf(job, sessionTransitionJob, interjectionRestartJob, livenessRecoveryJob)
+                        .any { it != null && !it.isCompleted } || livenessRecoveryInProgress,
+                    hasGate = gate != null,
+                    hasPendingReview = _pendingReview.value != null,
+                    recoveryPending = runCheckpoint.recoveryPending,
+                    transitionPending = sessionTransitionPending,
+                    importPending = backupImportBlocked(),
+                    controllerClosed = closedOrObsolete || active !== this,
+                )
+                check(AgentBackupImportLeasePolicy.canAcquire(snapshot)) {
+                    "智能体尚有运行、等待回复或未结束的任务；请先停止任务，并采用或拒绝待审核候选稿，等待任务结束后再导入备份。"
+                }
+                runControlRevision += 1
+                sessionTransitionRevision += 1
+                contextUsageRefreshRevision += 1
+                contextUsageRefreshJob?.cancel()
+                contextUsageRefreshJob = null
+                backupImportPending = true
+                sessionTransitionPending = true
+                val token = if (nextBackupImportToken == Long.MAX_VALUE) 1L else nextBackupImportToken + 1L
+                nextBackupImportToken = token
+                BackupImportLease(token).also { activeBackupImport = it }
+            }
+        }
+        withContext(NonCancellable + Dispatchers.IO) {
+            var importCommitted = false
+            try {
+                // A writer already inside this monitor is allowed to finish before import starts.
+                // Writers queued behind it recheck the global import fence and become no-ops.
+                synchronized(persistenceLock) { /* Drain only; never hold it for repository I/O. */ }
+                importAction()
+                importCommitted = true
+                if (!closedOrObsolete && active === this@AgentController) {
+                    reloadSessionsAfterBackupImport()
+                }
+            } catch (error: Throwable) {
+                if (importCommitted && !closedOrObsolete && active === this@AgentController) {
+                    // A committed import cannot safely fall back to the pre-import in-memory
+                    // snapshot if disk reload itself failed. Fence this instance until reopen.
+                    closedOrObsolete = true
+                    throw IllegalStateException("备份已导入，但会话重载失败；请完全退出并重新启动应用，旧内存不会覆盖导入数据。", error)
+                }
+                throw error
+            } finally {
+                synchronized(ACTIVE_CONTROLLER_LOCK) {
+                    synchronized(stateMutationLock) {
+                        if (AgentBackupImportLeasePolicy.ownsLease(lease.token, activeBackupImport?.token, backupImportPending)) {
+                            backupImportPending = false
+                            sessionTransitionPending = false
+                            activeBackupImport = null
+                        }
+                    }
+                }
+                // A replacement controller waits asynchronously, then loads committed or rolled
+                // back records. Its own local fence remains closed until that load is complete.
+                lease.completion.complete(Unit)
+                if (!closedOrObsolete && active === this@AgentController) {
+                    if (importCommitted) {
+                        persist()
+                    }
+                    refreshContextUsage()
+                }
+            }
+        }
+    }
+
+    private fun reloadSessionsAfterBackupImport() {
+        // Ordinary startup helpers deliberately swallow corrupt/missing files for legacy users.
+        // At a committed import boundary that fallback must not turn an I/O failure into an empty
+        // replacement index. Read the fixed index path strictly, then require its selected session.
+        val idx = AppRepository.JSON.decodeFromString(
+            AgentIndex.serializer(),
+            AtomicTextFile.readText(File(appContext.filesDir, "agent/index.json")),
+        )
+        val curId = idx.currentId ?: idx.items.firstOrNull()?.id
+        val selected = curId?.let {
+            checkNotNull(repo.loadAgentSessionById(it)) { "无法读取导入后的智能体会话 $it" }
+                .also { session -> check(session.id == it) { "导入后的会话身份不匹配" } }
+        }
+        _sessions.value = idx.items.sortedByDescending { it.createdAt }
+        if (selected != null) loadSession(selected.id, allowAutomaticRecovery = false, restoredSession = selected)
+        else newSessionNow()
+        // Reconcile missing/terminal candidate links before exposing the fresh session. Persist
+        // remains fenced here; the owner writes the normalized fresh snapshot only after release.
+        reconcilePendingReview(resumeAccepted = false, allowImportReload = true)
+    }
+
     fun start(command: String) = sendInput(command)
 
     fun continueRun() {
         val reviewBlocked = synchronized(stateMutationLock) {
+            if (closedOrObsolete || backupImportBlocked()) return
             if (_pendingReview.value == null) {
                 false
             } else {
@@ -330,12 +534,12 @@ class AgentController(
      *  new instruction; while paused it's added and the run resumes. */
     fun sendInput(text: String) {
         val t = text.trim()
-        if (t.isEmpty() || sessionTransitionPending) return
+        if (t.isEmpty() || sessionTransitionPending || backupImportBlocked()) return
         var gateCompletion: Pair<CompletableDeferred<String?>, String?>? = null
         var restartRequest: Pair<Job, Long>? = null
         var launchRevision: Long? = null
         synchronized(stateMutationLock) {
-            if (sessionTransitionPending) return
+            if (closedOrObsolete || sessionTransitionPending || backupImportBlocked()) return
             when (_status.value) {
                 Status.AWAITING_USER -> {
                     val askActionId = _steps.value.lastOrNull {
@@ -416,6 +620,7 @@ class AgentController(
 
     fun confirm(approve: Boolean) {
         val deferred = synchronized(stateMutationLock) {
+            if (closedOrObsolete || backupImportBlocked()) return
             if (_status.value != Status.AWAITING_CONFIRM) return
             _pendingPrompt.value = null
             gate
@@ -425,6 +630,7 @@ class AgentController(
 
     fun stop() {
         val activeJob = synchronized(stateMutationLock) {
+            if (backupImportBlocked()) return
             runControlRevision += 1
             interjectionRestartJob?.cancel()
             interjectionRestartJob = null
@@ -438,6 +644,7 @@ class AgentController(
         activeJob?.cancel()
         gate?.complete(null)
         synchronized(stateMutationLock) {
+            if (backupImportBlocked()) return
             gate = null
             _pendingPrompt.value = null
             _streamingText.value = ""
@@ -521,23 +728,28 @@ class AgentController(
 
     /** Lock the session to a project the agent operates on. Changing scope revokes the old grant. */
     fun lockProject(projectId: String?) {
-        if (job?.isCompleted == false || sessionTransitionPending) return
-        val previousId = _activeProjectId.value
-        updateLockedProject(projectId)
-        if (previousId != _activeProjectId.value) instructionRevision++
+        synchronized(stateMutationLock) {
+            if (closedOrObsolete || backupImportBlocked() || job?.isCompleted == false || sessionTransitionPending) return
+            val previousId = _activeProjectId.value
+            updateLockedProject(projectId)
+            if (previousId != _activeProjectId.value) instructionRevision++
+        }
         persist()
     }
 
     /** Pre-authorize auto-continue only when it can be bound to an existing locked project. */
     fun setAutoApprove(enabled: Boolean) {
-        _autoApprove.value = enabled && validLockedProjectId() != null
+        synchronized(stateMutationLock) {
+            if (closedOrObsolete || backupImportBlocked()) return
+            _autoApprove.value = enabled && validLockedProjectId() != null
+        }
         persist()
     }
 
     /** Apply a changed global preference immediately only when this conversation is still blank. */
     fun refreshDefaultsForBlankSession() {
         val changed = synchronized(stateMutationLock) {
-            if (_steps.value.isNotEmpty() || job?.isCompleted == false || sessionTransitionPending) {
+            if (closedOrObsolete || backupImportBlocked() || _steps.value.isNotEmpty() || job?.isCompleted == false || sessionTransitionPending) {
                 false
             } else {
                 val selectedEngine = sanitizeEngineMode(vm.agentEngine())
@@ -575,6 +787,7 @@ class AgentController(
                 _status.value == Status.AWAITING_CONFIRM ||
                 _status.value == Status.AWAITING_REVIEW
             if (
+                closedOrObsolete || backupImportBlocked() ||
                 expectedSessionId == null ||
                 _currentSessionId.value != expectedSessionId ||
                 _engineMode.value != ENGINE_DUAL ||
@@ -610,6 +823,7 @@ class AgentController(
     /** Re-estimate the next executor request without mutating or compacting the conversation. */
     fun refreshContextUsage() {
         val refreshJob = synchronized(stateMutationLock) {
+            if (closedOrObsolete || backupImportBlocked()) return
             contextUsageRefreshRevision += 1
             val revision = contextUsageRefreshRevision
             contextUsageRefreshJob?.cancel()
@@ -684,6 +898,7 @@ class AgentController(
                 engineMode = _engineMode.value,
             )
             if (
+                closedOrObsolete || backupImportBlocked() ||
                 !AgentContextUsageRefreshPolicy.isCurrent(
                     expectedRevision = revision,
                     currentRevision = contextUsageRefreshRevision,
@@ -712,7 +927,7 @@ class AgentController(
                 _status.value == Status.AWAITING_CONFIRM ||
                 _status.value == Status.AWAITING_REVIEW
             if (
-                closedOrObsolete ||
+                closedOrObsolete || backupImportBlocked() ||
                 _currentSessionId.value != expectedSessionId ||
                 sessionTransitionPending ||
                 (!allowActiveRequestBoundary && (runIsActive || job?.isCompleted == false))
@@ -743,7 +958,7 @@ class AgentController(
         ) ?: return false
         val committed = synchronized(stateMutationLock) {
             if (
-                closedOrObsolete ||
+                closedOrObsolete || backupImportBlocked() ||
                 _currentSessionId.value != snapshot.sessionId ||
                 sessionTransitionPending ||
                 _steps.value !== snapshot.steps ||
@@ -764,7 +979,7 @@ class AgentController(
         // or resurrected by this older background compaction.
         val saved = synchronized(stateMutationLock) {
             if (
-                closedOrObsolete ||
+                closedOrObsolete || backupImportBlocked() ||
                 _currentSessionId.value != snapshot.sessionId ||
                 sessionTransitionPending ||
                 _contextMemory.value != next
@@ -775,7 +990,7 @@ class AgentController(
                 // across this one atomic save prevents delete/switch from starting between the CAS
                 // check and the write, which could otherwise recreate a just-deleted session.
                 synchronized(persistenceLock) {
-                    if (closedOrObsolete) {
+                    if (closedOrObsolete || backupImportBlocked()) {
                         false
                     } else {
                         repo.saveAgentSessionById(buildCurrentSessionSnapshot(snapshot.sessionId))
@@ -791,8 +1006,8 @@ class AgentController(
 
     // ── session management ──────────────────────────────────────────────────────
 
-    private fun loadSession(id: String) {
-        val persistedSession = repo.loadAgentSessionById(id) ?: return
+    private fun loadSession(id: String, allowAutomaticRecovery: Boolean = true, restoredSession: AgentSession? = null) {
+        val persistedSession = restoredSession ?: repo.loadAgentSessionById(id) ?: return
         val sessionRuns = repo.projects.value.flatMap { project ->
             repo.listGenerationRuns(project.id).filter {
                 it.initiator == GenerationRun.INITIATOR_AGENT &&
@@ -835,7 +1050,7 @@ class AgentController(
             (s.runStatus == "awaiting_user" || s.runStatus == "idle")
         _pendingReview.value = s.pendingReview
         val savedCheckpoint = s.runCheckpoint.sanitized()
-        val shouldAutoRecover = recovery.steps.isNotEmpty() &&
+        val shouldAutoRecover = allowAutomaticRecovery && recovery.steps.isNotEmpty() &&
             s.pendingReview == null &&
             !restoreQuestion &&
             (s.runStatus.equals("running", ignoreCase = true) || savedCheckpoint.recoveryPending)
@@ -949,6 +1164,7 @@ class AgentController(
 
     fun renameSession(id: String, title: String) {
         synchronized(stateMutationLock) {
+            if (closedOrObsolete || backupImportBlocked() || sessionTransitionPending) return
             if (id == _currentSessionId.value) currentTitle = title
             _sessions.update { sessions ->
                 sessions.map { if (it.id == id) it.copy(title = title) else it }
@@ -969,6 +1185,7 @@ class AgentController(
         automaticRecovery: Boolean = false,
     ): Boolean {
         val accepted = synchronized(stateMutationLock) {
+            if (closedOrObsolete || backupImportBlocked()) return@synchronized false
             if (expectedRevision != runControlRevision) return@synchronized false
             if (sessionTransitionPending) return@synchronized false
             if (requiredStatus != null && _status.value != requiredStatus) return@synchronized false
@@ -1036,7 +1253,7 @@ class AgentController(
      */
     private fun mutateSessionAfterRunStops(mutation: () -> Unit) {
         val transition = synchronized(stateMutationLock) {
-            if (closedOrObsolete) return
+            if (closedOrObsolete || backupImportBlocked()) return
             runControlRevision += 1
             interjectionRestartJob?.cancel()
             interjectionRestartJob = null
@@ -1117,7 +1334,7 @@ class AgentController(
         var request: AutomaticRecoveryRequest? = null
         var persistTerminalDecision = false
         val decision = synchronized(stateMutationLock) {
-            if (closedOrObsolete) return@synchronized AgentRunLivenessDecision.INACTIVE
+            if (closedOrObsolete || backupImportBlocked()) return@synchronized AgentRunLivenessDecision.INACTIVE
             if (sessionTransitionPending) return@synchronized AgentRunLivenessDecision.INACTIVE
             if (livenessRecoveryInProgress) return@synchronized AgentRunLivenessDecision.HEALTHY
 
@@ -1830,7 +2047,7 @@ class AgentController(
                     }
                     val observation = (execution as AgentToolExecution.Completed).observation
                     val actionSucceeded =
-                        result.isSuccess && !AgentToolOutcome.isSemanticFailure(observation)
+                        result.isSuccess && !AgentStructuredReadResultPolicy.isSemanticFailure(tool.name, observation)
                     val committed = synchronized(stateMutationLock) {
                         if (!runClaimMatchesLocked(runClaim)) {
                             false
@@ -2224,18 +2441,20 @@ class AgentController(
      * rejected under [stateMutationLock] before it can contaminate another session.
      */
     private suspend fun sessionAgentChat(messages: List<ChatMessage>): String? {
-        val expectedSessionId = synchronized(stateMutationLock) {
-            _currentSessionId.value?.takeUnless { sessionTransitionPending }
+        val expected = synchronized(stateMutationLock) {
+            _currentSessionId.value?.takeUnless { sessionTransitionPending || backupImportBlocked() }
+                ?.let { it to sessionTransitionRevision }
         } ?: return null
         return vm.agentChat(messages) { usage ->
-            recordSessionCacheUsage(expectedSessionId, usage)
+            recordSessionCacheUsage(expected.first, expected.second, usage)
         }
     }
 
-    private fun recordSessionCacheUsage(expectedSessionId: String, usage: StreamUsage) {
+    private fun recordSessionCacheUsage(expectedSessionId: String, expectedTransitionRevision: Long, usage: StreamUsage) {
         val changed = synchronized(stateMutationLock) {
             if (
-                sessionTransitionPending ||
+                closedOrObsolete || backupImportBlocked() || sessionTransitionPending ||
+                expectedTransitionRevision != sessionTransitionRevision ||
                 _currentSessionId.value != expectedSessionId ||
                 usage.cacheHitTokens == null ||
                 usage.cacheMissTokens == null
@@ -2752,19 +2971,40 @@ class AgentController(
         )
     }
 
+    private data class SessionPersistenceSnapshot(
+        val session: AgentSession,
+        val index: AgentIndex,
+        val snapshotRevision: Long,
+        val transitionRevision: Long,
+    )
+
     private fun persist() {
-        if (closedOrObsolete) return
-        synchronized(persistenceLock) {
-            if (closedOrObsolete) return
+        // Capture identity, content and index together. A writer must never read another session's
+        // title/steps after taking the old ID. Long file writes do not hold the state monitor.
+        val snapshot = synchronized(stateMutationLock) {
+            if (closedOrObsolete || backupImportBlocked()) return
             val id = _currentSessionId.value ?: return
-            repo.saveAgentSessionById(buildCurrentSessionSnapshot(id))
-            // Snapshot construction and both files share one writer, preventing an older snapshot
-            // from overwriting a newer user input/title after a thread scheduling inversion.
+            val session = buildCurrentSessionSnapshot(id)
             val items = _sessions.value.map {
                 if (it.id == id) it.copy(title = currentTitle) else it
             }
             _sessions.value = items
-            repo.saveAgentIndex(AgentIndex(id, items))
+            persistenceSnapshotRevision = if (persistenceSnapshotRevision == Long.MAX_VALUE) 1L else persistenceSnapshotRevision + 1L
+            SessionPersistenceSnapshot(session, AgentIndex(id, items), persistenceSnapshotRevision, sessionTransitionRevision)
+        }
+        synchronized(persistenceLock) {
+            if (!AgentBackupImportLeasePolicy.canPersistSnapshot(
+                    expectedSnapshotRevision = snapshot.snapshotRevision,
+                    currentSnapshotRevision = persistenceSnapshotRevision,
+                    expectedTransitionRevision = snapshot.transitionRevision,
+                    currentTransitionRevision = sessionTransitionRevision,
+                    importPending = backupImportBlocked(),
+                    controllerClosed = closedOrObsolete,
+                )) return
+            // A newer capture invalidates queued old writes. If it is captured during this write,
+            // the shared monitor guarantees the older coherent record lands before the newer one.
+            repo.saveAgentSessionById(snapshot.session)
+            repo.saveAgentIndex(snapshot.index)
         }
     }
 
@@ -2773,12 +3013,14 @@ class AgentController(
      * action into committed evidence and resumes the loop; rejection/failure clears the gate but
      * never fabricates a successful plan result.
      */
-    private fun reconcilePendingReview(resumeAccepted: Boolean = true) {
+    private fun reconcilePendingReview(resumeAccepted: Boolean = true, allowImportReload: Boolean = false) {
+        if (closedOrObsolete || (backupImportBlocked() && !allowImportReload)) return
         val expected = _pendingReview.value ?: return
         val run = repo.getGenerationRun(expected.projectId, expected.runId)
         var changed = false
         var resumeRevision: Long? = null
         synchronized(stateMutationLock) {
+            if (closedOrObsolete || (backupImportBlocked() && !allowImportReload)) return@synchronized
             if (_pendingReview.value != expected) return@synchronized
             val wasAwaitingReview = _status.value == Status.AWAITING_REVIEW
             when (run?.status) {
@@ -3272,13 +3514,24 @@ class AgentController(
                 "已生成整章修订候选（" + text.length + " 字符），等待用户审核；正式正文未改变。",
             )
         },
-        AgentTool("read_chapter", "读取某章完整正文（用于定位要局部修改的原文片段）。args: projectId?, chapterId") { a ->
+        AgentTool("read_chapter", "分段精确读取某章正文，返回 JSON：text/offset/endOffset/total/nextOffset/sourceHash；按 nextOffset 续读至 null。偏移单位为 UTF-16 字符，保护 Unicode 边界。args: projectId?, chapterId, offset?(默认0), limit?(1..12000，默认8000；兼容 start/length), sourceHash?(与前页一致，否则拒绝陈旧读取), query?(提供则搜索本章，offset 是命中序号，limit 1..30 默认10), contextLength?(0..300), ignoreCase?") { a ->
             val id = pid(a) ?: return@AgentTool "无聚焦项目"
             val cid = a.str("chapterId") ?: return@AgentTool "缺少 chapterId"
-            if (repo.chapters(id).none { it.id == cid }) return@AgentTool "未找到章节"
+            val chapter = repo.chapters(id).firstOrNull { it.id == cid } ?: return@AgentTool "未找到章节"
             val b = repo.chapterBody(cid); val t = b.final.ifBlank { b.draft }
-            if (t.isBlank()) "（该章暂无正文）"
-            else if (t.length > 8000) t.take(8000) + "\n…（已截断，共 ${t.length} 字符；如需后半段请告知）" else t
+            if (a.str("sourceHash")?.let { it != TextRangeReader.hash(t) } == true) return@AgentTool "内容冲突：正文已改变，sourceHash 不一致，请从 offset=0 重新读取"
+            val invalidNumber = listOf("offset", "start", "limit", "length", "contextLength").firstOrNull { a.containsKey(it) && a.intOrNull(it) == null }
+            if (invalidNumber != null) return@AgentTool "执行出错：$invalidNumber 必须是整数"
+            runCatching {
+                val query = a.str("query")
+                val offset = a.intOrNull("offset") ?: a.intOr("start", 0)
+                val limit = a.intOrNull("limit") ?: a.intOr("length", if (query == null) 8_000 else 10)
+                if (query == null) Json.encodeToString(TextRangeReader.read(t, offset, limit))
+                else Json.encodeToString(TextRangeReader.search(
+                    listOf(TextRangeReader.Source(cid, chapter.title, "chapter", t)),
+                    query, offset, limit, a.intOr("contextLength", 120), a.boolOr("ignoreCase", false),
+                ))
+            }.getOrElse { "执行出错：读取参数错误：${it.message}" }
         },
         AgentTool("replace_in_chapter", "局部修改候选：精确替换正文片段，完成后等待用户审核。args: projectId?, chapterId, find, replace(空白=删除且始终需确认)", sensitive = true) { a, context ->
             val id = pid(a)
@@ -3786,10 +4039,43 @@ class AgentController(
         },
 
         // ── 大纲 / 正文 直接读写 ──
-        AgentTool("get_outline", "查看完整大纲文本。args: projectId?") { a ->
+        AgentTool("get_outline", "分段精确读取大纲，返回 JSON：text/offset/endOffset/total/nextOffset/sourceHash；按 nextOffset 续读至 null。UTF-16 字符偏移并保护 Unicode 边界。args: projectId?, offset?(默认0), limit?(1..12000，默认8000；兼容 start/length), sourceHash?, query?(提供则搜索大纲，offset 是命中序号，limit 1..30 默认10), contextLength?(0..300), ignoreCase?") { a ->
             val id = pid(a) ?: return@AgentTool "无聚焦项目"
             val o = repo.outline(id)
-            if (o.isBlank()) "（暂无大纲）" else if (o.length > 2500) o.take(2500) + "\n…（已截断，共 ${o.length} 字符）" else o
+            if (repo.project(id) == null) return@AgentTool "项目不存在"
+            if (a.str("sourceHash")?.let { it != TextRangeReader.hash(o) } == true) return@AgentTool "内容冲突：大纲已改变，sourceHash 不一致，请从 offset=0 重新读取"
+            val invalidNumber = listOf("offset", "start", "limit", "length", "contextLength").firstOrNull { a.containsKey(it) && a.intOrNull(it) == null }
+            if (invalidNumber != null) return@AgentTool "执行出错：$invalidNumber 必须是整数"
+            runCatching {
+                val query = a.str("query")
+                val offset = a.intOrNull("offset") ?: a.intOr("start", 0)
+                val limit = a.intOrNull("limit") ?: a.intOr("length", if (query == null) 8_000 else 10)
+                if (query == null) Json.encodeToString(TextRangeReader.read(o, offset, limit))
+                else Json.encodeToString(TextRangeReader.search(
+                    listOf(TextRangeReader.Source("outline", "大纲", "outline", o)), query, offset, limit,
+                    a.intOr("contextLength", 120), a.boolOr("ignoreCase", false),
+                ))
+            }.getOrElse { "执行出错：读取参数错误：${it.message}" }
+        },
+        AgentTool("search_project_text", "搜索当前项目的大纲与章节正文，返回分页 JSON 命中（sourceId/title/kind/offset/endOffset/contextOffset/context/total/sourceHash）；可交给 read_chapter/get_outline 定位。offset/nextOffset 是命中序号，命中内偏移是 UTF-16 字符。args: projectId?, query(1..500字符), scope?(all|outline|chapters，默认all), offset?(默认0), limit?(1..30，默认10), contextLength?(0..300，默认120), ignoreCase?(默认false)") { a ->
+            val id = pid(a) ?: return@AgentTool "无聚焦项目"
+            if (repo.project(id) == null) return@AgentTool "项目不存在"
+            val query = a.str("query") ?: return@AgentTool "缺少 query"
+            val searchScope = a.str("scope") ?: "all"
+            if (searchScope !in setOf("all", "outline", "chapters")) return@AgentTool "执行出错：scope 仅支持 all / outline / chapters"
+            val invalidNumber = listOf("offset", "limit", "contextLength").firstOrNull { a.containsKey(it) && a.intOrNull(it) == null }
+            if (invalidNumber != null) return@AgentTool "执行出错：$invalidNumber 必须是整数"
+            val sources = sequence {
+                if (searchScope != "chapters") yield(TextRangeReader.Source("outline", "大纲", "outline", repo.outline(id)))
+                if (searchScope != "outline") for (chapter in repo.chapters(id).sortedBy { it.order_index }) {
+                    val body = repo.chapterBody(chapter.id)
+                    yield(TextRangeReader.Source(chapter.id, chapter.title, "chapter", body.final.ifBlank { body.draft }))
+                }
+            }.asIterable()
+            runCatching {
+                Json.encodeToString(TextRangeReader.search(sources, query, a.intOr("offset", 0), a.intOr("limit", 10),
+                    a.intOr("contextLength", 120), a.boolOr("ignoreCase", false)))
+            }.getOrElse { "执行出错：搜索参数错误：${it.message}" }
         },
         AgentTool("set_outline", "直接写入/覆盖大纲文本。args: projectId?, text(非空)", sensitive = true) { a ->
             val id = pid(a) ?: return@AgentTool "无聚焦项目"
@@ -3994,12 +4280,17 @@ class AgentController(
             "list_text_models",
             "list_volumes",
             "read_chapter",
+            "search_project_text",
             "retrieve",
             "review_consistency",
             "web_search",
         )
         private val ACTIVE_CONTROLLER_LOCK = Any()
         private val GLOBAL_AGENT_PERSISTENCE_LOCK = Any()
+        /** Global fence also covers a replacement ViewModel while the old owner imports. */
+        @Volatile
+        private var activeBackupImport: BackupImportLease? = null
+        private var nextBackupImportToken: Long = 0L
         private val REQUIRED_ACTION_STATUSES = setOf(
             AgentStep.ACTION_PROPOSED,
             AgentStep.ACTION_RUNNING,

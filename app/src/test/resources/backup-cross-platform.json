@@ -1,0 +1,205 @@
+{
+  "version": 1,
+  "exportedAt": "2026-10-07T10:00:00Z",
+  "appVersion": "1.6.0",
+  "data": {
+    "projects": [
+      {
+        "id": "interop-project",
+        "title": "两端互通测试",
+        "author": "测试",
+        "genre": "奇幻",
+        "description": "测试数据，无真实作品",
+        "language": "zh",
+        "target_word_count": 30000,
+        "current_word_count": 0,
+        "status": "draft",
+        "created_at": "2026-10-07T10:00:00Z",
+        "updated_at": "2026-10-07T10:00:00Z"
+      }
+    ],
+    "chaptersByProject": {
+      "interop-project": [
+        {
+          "id": "interop-chapter",
+          "project_id": "interop-project",
+          "title": "雪夜😀",
+          "order_index": 3,
+          "outline_goal": "寻找线索",
+          "conflict": "不能暴露秘密",
+          "twist": "残页指向故人",
+          "cliffhanger": "守卫突然回头",
+          "word_count": 12,
+          "arcId": "interop-arc",
+          "status": "draft",
+          "created_at": "2026-10-07T10:00:00Z",
+          "updated_at": "2026-10-07T10:00:00Z"
+        }
+      ]
+    },
+    "chapterBodies": {
+      "interop-chapter": {
+        "draft": "雪夜😀\n\n他找到了线索。",
+        "final": ""
+      }
+    },
+    "chapterIllustrations": {
+      "interop-chapter": [
+        {
+          "id": "illustration-1",
+          "imageBase64": "QUJD",
+          "paragraphIndex": 1
+        }
+      ]
+    },
+    "novelTypeByProject": {
+      "interop-project": "long"
+    },
+    "charactersByProject": {
+      "interop-project": [
+        {
+          "id": "character-1",
+          "name": "林雪",
+          "role": "主角"
+        }
+      ]
+    },
+    "writingWorkspaceByProject": {
+      "interop-project": {
+        "version": 1,
+        "mode": "scene",
+        "style": "克制",
+        "perspective": "第三人称",
+        "forbiddenExpressions": "不禁",
+        "sampleProse": "",
+        "maxRequestsPerRun": 16,
+        "planningProfileId": null,
+        "writingProfileId": null,
+        "reviewProfileId": null,
+        "extractionProfileId": null,
+        "notes": [
+          {
+            "id": "note-1",
+            "kind": "canon",
+            "subject": "世界规则",
+            "text": "秘密不得提前泄露",
+            "sourceChapterId": null,
+            "sourceBodyHash": null,
+            "knownByCharacterIds": [],
+            "payoffChapterId": null,
+            "resolved": false,
+            "importance": 3
+          }
+        ]
+      }
+    },
+    "writingUsageByProject": {
+      "interop-project": [
+        {
+          "runId": "interop-run",
+          "model": "mock-only",
+          "completedAt": "2026-10-07T10:00:00Z",
+          "requestCount": 1,
+          "promptTokens": null,
+          "completionTokens": null,
+          "cacheHitTokens": null,
+          "failedRequests": 0,
+          "chapterId": "interop-chapter",
+          "parentRunId": null
+        }
+      ]
+    },
+    "sceneWritingByProject": {
+      "interop-project": {
+        "version": 1,
+        "plans": [
+          {
+            "projectId": "interop-project",
+            "chapterId": "interop-chapter",
+            "sourceFingerprint": "0000000000000000000000000000000000000000000000000000000000000000",
+            "scenes": [
+              {
+                "id": "s1",
+                "title": "找线索",
+                "pov": "林雪",
+                "time": "夜",
+                "location": "雪城",
+                "goal": "寻找线索",
+                "conflict": "守卫巡逻",
+                "turn": "发现残页",
+                "entryState": "不知道残页位置",
+                "exitState": "找到残页",
+                "requiredEvents": [
+                  "找到残页"
+                ],
+                "forbiddenEvents": [
+                  "秘密暴露"
+                ],
+                "targetWords": 500
+              }
+            ],
+            "updatedAt": 1791367200000
+          }
+        ],
+        "checkpoints": []
+      }
+    },
+    "agentIndex": {
+      "currentId": "interop-session",
+      "items": [
+        {
+          "id": "interop-session",
+          "title": "互通会话",
+          "createdAt": "2026-10-07T10:00:00Z"
+        }
+      ]
+    },
+    "agentSessions": {
+      "interop-session": {
+        "id": "interop-session",
+        "title": "互通会话",
+        "createdAt": "2026-10-07T10:00:00Z",
+        "lockedProjectId": "interop-project",
+        "autoApprove": false,
+        "engineMode": "dual",
+        "reasoningLevel": "high",
+        "runStatus": "idle",
+        "steps": [
+          {
+            "id": "step-user",
+            "type": "user",
+            "text": "规划小说",
+            "createdAt": "2026-10-07T10:00:00Z",
+            "tool": "",
+            "argsJson": "",
+            "actionStatus": "",
+            "planStepId": "",
+            "planId": "",
+            "resolvedProjectId": "",
+            "resultForActionId": "",
+            "resultKind": "",
+            "image": ""
+          }
+        ],
+        "cacheMetrics": {
+          "observedRequests": 1,
+          "hitTokens": 16,
+          "missTokens": 4
+        }
+      }
+    },
+    "pcWritingCandidatesByProject": {
+      "interop-project": [
+        {
+          "id": "opaque-candidate",
+          "platform": "pc",
+          "body": "保留未知候选"
+        }
+      ]
+    },
+    "futureExtension": {
+      "text": "未知字段必须保留",
+      "version": 7
+    }
+  }
+}

@@ -65,6 +65,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -81,6 +82,13 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
+private enum class BackupExportFormat(val mime: String, val extension: String) {
+    Zip("application/zip", "zip"),
+    Json("application/json", "json"),
+}
+
+private data class BackupExportRequest(val format: BackupExportFormat, val includeSecrets: Boolean) : java.io.Serializable
+
 @Composable
 @OptIn(ExperimentalMaterial3Api::class)
 fun SettingsScreen(vm: AppViewModel) {
@@ -93,40 +101,36 @@ fun SettingsScreen(vm: AppViewModel) {
     val importPreview by vm.importPreview.collectAsState()
     val status by vm.statusMessage.collectAsState()
     val scope = rememberCoroutineScope()
-    var includeAppSettings by remember { mutableStateOf(false) }
-    var includeSecretsInExport by remember { mutableStateOf(false) }
-    var showSecretExportConfirmation by remember { mutableStateOf(false) }
+    var includeAppSettings by rememberSaveable { mutableStateOf(false) }
+    var includeSecretsInExport by rememberSaveable { mutableStateOf(false) }
+    var showSecretExportConfirmation by rememberSaveable { mutableStateOf(false) }
+    var backupExportFormat by rememberSaveable { mutableStateOf(BackupExportFormat.Zip) }
+    var pendingBackupExport by rememberSaveable { mutableStateOf<BackupExportRequest?>(null) }
+    var backupExportRunning by remember { mutableStateOf(false) }
 
     val pickFileLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument(),
     ) { uri: Uri? ->
         uri ?: return@rememberLauncherForActivityResult
-        scope.launch {
-            val text = withContext(Dispatchers.IO) {
-                context.contentResolver.openInputStream(uri)?.use { it.readBytes().toString(Charsets.UTF_8) }
-            }
-            if (text != null) {
-                val name = uri.lastPathSegment?.substringAfterLast('/') ?: "backup.json"
-                vm.stageImport(name, text)
-            } else {
-                // surface a friendly message; reuse statusMessage by triggering a failed parse
-                vm.stageImport("backup.json", "{}")
-            }
-        }
+        val name = uri.lastPathSegment?.substringAfterLast('/') ?: "backup"
+        vm.stageImport(name) { context.contentResolver.openInputStream(uri) }
     }
 
     val createFileLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.CreateDocument("application/json"),
+        contract = ActivityResultContracts.CreateDocument(backupExportFormat.mime),
     ) { uri: Uri? ->
-        uri ?: return@rememberLauncherForActivityResult
+        val request = pendingBackupExport
+        pendingBackupExport = null
+        if (uri == null || request == null) return@rememberLauncherForActivityResult
+        backupExportRunning = true
+        vm.showStatus(tx(lang, "正在导出并校验备份…", "Exporting and verifying backup…"))
         scope.launch {
             val result = withContext(Dispatchers.IO) {
                 runCatching {
-                    val json = vm.buildBackupJson(includeSecretsInExport)
                     val stream = context.contentResolver.openOutputStream(uri, "w")
                         ?: error("无法打开导出文件 / Unable to open export file")
                     stream.use { out ->
-                        out.write(json.toByteArray(Charsets.UTF_8))
+                        vm.writeBackup(out, archive = request.format == BackupExportFormat.Zip, includeSecrets = request.includeSecrets)
                     }
                 }
             }
@@ -136,12 +140,14 @@ fun SettingsScreen(vm: AppViewModel) {
             }.onFailure { error ->
                 vm.showStatus(tx(lang, "备份导出失败：", "Backup export failed: ") + error.message)
             }
+            backupExportRunning = false
         }
     }
 
     val launchBackupDocument = {
         val stamp = SimpleDateFormat("yyyy-MM-dd-HH-mm-ss", Locale.US).format(Date())
-        createFileLauncher.launch("novelseek-backup-$stamp.json")
+        pendingBackupExport = BackupExportRequest(backupExportFormat, includeSecretsInExport)
+        createFileLauncher.launch("novelseek-backup-$stamp.${backupExportFormat.extension}")
     }
 
     Scaffold(
@@ -241,10 +247,10 @@ fun SettingsScreen(vm: AppViewModel) {
                 Text(
                     tx(
                         lang,
-                        "备份包含项目元数据、章节正文、配图、小说问答与智能体会话；PC 版会忽略 Android 扩展字段。" +
+                        "备份包含项目元数据、章节正文、配图、小说问答、智能体会话、候选稿和场景写作进度。ZIP 逐项校验；JSON 兼容 PC 版。" +
                             "默认不导出 API Key。导入旧备份中的 Key 时会写入 Android Keystore。",
-                        "The backup includes project metadata, chapter bodies, illustrations, novel chat, and agent sessions; " +
-                            "the PC build ignores Android extension fields. API keys are excluded by default and imported " +
+                        "Backups include metadata, chapter bodies, illustrations, novel chat, agent sessions, candidates and scene progress. " +
+                            "ZIP verifies each item; JSON supports the PC build. API keys are excluded by default and imported " +
                             "legacy keys are stored in Android Keystore."
                     ),
                     style = MaterialTheme.typography.bodyMedium,
@@ -252,10 +258,24 @@ fun SettingsScreen(vm: AppViewModel) {
                 )
 
                 Spacer(Modifier.height(10.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilterChip(selected = backupExportFormat == BackupExportFormat.Zip,
+                        onClick = { backupExportFormat = BackupExportFormat.Zip },
+                        enabled = !backupExportRunning && pendingBackupExport == null,
+                        label = { Text(tx(lang, "ZIP（推荐）", "ZIP (recommended)")) })
+                    FilterChip(selected = backupExportFormat == BackupExportFormat.Json,
+                        onClick = { backupExportFormat = BackupExportFormat.Json },
+                        enabled = !backupExportRunning && pendingBackupExport == null,
+                        label = { Text(tx(lang, "JSON（PC）", "JSON (PC)")) })
+                }
+                Text(tx(lang, "可导入 ZIP 或旧版 JSON；文件全部校验成功后才进入导入确认。",
+                    "Import ZIP or legacy JSON. Import confirmation appears only after verification succeeds."),
+                    style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Checkbox(
                         checked = includeSecretsInExport,
                         onCheckedChange = { includeSecretsInExport = it },
+                        enabled = !backupExportRunning && pendingBackupExport == null,
                     )
                     Text(
                         tx(
@@ -276,6 +296,7 @@ fun SettingsScreen(vm: AppViewModel) {
                             else launchBackupDocument()
                         },
                         modifier = Modifier.weight(1f),
+                        enabled = !backupExportRunning && pendingBackupExport == null,
                     ) {
                         Icon(Icons.Outlined.Download, contentDescription = null)
                         Spacer(Modifier.width(8.dp))
@@ -284,9 +305,10 @@ fun SettingsScreen(vm: AppViewModel) {
                     OutlinedButton(
                         onClick = {
                             vm.clearStatus()
-                            pickFileLauncher.launch(arrayOf("application/json", "*/*"))
+                            pickFileLauncher.launch(arrayOf("application/zip", "application/x-zip-compressed", "application/json", "application/octet-stream", "*/*"))
                         },
                         modifier = Modifier.weight(1f),
+                        enabled = !backupExportRunning && pendingBackupExport == null,
                     ) {
                         Icon(Icons.Outlined.Upload, contentDescription = null)
                         Spacer(Modifier.width(8.dp))
@@ -389,8 +411,8 @@ fun SettingsScreen(vm: AppViewModel) {
                 Text(
                     tx(
                         lang,
-                        "这份 JSON 会包含文本模型、Embedding 与图像服务的 API Key。任何拿到文件的人都可能使用这些额度。仅在迁移到你自己的设备时使用。",
-                        "This JSON will contain API keys for text, embedding, and image services. Anyone with the file may use those credentials. Use this only to migrate to your own device.",
+                        "这份备份会包含文本模型、Embedding 与图像服务的 API Key。任何拿到文件的人都可能使用这些额度。仅在迁移到你自己的设备时使用。",
+                        "This backup will contain API keys for text, embedding, and image services. Anyone with the file may use those credentials. Use this only to migrate to your own device.",
                     ),
                 )
             },

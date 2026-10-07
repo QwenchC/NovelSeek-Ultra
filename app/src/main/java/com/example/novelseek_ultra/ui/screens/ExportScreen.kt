@@ -10,6 +10,8 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -38,12 +40,14 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import com.example.novelseek_ultra.data.export.PdfExporter
+import com.example.novelseek_ultra.data.export.BookPackageExporter
 import com.example.novelseek_ultra.data.model.Chapter
 import com.example.novelseek_ultra.ui.AppViewModel
 import com.example.novelseek_ultra.util.tx
@@ -55,9 +59,11 @@ private enum class ExportFormat(val label: String, val mime: String, val ext: St
     Txt("TXT", "text/plain", "txt"),
     Markdown("Markdown", "text/markdown", "md"),
     Pdf("PDF", "application/pdf", "pdf"),
+    Epub("EPUB", "application/epub+zip", "epub"),
+    Docx("DOCX", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "docx"),
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun ExportScreen(vm: AppViewModel, projectId: String, onBack: () -> Unit) {
     val lang by vm.uiLanguage.collectAsState()
@@ -66,14 +72,14 @@ fun ExportScreen(vm: AppViewModel, projectId: String, onBack: () -> Unit) {
     val project = vm.project(projectId)
     val chapters = remember(projectId) { vm.chapters(projectId).sortedBy { it.order_index } }
 
-    var format by remember { mutableStateOf(ExportFormat.Pdf) }
-    var includeOutline by remember { mutableStateOf(false) }
-    var preferFinal by remember { mutableStateOf(true) }
+    var format by rememberSaveable { mutableStateOf(ExportFormat.Pdf) }
+    var includeOutline by rememberSaveable { mutableStateOf(false) }
+    var preferFinal by rememberSaveable { mutableStateOf(true) }
     // PDF-only image toggles (mirror the PC export): novel cover, per-chapter promo banner,
     // and inline paragraph illustrations. Default on.
-    var includeCover by remember { mutableStateOf(true) }
-    var includePromo by remember { mutableStateOf(true) }
-    var includeIllustrations by remember { mutableStateOf(true) }
+    var includeCover by rememberSaveable { mutableStateOf(true) }
+    var includePromo by rememberSaveable { mutableStateOf(true) }
+    var includeIllustrations by rememberSaveable { mutableStateOf(true) }
     var status by remember { mutableStateOf("") }
 
     val createDoc = rememberLauncherForActivityResult(
@@ -103,6 +109,25 @@ fun ExportScreen(vm: AppViewModel, projectId: String, onBack: () -> Unit) {
                                     ch.title to if (preferFinal) b.final.ifBlank { b.draft } else b.draft
                                 })
                         )
+                        ExportFormat.Epub, ExportFormat.Docx -> {
+                            val book = BookPackageExporter.Book(
+                                title = project.title,
+                                author = project.author,
+                                outline = if (includeOutline) vm.outlineText(projectId) else null,
+                                language = if (lang == "en") "en" else "zh-CN",
+                                chapters = chapters.map { chapter ->
+                                    val body = vm.chapterBody(chapter.id)
+                                    BookPackageExporter.Chapter(chapter.title,
+                                        if (preferFinal) body.final.ifBlank { body.draft } else body.draft)
+                                },
+                            )
+                            val output = context.contentResolver.openOutputStream(uri, "w")
+                                ?: error("无法打开目标文件")
+                            output.use {
+                                if (format == ExportFormat.Epub) BookPackageExporter.exportEpub(it, book)
+                                else BookPackageExporter.exportDocx(it, book)
+                            }
+                        }
                         ExportFormat.Pdf -> {
                             // Resolve the project's default cover (or first cover) as base64.
                             val coverB64 = if (includeCover) {
@@ -187,7 +212,7 @@ fun ExportScreen(vm: AppViewModel, projectId: String, onBack: () -> Unit) {
         ) {
             Card { Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(tx(lang, "导出格式", "Format"), style = MaterialTheme.typography.titleMedium)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     ExportFormat.values().forEach { f ->
                         FilterChip(selected = format == f, onClick = { format = f }, label = { Text(f.label) })
                     }
@@ -203,6 +228,12 @@ fun ExportScreen(vm: AppViewModel, projectId: String, onBack: () -> Unit) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Checkbox(checked = preferFinal, onCheckedChange = { preferFinal = it })
                     Text(tx(lang, "优先使用「正文」（取消则使用「草稿」）", "Prefer 'final' text (uncheck for 'draft')"))
+                }
+                if (format == ExportFormat.Epub || format == ExportFormat.Docx) {
+                    Text(tx(lang, "EPUB / DOCX 导出书名、作者、章节标题和完整文字正文；图片选项仅适用于 PDF。",
+                        "EPUB / DOCX include book metadata, chapter headings and full text. Image options apply to PDF."),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
 
                 // ── PDF-only image options ──────────────────────────────

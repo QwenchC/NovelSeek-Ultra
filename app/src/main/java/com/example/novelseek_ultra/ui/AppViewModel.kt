@@ -11,9 +11,13 @@ import com.example.novelseek_ultra.data.FactEvidenceLedger
 import com.example.novelseek_ultra.data.NovelGenerationEngine
 import com.example.novelseek_ultra.data.ai.AiService
 import com.example.novelseek_ultra.data.ai.ChatMessage
+import com.example.novelseek_ultra.data.ai.ChatResponseFormat
+import com.example.novelseek_ultra.data.ai.CharacterImportProtocol
 import com.example.novelseek_ultra.data.ai.EntityReconciliation
 import com.example.novelseek_ultra.data.ai.GenerationTelemetryCollector
 import com.example.novelseek_ultra.data.ai.KbService
+import com.example.novelseek_ultra.data.ai.LongOutputFormat
+import com.example.novelseek_ultra.data.ai.LongOutputRecovery
 import com.example.novelseek_ultra.data.ai.Prompts
 import com.example.novelseek_ultra.data.ai.PromptRequestBudgeter
 import com.example.novelseek_ultra.data.ai.TextModelRequestPolicy
@@ -712,6 +716,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         repo.listGenerationRuns(projectId, chapterId)
             .firstOrNull { it.status == GenerationRun.STATUS_COMPLETED }
 
+    /** Exact durable generation run used by agent review links. Call from a worker dispatcher. */
+    fun chapterGenerationRun(projectId: String, runId: String): GenerationRun? =
+        repo.getGenerationRun(projectId, runId)
+
     fun adoptChapterCandidate(
         projectId: String,
         runId: String,
@@ -1170,12 +1178,19 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             ),
         )
         launchStreamingGeneration(ticket) { revision, buffer ->
-            ai.streamChat(cfg, messages).collectCompleted(
-                onDelta = { text -> appendStreamingText(revision, buffer, text) },
-                onFailure = { message -> streamingError(revision, "生成失败：$message") },
+            val generated = LongOutputRecovery.collect(
+                config = cfg,
+                initialMessages = messages,
+                format = LongOutputFormat.MARKDOWN,
+                taskLabel = if (lang == "en") "Outline generation" else "大纲生成",
+                language = lang,
+                request = { requestMessages -> ai.streamChat(cfg, requestMessages) },
+                onCumulative = { cumulative ->
+                    replaceStreamingText(revision, buffer, prefix + cumulative)
+                },
             )
             ensureStreamingOwner(revision)
-            val final = buffer.toString().trim()
+            val final = (prefix + generated).trim()
             if (final.isNotEmpty()) {
                 val committed = commitIfStreamingOwner(revision) {
                     repo.setOutlineIfUnchanged(projectId, currentOutline, final)
@@ -1579,6 +1594,23 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     activeGeneration.run.id,
                 )
             }
+        }
+    }
+
+    /** Replace the visible cumulative preview (used by multi-request continuation/batch flows). */
+    private suspend fun replaceStreamingText(
+        revision: Long,
+        buffer: StringBuilder,
+        text: String,
+    ) {
+        ensureStreamingOwner(revision)
+        synchronized(streamingGenerationLock) {
+            if (streamingGenerationRevision != revision) {
+                throw CancellationException("Streaming generation was superseded")
+            }
+            buffer.clear()
+            buffer.append(text)
+            _streamingText.value = text
         }
     }
 
@@ -2661,7 +2693,14 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         onUsage: (StreamUsage) -> Unit = {},
     ): String? {
         val cfg = repo.activeTextModelConfig(); if (!cfg.isValid()) return null
-        return withContext(Dispatchers.IO) { ai.chat(cfg, messages, onUsage) }
+        return withContext(Dispatchers.IO) {
+            ai.chat(
+                config = cfg,
+                messages = messages,
+                onUsage = onUsage,
+                responseFormat = ChatResponseFormat.JSON_OBJECT,
+            )
+        }
     }
 
     fun agentTextModelReady(): Boolean = repo.activeTextModelConfig().isValid()
@@ -2803,14 +2842,20 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             if (!promptSourcesStillCurrent(projectId, PromptSourceScope.OUTLINE, promptSources)) {
                 contentConflict("项目大纲生成上下文")
             }
-            val out = runSuspendCatching { streamCollect(cfg, messages, onDelta) }.getOrNull()?.takeIf { it.isNotEmpty() }
-            if (out != null) {
-                currentCoroutineContext().ensureActive()
-                if (!promptSourcesStillCurrent(projectId, PromptSourceScope.OUTLINE, promptSources) ||
-                    !repo.setOutlineIfUnchanged(projectId, baselineOutline, out)
-                ) {
-                    contentConflict("项目大纲或生成上下文")
-                }
+            val out = LongOutputRecovery.collect(
+                config = cfg,
+                initialMessages = messages,
+                format = LongOutputFormat.MARKDOWN,
+                taskLabel = if (lang == "en") "Agent outline generation" else "智能体大纲生成",
+                language = lang,
+                request = { requestMessages -> ai.streamChat(cfg, requestMessages) },
+                onCumulative = onDelta,
+            ).trim()
+            currentCoroutineContext().ensureActive()
+            if (!promptSourcesStillCurrent(projectId, PromptSourceScope.OUTLINE, promptSources) ||
+                !repo.setOutlineIfUnchanged(projectId, baselineOutline, out)
+            ) {
+                contentConflict("项目大纲或生成上下文")
             }
             out
         }
@@ -3036,13 +3081,29 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     appendLine()
                     appendLine((if (lang == "en") "Chapter text:" else "章节正文：") + "\n" + text.take(6000))
                     appendLine()
-                    append(if (lang == "en") "Output the JSON character array." else "请输出 JSON 角色数组。")
+                    append(
+                        if (lang == "en") {
+                            "Output only the complete JSON wrapper object required by the system wire contract."
+                        } else {
+                            "只能输出系统传输协议要求的完整 JSON 包装对象。"
+                        },
+                    )
                 }),
             )
-            val reply = runSuspendCatching { ai.chat(cfg, messages) }.getOrElse {
+            val reply = runSuspendCatching {
+                ai.chat(cfg, messages, responseFormat = ChatResponseFormat.JSON_OBJECT)
+            }.getOrElse {
                 throw IllegalStateException("角色提取失败：文本模型调用失败", it)
             }
-            val parsed = parseCharsFromAiText(reply).filter { it.name.isNotBlank() && it.name !in existingNames }
+            val parsed = runCatching { CharacterImportProtocol.parseCompleteJson(reply) }
+                .getOrElse {
+                    throw IllegalStateException(
+                        "角色提取失败：模型没有返回符合协议的完整 JSON（${it.message}）",
+                        it,
+                    )
+                }
+                .let { CharacterImportProtocol.mergeByName(listOf(it), "char-chapter-${System.currentTimeMillis()}") }
+                .filter { it.name.isNotBlank() && it.name !in existingNames }
             if (parsed.isEmpty()) return@withContext emptyList()
             currentCoroutineContext().ensureActive()
             val added = repo.withChapterTransaction {
@@ -3486,26 +3547,89 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
         val lang = _uiLanguage.value
         val realmCtx = buildRealmSystemContext(repo.cultivationRealms(projectId), lang)
-        val outlineWithCtx = if (realmCtx.isNotEmpty()) "$outline\n\n$realmCtx" else outline
-        val messages = listOf(
-            ChatMessage("system", Prompts.charsFromOutlineSystem(lang)),
-            ChatMessage("user", Prompts.charsFromOutlineUser(outlineWithCtx, lang)),
-        )
-        return launchStreamingGeneration(ticket) { revision, buffer ->
-            if (!promptSourcesStillCurrent(
-                    projectId,
-                    PromptSourceScope.CHARACTERS_FROM_OUTLINE,
-                    promptSources,
-                )
-            ) {
-                contentConflict("大纲、境界体系或项目")
+        val systemMessage = ChatMessage("system", Prompts.charsFromOutlineSystem(lang))
+        val stablePrefixMessages = buildList {
+            add(systemMessage)
+            realmCtx.takeIf { it.isNotBlank() }?.let {
+                add(ChatMessage("system", Prompts.charsFromOutlineContext(it, lang)))
             }
-            ai.streamChat(cfg, messages).collectCompleted(
-                onDelta = { text -> appendStreamingText(revision, buffer, text) },
-                onFailure = { message -> streamingError(revision, "生成失败：$message") },
+        }
+        val fixedMessages = stablePrefixMessages +
+            ChatMessage(
+                "user",
+                Prompts.charsFromOutlineUser(
+                    outline = "",
+                    language = lang,
+                    batchIndex = 9_999,
+                    batchCount = 9_999,
+                ),
             )
+        return launchStreamingGeneration(ticket) { revision, buffer ->
+            val batchTokenBudget = CharacterImportProtocol.outlineBatchTokenBudget(cfg, fixedMessages)
+            val outlineBatches = CharacterImportProtocol.splitOutline(outline, batchTokenBudget)
+            if (outlineBatches.isEmpty()) {
+                throw IllegalStateException("角色导入失败：大纲分批后没有可处理内容，未导入任何角色。")
+            }
+            val parsedBatches = mutableListOf<List<Character>>()
+            outlineBatches.forEachIndexed { index, outlineBatch ->
+                if (!promptSourcesStillCurrent(
+                        projectId,
+                        PromptSourceScope.CHARACTERS_FROM_OUTLINE,
+                        promptSources,
+                    )
+                ) {
+                    contentConflict("大纲、境界体系或项目")
+                }
+                val batchNumber = index + 1
+                val messages = stablePrefixMessages +
+                    ChatMessage(
+                        "user",
+                        Prompts.charsFromOutlineUser(
+                            outline = outlineBatch,
+                            language = lang,
+                            batchIndex = batchNumber,
+                            batchCount = outlineBatches.size,
+                        ),
+                    )
+                // LongOutputRecovery validates every initial/continuation request against the
+                // normalized provider budget before any network call is allowed.
+                val response = LongOutputRecovery.collect(
+                    config = cfg,
+                    initialMessages = messages,
+                    format = LongOutputFormat.JSON_OBJECT,
+                    taskLabel = if (lang == "en") {
+                        "Character import batch $batchNumber/${outlineBatches.size}"
+                    } else {
+                        "角色导入第 $batchNumber/${outlineBatches.size} 批"
+                    },
+                    language = lang,
+                    maxRequests = 3,
+                    request = { requestMessages -> ai.streamChat(cfg, requestMessages) },
+                    onCumulative = { cumulative ->
+                        val progress = if (lang == "en") {
+                            "Processing character batch $batchNumber/${outlineBatches.size}"
+                        } else {
+                            "正在处理角色分片 $batchNumber/${outlineBatches.size}"
+                        }
+                        replaceStreamingText(revision, buffer, "$progress\n\n$cumulative")
+                    },
+                )
+                val parsed = try {
+                    CharacterImportProtocol.parseCompleteJson(response)
+                } catch (failure: CharacterImportProtocol.FormatException) {
+                    throw IllegalStateException(
+                        "角色导入失败：第 $batchNumber/${outlineBatches.size} 批没有返回符合协议的完整 JSON" +
+                            "（${failure.message}）。所有批次均未导入；请重试，或更换支持 JSON 输出的模型。",
+                        failure,
+                    )
+                }
+                parsedBatches += parsed
+            }
             ensureStreamingOwner(revision)
-            val parsed = parseCharsFromAiText(buffer.toString())
+            val parsed = CharacterImportProtocol.mergeByName(
+                batches = parsedBatches,
+                idPrefix = "char-import-${System.currentTimeMillis()}",
+            )
             val committed = withContext(Dispatchers.Main) {
                 commitIfStreamingOwner(revision) {
                     if (!promptSourcesStillCurrent(
@@ -3523,66 +3647,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             }
             if (!committed) contentConflict("大纲、境界体系或项目")
         }
-    }
-
-    private fun parseCharsFromAiText(text: String): List<Character> {
-        val ts = System.currentTimeMillis()
-        // Try JSON array first
-        val jsonResult = runCatching {
-            // Strip optional markdown code fences and find the JSON array
-            val stripped = text
-                .replace(Regex("```(?:json)?\\s*"), "")
-                .replace("```", "")
-                .trim()
-            val start = stripped.indexOf('[')
-            val end = stripped.lastIndexOf(']')
-            if (start < 0 || end <= start) error("no array")
-            val jsonArray = stripped.substring(start, end + 1)
-            val arr = Json { ignoreUnknownKeys = true }.parseToJsonElement(jsonArray)
-                .jsonArray
-            arr.mapIndexed { i, el ->
-                val obj = el.jsonObject
-                fun str(key: String) = obj[key]?.let {
-                    it.toString().trim('"')
-                }?.takeIf { it.isNotBlank() && it != "null" } ?: ""
-                val isProta = obj["isProtagonist"]?.toString()?.trim('"')
-                    ?.equals("true", ignoreCase = true) ?: false
-                Character(
-                    id = "char-import-$ts-$i",
-                    name = str("name").ifBlank { return@mapIndexed null },
-                    gender = str("gender"),
-                    role = str("role"),
-                    personality = str("personality"),
-                    motivation = str("motivation"),
-                    background = str("background"),
-                    appearance = str("appearance"),
-                    isProtagonist = isProta,
-                )
-            }.filterNotNull()
-        }
-        if (jsonResult.isSuccess) {
-            val list = jsonResult.getOrDefault(emptyList())
-            if (list.isNotEmpty()) return list
-        }
-        // Fallback: pipe-delimited format
-        return text.lines()
-            .mapIndexedNotNull { i, line ->
-                val raw = line.trimStart('-', '*', ' ', '\t')
-                    .replace(Regex("^\\d+[.)、]\\s*"), "")
-                    .trim()
-                if (!raw.contains('|')) return@mapIndexedNotNull null
-                val parts = raw.split('|').map { it.trim() }
-                val name = parts.getOrNull(0)?.takeIf { it.isNotBlank() } ?: return@mapIndexedNotNull null
-                Character(
-                    id = "char-import-$ts-$i",
-                    name = name,
-                    gender = parts.getOrElse(1) { "" },
-                    role = parts.getOrElse(2) { "" },
-                    personality = parts.getOrElse(3) { "" },
-                    motivation = parts.getOrElse(4) { "" },
-                    background = parts.getOrElse(5) { "" },
-                )
-            }
     }
 
 

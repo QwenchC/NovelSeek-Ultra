@@ -16,7 +16,7 @@ android {
         applicationId = "com.example.novelseek_ultra"
         minSdk = 24
         targetSdk = 36
-        versionCode = 13
+        versionCode = 14
         versionName = "1.5.6"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"

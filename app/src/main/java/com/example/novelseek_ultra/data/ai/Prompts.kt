@@ -277,47 +277,42 @@ object Prompts {
     }
 
     fun charsFromOutlineSystem(language: String) = if (language == "en") {
-        """You are a professional novel character analyst. Extract ALL major and secondary characters from the provided outline.
+        """You are a professional novel character analyst. Extract every major or meaningful secondary character that appears in the supplied outline slice. Create a detailed, evidence-grounded profile for each one.
 
-For each character, create a COMPREHENSIVE and DETAILED profile — do not summarize, be thorough.
+WIRE CONTRACT (mandatory): output exactly ONE complete JSON object and nothing else. No Markdown, code fence, preface, explanation, or trailing text. The root shape is:
+{"characters":[{"name":"Full character name","gender":"male / female / unknown","isProtagonist":false,"role":"Detailed story role/title","personality":"Detailed traits, behavior, strengths and flaws","motivation":"Detailed desires, goals, fears and driving forces","background":"Detailed origin, family and formative events","appearance":"Detailed build, features, clothing and distinguishing marks"}]}
 
-Output ONLY a valid JSON array with no markdown, no code fences, no explanation before or after:
-[
-  {
-    "name": "Full character name",
-    "gender": "male / female / unknown",
-    "isProtagonist": true or false,
-    "role": "Role/title in the story (e.g. protagonist, main antagonist, mentor, rival...)",
-    "personality": "Detailed personality traits, behavioral tendencies, strengths and flaws",
-    "motivation": "Core desires, goals, driving forces, and what they fear or want to avoid",
-    "background": "Detailed backstory: origin, family, past events that shaped them",
-    "appearance": "Physical description: build, features, clothing style, distinguishing marks"
-  }
-]"""
+Every character object must contain all eight fields with exactly the JSON types shown. Use {"characters":[]} when this slice contains no identifiable character. Never output a loose root array."""
     } else {
-        """你是专业的小说角色分析师。请从提供的大纲中提取所有主要角色与重要配角。
+        """你是专业的小说角色分析师。请提取所给大纲分片中出现的所有主要角色与重要配角，并依据原文为每人建立详尽档案。
 
-对每个角色，请创建详尽完整的角色档案——不要简略概括，要详细展开。
+【强制传输协议】只能输出一个完整 JSON 对象，除此之外不能有任何内容；禁止 Markdown、代码块、前置说明、解释或结尾文字。根对象格式固定为：
+{"characters":[{"name":"角色全名","gender":"男 / 女 / 未知","isProtagonist":false,"role":"详细身份与故事定位","personality":"详细性格、行为倾向、优点与缺陷","motivation":"详细欲望、目标、恐惧与驱动力","background":"详细出身、家庭与关键经历","appearance":"详细体型、五官、着装与显著标志"}]}
 
-请只输出合法 JSON 数组，不要加任何 markdown、代码块标记、前置说明或结尾说明：
-[
-  {
-    "name": "角色全名",
-    "gender": "男 / 女 / 未知",
-    "isProtagonist": true 或 false,
-    "role": "角色在故事中的身份定位（如主角、主要反派、导师、对手……）",
-    "personality": "详细的性格特点、行为倾向、优点与缺陷",
-    "motivation": "核心欲望、目标、驱动力，以及他们恐惧或想要避免的事",
-    "background": "详细背景故事：出身、家庭、塑造其性格的过去经历",
-    "appearance": "外貌描述：体型、五官特征、着装风格、显著标志"
-  }
-]"""
+每个角色对象必须包含以上八个字段，JSON 类型必须与示例一致。分片中没有可识别角色时输出 {"characters":[]}。绝不能输出根数组。"""
     }
 
-    fun charsFromOutlineUser(outline: String, language: String) = if (language == "en") {
-        "Novel outline:\n\n$outline\n\nNow output the complete JSON character array. Be thorough — each field must be detailed, not just a brief phrase."
+    fun charsFromOutlineUser(
+        outline: String,
+        language: String,
+        batchIndex: Int = 1,
+        batchCount: Int = 1,
+    ): String = if (language == "en") buildString {
+        appendLine("Outline slice:")
+        appendLine(outline)
+        appendLine()
+        append("Extract this slice ($batchIndex/$batchCount) now. Return only the complete JSON wrapper object required by the wire contract.")
+    } else buildString {
+        appendLine("大纲分片：")
+        appendLine(outline)
+        appendLine()
+        append("现在提取本分片（$batchIndex/$batchCount）。只能返回传输协议要求的完整 JSON 包装对象。")
+    }
+
+    fun charsFromOutlineContext(realmContext: String, language: String): String = if (language == "en") {
+        "Novel setting reference for every extraction batch. Treat it as fixed context and do not invent conflicts:\n$realmContext"
     } else {
-        "小说大纲：\n\n$outline\n\n请现在输出完整的 JSON 角色数组。每个字段都要详尽，不能只写简短的词语或短语。"
+        "所有角色提取分片共用的小说设定参考。请将其视为固定上下文，不得编造冲突内容：\n$realmContext"
     }
 
     /**

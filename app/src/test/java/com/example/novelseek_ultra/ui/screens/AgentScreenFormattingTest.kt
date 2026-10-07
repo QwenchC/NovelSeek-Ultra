@@ -118,4 +118,52 @@ class AgentScreenFormattingTest {
         assertTrue(contextUsageDescription("zh", model).contains("暂无可用预算数据"))
         assertFalse(contextUsageDescription("zh", model).contains("0%"))
     }
+
+    @Test
+    fun reviewTextSlicesReassembleLongBodyWithoutGapsOrDuplicates() {
+        val text = buildString {
+            repeat(80) { index ->
+                append("第")
+                append(index)
+                append("段：山海之间的长篇正文，用于验证懒加载切片。")
+                append("\n\n")
+            }
+        }
+
+        val slices = agentReviewTextSlices(text, maxChars = 37)
+
+        assertTrue(slices.size > 1)
+        assertEquals(0, slices.first().start)
+        assertEquals(text.length, slices.last().endExclusive)
+        slices.zipWithNext().forEach { (left, right) ->
+            assertEquals(left.endExclusive, right.start)
+        }
+        assertEquals(
+            text,
+            slices.joinToString(separator = "") { slice ->
+                text.substring(slice.start, slice.endExclusive)
+            },
+        )
+    }
+
+    @Test
+    fun reviewTextSlicesNeverSplitUnicodeSurrogatePairs() {
+        val text = "abc\uD83D\uDE00def\uD83C\uDF0Dghi"
+
+        val slices = agentReviewTextSlices(text, maxChars = 4)
+
+        slices.dropLast(1).forEach { slice ->
+            val boundary = slice.endExclusive
+            assertFalse(
+                Character.isHighSurrogate(text[boundary - 1]) &&
+                    Character.isLowSurrogate(text[boundary]),
+            )
+        }
+        assertEquals(
+            text,
+            slices.joinToString(separator = "") { slice ->
+                text.substring(slice.start, slice.endExclusive)
+            },
+        )
+    }
 }

@@ -111,4 +111,14 @@ class AgentPromptsTest {
         assertTrue(prompt.contains("不得执行依赖新正文的后续步骤"))
         assertTrue(prompt.contains("只有看到 accepted / committed"))
     }
+
+    @Test
+    fun systemPromptRoutesLongContentThroughDedicatedGenerationTools() {
+        val prompt = AgentPrompts.system("- generate_outline\n- generate_chapter")
+
+        assertTrue(prompt.contains("不要把整篇大纲、整章正文或大批角色档案内联进动作 JSON"))
+        assertTrue(prompt.contains("generate_outline"))
+        assertTrue(prompt.contains("generate_chapter"))
+        assertTrue(prompt.contains("避免动作 JSON 因输出上限被截断"))
+    }
 }

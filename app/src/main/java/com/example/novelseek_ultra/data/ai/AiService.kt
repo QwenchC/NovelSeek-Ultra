@@ -3,6 +3,8 @@ package com.example.novelseek_ultra.data.ai
 import com.example.novelseek_ultra.data.model.TextModelConfig
 import com.example.novelseek_ultra.data.model.TextModelThinkingModes
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -35,10 +37,16 @@ import java.io.IOException
 import java.net.ConnectException
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 data class ChatMessage(val role: String, val content: String)
+
+enum class ChatResponseFormat {
+    TEXT,
+    JSON_OBJECT,
+}
 
 data class StreamUsage(
     val promptTokens: Long? = null,
@@ -84,6 +92,13 @@ class AiService {
 
     private val sseFactory = EventSources.createFactory(client)
 
+    /**
+     * Some OpenAI-compatible gateways reject `response_format` even though the rest of the chat
+     * contract works. Remember that capability per endpoint/model after the first rejection so
+     * later agent steps do not pay for the same failed probe again.
+     */
+    private val jsonObjectUnsupported = ConcurrentHashMap.newKeySet<String>()
+
     /** Streamed chat completion: each emission is a delta `String` (a token or token chunk). */
     fun streamChat(
         config: TextModelConfig,
@@ -122,13 +137,17 @@ class AiService {
             close()
         }
 
-        fun fail(message: String, cause: Throwable? = null) {
+        fun fail(
+            message: String,
+            cause: Throwable? = null,
+            kind: StreamFailureKind = StreamFailureKind.OTHER,
+        ) {
             if (!terminated.compareAndSet(false, true)) return
             recordLatestUsage()
             // The original cause may contain an endpoint/query string or a provider response.
             // Keep it only as a nested diagnostic cause; collectors and UI see the safe message.
             val error = IOException(message, cause)
-            trySend(StreamEvent.Error(message))
+            trySend(StreamEvent.Error(message, kind))
             // Closing exceptionally is deliberate: current collectors commit their buffer after a
             // normal completion, so an Error event alone would still allow a truncated chapter.
             close(error)
@@ -162,7 +181,10 @@ class AiService {
                 when (val reason = frame.finishReason?.takeIf { it.isNotBlank() }) {
                     null -> Unit
                     "stop" -> sawStop.set(true)
-                    "length" -> fail("生成内容因达到模型最大输出长度而被截断（finish_reason=length）")
+                    "length" -> fail(
+                        message = "生成内容因达到模型最大输出长度而被截断（finish_reason=length）",
+                        kind = StreamFailureKind.OUTPUT_LIMIT,
+                    )
                     "content_filter" -> fail("生成内容被模型的内容安全策略中止（finish_reason=content_filter）")
                     "insufficient_system_resource" ->
                         fail("模型服务资源暂时不足（finish_reason=insufficient_system_resource）")
@@ -198,80 +220,121 @@ class AiService {
         config: TextModelConfig,
         messages: List<ChatMessage>,
         onUsage: (StreamUsage) -> Unit = {},
+        responseFormat: ChatResponseFormat = ChatResponseFormat.TEXT,
     ): String {
         ApiEndpointPolicy.requireAllowed(config.apiUrl, config.apiKey)
-        return kotlinx.coroutines.suspendCancellableCoroutine { cont ->
-            val payload = buildChatPayload(config, messages, stream = false).toString()
-            val request = Request.Builder()
-                .url("${config.apiUrl.trimEnd('/')}/chat/completions")
-                .apply {
-                    if (config.apiKey.isNotBlank()) {
-                        addHeader("Authorization", "Bearer ${config.apiKey}")
-                    }
-                }
-                .addHeader("Content-Type", "application/json")
-                .post(payload.toRequestBody("application/json".toMediaType()))
-                .build()
-
-            val call = client.newCall(request)
-            // Per-call hard deadline — client.callTimeout stays at 0 to keep SSE streaming
-            // long-lived, so the bound has to be applied here per-request. Without this the
-            // call could hang forever if the provider queues / rate-limits us (Pollinations
-            // does this, which is exactly how the "always generating…" bug surfaced).
-            call.timeout().timeout(CHAT_ONESHOT_TIMEOUT_SEC, TimeUnit.SECONDS)
-            cont.invokeOnCancellation { call.cancel() }
-
-            call.enqueue(object : Callback {
-                override fun onFailure(call: Call, e: IOException) {
-                    val message = when (e) {
-                        is SocketTimeoutException -> "模型服务请求超时"
-                        is UnknownHostException, is ConnectException -> "模型服务网络连接失败"
-                        else -> "模型服务网络请求失败"
-                    }
-                    cont.resumeWith(Result.failure(IOException(message, e)))
-                }
-
-                override fun onResponse(call: Call, response: Response) {
-                    response.use { resp ->
-                        val body = resp.body?.string().orEmpty()
-                        if (!resp.isSuccessful) {
-                            cont.resumeWith(
-                                Result.failure(
-                                    IOException("HTTP ${resp.code}: 模型服务请求失败"),
-                                ),
-                            )
-                            return
-                        }
-                        runCatching {
-                            val root = kotlinx.serialization.json.Json.parseToJsonElement(body).jsonObject
-                            (root["usage"] as? JsonObject)?.let(::parseUsage)?.let { usage ->
-                                runCatching { onUsage(usage) }
-                                recordUsage(usage)
-                            }
-                            val choice = root["choices"]?.jsonArray?.get(0)?.jsonObject
-                            val finishReason = (choice?.get("finish_reason") as? JsonPrimitive)
-                                ?.contentOrNull
-                            requireSuccessfulFinish(finishReason)
-                            choice?.get("message")?.jsonObject
-                                ?.get("content")?.jsonPrimitive?.contentOrNull
-                                ?: ""
-                        }.onSuccess { cont.resumeWith(Result.success(it)) }
-                            .onFailure { error ->
-                                // Preserve deliberate, already-sanitized finish_reason failures;
-                                // only parser/shape errors should become malformed-response errors.
-                                val safeError = if (error is IOException) {
-                                    error
-                                } else {
-                                    IOException("模型服务返回格式异常", error)
-                                }
-                                cont.resumeWith(
-                                    Result.failure(safeError),
-                                )
-                            }
-                    }
-                }
-            })
+        val capabilityKey = responseFormatCapabilityKey(config)
+        val effectiveFormat = if (
+            responseFormat == ChatResponseFormat.JSON_OBJECT &&
+            capabilityKey !in jsonObjectUnsupported
+        ) {
+            ChatResponseFormat.JSON_OBJECT
+        } else {
+            ChatResponseFormat.TEXT
         }
+        return try {
+            executeChat(config, messages, onUsage, effectiveFormat)
+        } catch (failure: ChatHttpException) {
+            if (
+                effectiveFormat == ChatResponseFormat.JSON_OBJECT &&
+                failure.statusCode in RESPONSE_FORMAT_REJECTION_STATUSES &&
+                failure.responseFormatRejected
+            ) {
+                currentCoroutineContext().ensureActive()
+                jsonObjectUnsupported += capabilityKey
+                executeChat(config, messages, onUsage, ChatResponseFormat.TEXT)
+            } else {
+                throw failure
+            }
+        }
+    }
+
+    private suspend fun executeChat(
+        config: TextModelConfig,
+        messages: List<ChatMessage>,
+        onUsage: (StreamUsage) -> Unit,
+        responseFormat: ChatResponseFormat,
+    ): String = kotlinx.coroutines.suspendCancellableCoroutine { cont ->
+        val payload = buildChatPayload(
+            config = config,
+            messages = messages,
+            stream = false,
+            responseFormat = responseFormat,
+        ).toString()
+        val request = Request.Builder()
+            .url("${config.apiUrl.trimEnd('/')}/chat/completions")
+            .apply {
+                if (config.apiKey.isNotBlank()) {
+                    addHeader("Authorization", "Bearer ${config.apiKey}")
+                }
+            }
+            .addHeader("Content-Type", "application/json")
+            .post(payload.toRequestBody("application/json".toMediaType()))
+            .build()
+
+        val call = client.newCall(request)
+        // Per-call hard deadline — client.callTimeout stays at 0 to keep SSE streaming
+        // long-lived, so the bound has to be applied here per-request. Without this the
+        // call could hang forever if the provider queues / rate-limits us (Pollinations
+        // does this, which is exactly how the "always generating…" bug surfaced).
+        call.timeout().timeout(CHAT_ONESHOT_TIMEOUT_SEC, TimeUnit.SECONDS)
+        cont.invokeOnCancellation { call.cancel() }
+
+        call.enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                val message = when (e) {
+                    is SocketTimeoutException -> "模型服务请求超时"
+                    is UnknownHostException, is ConnectException -> "模型服务网络连接失败"
+                    else -> "模型服务网络请求失败"
+                }
+                cont.resumeWith(Result.failure(IOException(message, e)))
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+                response.use { resp ->
+                    val body = resp.body?.string().orEmpty()
+                    if (!resp.isSuccessful) {
+                        cont.resumeWith(
+                            Result.failure(
+                                ChatHttpException(
+                                    statusCode = resp.code,
+                                    responseFormatRejected =
+                                        responseFormat == ChatResponseFormat.JSON_OBJECT &&
+                                            rejectsJsonObjectResponseFormat(body),
+                                ),
+                            ),
+                        )
+                        return
+                    }
+                    runCatching {
+                        val root = kotlinx.serialization.json.Json.parseToJsonElement(body).jsonObject
+                        (root["usage"] as? JsonObject)?.let(::parseUsage)?.let { usage ->
+                            runCatching { onUsage(usage) }
+                            recordUsage(usage)
+                        }
+                        val choice = root["choices"]?.jsonArray?.get(0)?.jsonObject
+                        val finishReason = (choice?.get("finish_reason") as? JsonPrimitive)
+                            ?.contentOrNull
+                        requireSuccessfulFinish(finishReason)
+                        choice?.get("message")?.jsonObject
+                            ?.get("content")?.jsonPrimitive?.contentOrNull
+                            ?: ""
+                    }.onSuccess { cont.resumeWith(Result.success(it)) }
+                        .onFailure { error ->
+                            // Preserve deliberate, already-sanitized finish_reason failures;
+                            // only parser/shape errors should become malformed-response errors.
+                            val safeError = if (error is IOException) {
+                                error
+                            } else {
+                                IOException("模型服务返回格式异常", error)
+                            }
+                            cont.resumeWith(
+                                Result.failure(safeError),
+                            )
+                        }
+                }
+            }
+        })
     }
 
     /**
@@ -665,6 +728,7 @@ class AiService {
         config: TextModelConfig,
         messages: List<ChatMessage>,
         stream: Boolean,
+        responseFormat: ChatResponseFormat = ChatResponseFormat.TEXT,
     ): JsonObject = buildJsonObject {
         val requestConfig = TextModelRequestPolicy.normalizeForRequest(config)
         val budgeted = PromptRequestBudgeter.validate(requestConfig, messages)
@@ -676,6 +740,9 @@ class AiService {
         }
         put("max_tokens", budgeted.maxOutputTokens)
         put("stream", stream)
+        if (responseFormat == ChatResponseFormat.JSON_OBJECT) {
+            put("response_format", buildJsonObject { put("type", "json_object") })
+        }
         if (isDeepSeek && thinkingMode != TextModelThinkingModes.AUTO) {
             put("thinking", buildJsonObject { put("type", thinkingMode) })
         }
@@ -837,10 +904,44 @@ class AiService {
             host == "openai.com" || host.endsWith(".openai.com")
     }
 
+    private fun responseFormatCapabilityKey(config: TextModelConfig): String =
+        "${config.apiUrl.trim().trimEnd('/').lowercase()}\u0000${config.model.trim()}"
+
+    private fun rejectsJsonObjectResponseFormat(body: String): Boolean {
+        val errorText = runCatching {
+            val root = kotlinx.serialization.json.Json.parseToJsonElement(body.take(MAX_ERROR_HINT_CHARS))
+                .jsonObject
+            val error = root["error"]
+            when (error) {
+                is JsonObject -> listOf("type", "code", "param", "message")
+                    .mapNotNull { key -> (error[key] as? JsonPrimitive)?.contentOrNull }
+                    .joinToString(" ")
+                is JsonPrimitive -> error.contentOrNull.orEmpty()
+                else -> ""
+            }
+        }.getOrDefault("").lowercase()
+        return "response_format" in errorText ||
+            "json_object" in errorText ||
+            "json object" in errorText
+    }
+
+    private class ChatHttpException(
+        val statusCode: Int,
+        val responseFormatRejected: Boolean,
+    ) : IOException("HTTP $statusCode: 模型服务请求失败")
+
+    enum class StreamFailureKind {
+        OTHER,
+        OUTPUT_LIMIT,
+    }
+
     sealed class StreamEvent {
         data class Delta(val text: String) : StreamEvent()
         object Done : StreamEvent()
-        data class Error(val message: String) : StreamEvent()
+        data class Error(
+            val message: String,
+            val kind: StreamFailureKind = StreamFailureKind.OTHER,
+        ) : StreamEvent()
     }
 
     private companion object {
@@ -850,6 +951,8 @@ class AiService {
         const val CHAT_ONESHOT_TIMEOUT_SEC = 120L
         const val IMAGE_TIMEOUT_SEC = 120L
         const val EMBED_TIMEOUT_SEC = 60L
+        const val MAX_ERROR_HINT_CHARS = 2_048
+        val RESPONSE_FORMAT_REJECTION_STATUSES = setOf(400, 404, 422)
 
         // ComfyUI: each individual HTTP call (submit / poll / view) gets this bound; the overall
         // job can take much longer, so it's gated by COMFY_JOB_TIMEOUT_SEC + a 1.5s poll interval.

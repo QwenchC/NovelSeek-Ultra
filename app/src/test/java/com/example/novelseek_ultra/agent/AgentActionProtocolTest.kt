@@ -3,6 +3,9 @@ package com.example.novelseek_ultra.agent
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -154,6 +157,34 @@ class AgentActionProtocolTest {
         assertTrue(feedback.contains("MISSING_ACTION"))
         assertTrue(feedback.contains("只输出一个 JSON 对象"))
         assertFalse(feedback.contains("{}{}"))
+    }
+
+    @Test
+    fun parsesLargeEscapedActionWithoutApplicationSideTruncation() {
+        val text = ("长正文含引号\"、反斜杠\\、括号{}[]与 emoji📚\n").repeat(12_000)
+        val raw = buildJsonObject {
+            put("thought", "保存用户提供的精确文本")
+            put("action", "set_chapter_body")
+            put("args", buildJsonObject { put("text", text) })
+        }.toString()
+
+        val parsed = AgentActionParser.parse(raw).success()
+
+        assertEquals(text, parsed.args.getValue("text").jsonPrimitive.content)
+    }
+
+    @Test
+    fun rejectsLargeTruncatedActionAndKeepsCorrectionBounded() {
+        val text = "未完成长正文".repeat(50_000)
+        val valid = buildJsonObject {
+            put("action", "set_chapter_body")
+            put("args", buildJsonObject { put("text", text) })
+        }.toString()
+        val failure = AgentActionParser.parse(valid.dropLast(2)).failure()
+
+        assertEquals(AgentActionParseErrorCode.INVALID_JSON, failure.error.code)
+        assertTrue(failure.error.asModelObservation().length < 1_000)
+        assertFalse(failure.error.asModelObservation().contains(text.take(200)))
     }
 
     private fun assertFailureCode(raw: String, expected: AgentActionParseErrorCode) {

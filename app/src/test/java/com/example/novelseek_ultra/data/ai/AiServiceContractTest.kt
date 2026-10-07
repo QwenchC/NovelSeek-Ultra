@@ -22,6 +22,8 @@ import org.junit.Test
 import java.io.IOException
 import java.net.InetSocketAddress
 import java.nio.charset.StandardCharsets
+import java.util.Collections
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -72,6 +74,133 @@ class AiServiceContractTest {
         assertEquals("system", messages[0].jsonObject.getValue("role").jsonPrimitive.content)
         assertEquals("你是小说编辑", messages[0].jsonObject.getValue("content").jsonPrimitive.content)
         assertEquals("写第一章", messages[1].jsonObject.getValue("content").jsonPrimitive.content)
+    }
+
+    @Test
+    fun chatJsonObjectModeSendsOpenAiCompatibleResponseFormat() = runBlocking {
+        val captured = AtomicReference<CapturedRequest>()
+        val apiUrl = startServer { exchange ->
+            captured.set(exchange.capture())
+            exchange.respondJson(
+                200,
+                """{"choices":[{"message":{"content":"{\"action\":\"finish\"}"}}]}""",
+            )
+        }
+
+        val reply = AiService().chat(
+            config = config(apiUrl),
+            messages = listOf(ChatMessage("user", "下一步")),
+            responseFormat = ChatResponseFormat.JSON_OBJECT,
+        )
+
+        assertEquals("{\"action\":\"finish\"}", reply)
+        val payload = Json.parseToJsonElement(captured.get().body).jsonObject
+        assertEquals(
+            "json_object",
+            payload.getValue("response_format").jsonObject
+                .getValue("type").jsonPrimitive.content,
+        )
+    }
+
+    @Test
+    fun chatJsonObjectModeFallsBackOnceWhenProviderRejectsField() = runBlocking {
+        val captured = Collections.synchronizedList(mutableListOf<CapturedRequest>())
+        val requests = AtomicInteger(0)
+        val apiUrl = startServer { exchange ->
+            val request = exchange.capture()
+            captured += request
+            if (requests.getAndIncrement() == 0) {
+                exchange.respondJson(
+                    400,
+                    """{"error":{"message":"unsupported field: response_format","param":"response_format"}}""",
+                )
+            } else {
+                exchange.respondJson(200, """{"choices":[{"message":{"content":"{}"}}]}""")
+            }
+        }
+
+        val reply = AiService().chat(
+            config = config(apiUrl),
+            messages = listOf(ChatMessage("user", "下一步")),
+            responseFormat = ChatResponseFormat.JSON_OBJECT,
+        )
+
+        assertEquals("{}", reply)
+        assertEquals(2, captured.size)
+        assertTrue("response_format" in Json.parseToJsonElement(captured[0].body).jsonObject)
+        assertFalse("response_format" in Json.parseToJsonElement(captured[1].body).jsonObject)
+    }
+
+    @Test
+    fun chatRemembersJsonObjectRejectionPerEndpointAndModel() = runBlocking {
+        val captured = Collections.synchronizedList(mutableListOf<CapturedRequest>())
+        val apiUrl = startServer { exchange ->
+            val request = exchange.capture()
+            captured += request
+            val payload = Json.parseToJsonElement(request.body).jsonObject
+            if ("response_format" in payload) {
+                exchange.respondJson(
+                    422,
+                    """{"error":{"message":"json_object is unsupported","param":"response_format"}}""",
+                )
+            } else {
+                exchange.respondJson(200, """{"choices":[{"message":{"content":"{}"}}]}""")
+            }
+        }
+        val service = AiService()
+        val cfg = config(apiUrl)
+
+        repeat(2) {
+            assertEquals(
+                "{}",
+                service.chat(
+                    config = cfg,
+                    messages = listOf(ChatMessage("user", "下一步")),
+                    responseFormat = ChatResponseFormat.JSON_OBJECT,
+                ),
+            )
+        }
+
+        assertEquals(
+            "{}",
+            service.chat(
+                config = cfg.copy(model = "another-model"),
+                messages = listOf(ChatMessage("user", "下一步")),
+                responseFormat = ChatResponseFormat.JSON_OBJECT,
+            ),
+        )
+
+        assertEquals(5, captured.size)
+        assertTrue("response_format" in Json.parseToJsonElement(captured[0].body).jsonObject)
+        assertFalse("response_format" in Json.parseToJsonElement(captured[1].body).jsonObject)
+        assertFalse("response_format" in Json.parseToJsonElement(captured[2].body).jsonObject)
+        assertTrue("response_format" in Json.parseToJsonElement(captured[3].body).jsonObject)
+        assertFalse("response_format" in Json.parseToJsonElement(captured[4].body).jsonObject)
+    }
+
+    @Test
+    fun chatJsonObjectModeDoesNotRetryAnUnrelatedBadRequest() = runBlocking {
+        val requests = AtomicInteger(0)
+        val apiUrl = startServer { exchange ->
+            requests.incrementAndGet()
+            exchange.capture()
+            exchange.respondJson(
+                400,
+                """{"error":{"message":"requested model does not exist","param":"model"}}""",
+            )
+        }
+
+        val failure = runCatching {
+            AiService().chat(
+                config = config(apiUrl),
+                messages = listOf(ChatMessage("user", "下一步")),
+                responseFormat = ChatResponseFormat.JSON_OBJECT,
+            )
+        }.exceptionOrNull()
+
+        assertTrue(failure is IOException)
+        assertEquals(1, requests.get())
+        assertTrue(failure?.message.orEmpty().contains("HTTP 400"))
     }
 
     @Test

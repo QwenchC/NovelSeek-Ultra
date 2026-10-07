@@ -57,6 +57,25 @@ class AiStreamCompletionGateTest {
     }
 
     @Test
+    fun outputLimitFailureKeepsMachineReadableKind() = runBlocking {
+        val failure = runCatching {
+            flowOf(
+                AiService.StreamEvent.Delta("partial"),
+                AiService.StreamEvent.Error(
+                    "达到输出上限",
+                    AiService.StreamFailureKind.OUTPUT_LIMIT,
+                ),
+            ).collectCompleted(onDelta = {})
+        }.exceptionOrNull()
+
+        assertTrue(failure is AiStreamCompletionException)
+        assertEquals(
+            AiService.StreamFailureKind.OUTPUT_LIMIT,
+            (failure as AiStreamCompletionException).kind,
+        )
+    }
+
+    @Test
     fun normalEofWithoutDoneRejectsPartialText() = runBlocking {
         val text = StringBuilder()
         val reported = mutableListOf<String>()

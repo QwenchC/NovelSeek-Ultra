@@ -20,6 +20,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.systemBars
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -49,6 +51,7 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -79,6 +82,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
@@ -86,12 +90,17 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.example.novelseek_ultra.util.ImageShare
 import androidx.compose.ui.text.font.FontStyle
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import com.example.novelseek_ultra.data.model.AgentPendingReview
 import com.example.novelseek_ultra.data.model.AgentReasoningLevels
 import com.example.novelseek_ultra.data.model.AgentStep
+import com.example.novelseek_ultra.data.model.CandidateAdoptionResult
+import com.example.novelseek_ultra.data.model.CandidateChapter
+import com.example.novelseek_ultra.data.model.GenerationRun
 import com.example.novelseek_ultra.agent.AgentController
 import com.example.novelseek_ultra.agent.AgentPlan
 import com.example.novelseek_ultra.agent.AgentPlanStep
@@ -112,7 +121,6 @@ import kotlinx.coroutines.withContext
 fun AgentScreen(
     vm: AppViewModel,
     onBack: () -> Unit,
-    onOpenChapterReview: (projectId: String, chapterId: String) -> Unit,
 ) {
     val lang by vm.uiLanguage.collectAsState()
     val focusManager = LocalFocusManager.current
@@ -133,6 +141,7 @@ fun AgentScreen(
     val sessionCacheMetrics by agent.sessionCacheMetrics.collectAsState()
     val contextUsage by agent.contextUsage.collectAsState()
     val activePlan by agent.activePlan.collectAsState()
+    val generationRunRevision by vm.generationRunRevision.collectAsState()
 
     val projects by vm.projects.collectAsState()
     val hasValidLockedProject = lockedProjectId?.let { id -> projects.any { it.id == id } } == true
@@ -151,6 +160,15 @@ fun AgentScreen(
     var showLockAuto by remember { mutableStateOf(false) }
     var renamingSession by remember { mutableStateOf<com.example.novelseek_ultra.data.model.AgentSessionMeta?>(null) }
     var fullscreenImage by remember { mutableStateOf<String?>(null) }
+    var reviewDialogKey by rememberSaveable(currentSessionId) { mutableStateOf<String?>(null) }
+    var reviewPayload by remember(currentSessionId, reviewDialogKey) {
+        mutableStateOf<AgentChapterReviewPayload?>(null)
+    }
+    var reviewLoading by remember(currentSessionId, reviewDialogKey) { mutableStateOf(false) }
+    var reviewLoadError by remember(currentSessionId, reviewDialogKey) { mutableStateOf<String?>(null) }
+    var reviewReloadRevision by remember(currentSessionId, reviewDialogKey) { mutableStateOf(0) }
+    var reviewActionInProgress by remember(currentSessionId, reviewDialogKey) { mutableStateOf(false) }
+    var reviewActionMessage by remember(currentSessionId, reviewDialogKey) { mutableStateOf<String?>(null) }
     val imeVisible = WindowInsets.ime.getBottom(LocalDensity.current) > 0
     val hasPriorityBottomContent = pendingReview != null ||
         status == AgentController.Status.AWAITING_CONFIRM
@@ -165,6 +183,55 @@ fun AgentScreen(
         mutableStateOf(false)
     }
     val listState = rememberLazyListState()
+    val dialogReview = pendingReview?.takeIf { agentReviewKey(it) == reviewDialogKey }
+
+    LaunchedEffect(reviewDialogKey, dialogReview, reviewReloadRevision, generationRunRevision, lang) {
+        val expected = dialogReview
+        if (reviewDialogKey == null) return@LaunchedEffect
+        if (expected == null) {
+            reviewDialogKey = null
+            return@LaunchedEffect
+        }
+        reviewLoading = true
+        reviewLoadError = null
+        reviewPayload = null
+        val loaded = withContext(Dispatchers.IO) {
+            runCatching { vm.chapterGenerationRun(expected.projectId, expected.runId) }
+        }
+        val run = loaded.getOrNull()
+        val candidate = run?.candidates?.firstOrNull { it.id == expected.candidateId }
+        when {
+            loaded.isFailure -> reviewLoadError = tx(
+                lang,
+                "读取候选稿失败，请重试。",
+                "Could not load the candidate. Please retry.",
+            )
+            run == null -> reviewLoadError = tx(
+                lang,
+                "候选稿已失效或不存在，请等待会话状态同步。",
+                "The candidate is no longer available. Wait for the session to refresh.",
+            )
+            run.projectId != expected.projectId || run.chapterId != expected.chapterId ->
+                reviewLoadError = tx(
+                    lang,
+                    "候选稿与目标章节不匹配，已阻止审核。",
+                    "The candidate does not match the target chapter; review was blocked.",
+                )
+            run.status != GenerationRun.STATUS_COMPLETED -> reviewLoadError = tx(
+                lang,
+                "候选稿状态已变化，请等待会话状态同步。",
+                "The candidate status changed. Wait for the session to refresh.",
+            )
+            candidate == null || candidate.status != CandidateChapter.STATUS_COMPLETED ->
+                reviewLoadError = tx(
+                    lang,
+                    "候选正文不完整或已失效。",
+                    "The candidate text is incomplete or no longer available.",
+                )
+            else -> reviewPayload = AgentChapterReviewPayload(run, candidate)
+        }
+        reviewLoading = false
+    }
 
     val running = status == AgentController.Status.RUNNING ||
         status == AgentController.Status.AWAITING_USER ||
@@ -317,13 +384,13 @@ fun AgentScreen(
                                 )
                                 FilledTonalButton(
                                     onClick = {
-                                        onOpenChapterReview(review.projectId, review.chapterId)
+                                        reviewDialogKey = agentReviewKey(review)
                                     },
                                     modifier = Modifier.fillMaxWidth(),
                                 ) {
                                     Icon(Icons.Outlined.Edit, contentDescription = null)
                                     Spacer(Modifier.width(6.dp))
-                                    Text(tx(lang, "打开章节审核", "Open chapter review"))
+                                    Text(tx(lang, "审核候选稿", "Review candidate"))
                                 }
                             }
                         }
@@ -529,6 +596,111 @@ fun AgentScreen(
                 }
             }
         }
+    }
+
+    dialogReview?.let { review ->
+        val projectTitle = projects.firstOrNull { it.id == review.projectId }?.title
+        val chapterTitle = vm.chapters(review.projectId)
+            .firstOrNull { it.id == review.chapterId }
+            ?.let { tx(lang, "第${it.order_index}章《${it.title}》", "Chapter ${it.order_index}: ${it.title}") }
+        AgentChapterReviewDialog(
+            lang = lang,
+            projectTitle = projectTitle,
+            chapterTitle = chapterTitle,
+            payload = reviewPayload,
+            loading = reviewLoading,
+            loadError = reviewLoadError,
+            actionInProgress = reviewActionInProgress,
+            actionMessage = reviewActionMessage,
+            onDismiss = { reviewDialogKey = null },
+            onRetry = { reviewReloadRevision += 1 },
+            onReject = {
+                if (!reviewActionInProgress && reviewPayload != null && agent.pendingReview.value == review) {
+                    val expectedKey = agentReviewKey(review)
+                    val expectedSessionId = agent.currentSessionId.value
+                    reviewActionInProgress = true
+                    reviewActionMessage = null
+                    screenScope.launch {
+                        val outcome: Result<Boolean> = try {
+                            Result.success(withContext(Dispatchers.IO) {
+                                vm.rejectChapterGeneration(review.projectId, review.runId)
+                            })
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (error: Throwable) {
+                            Result.failure(error)
+                        }
+                        if (
+                            reviewDialogKey == expectedKey &&
+                            agent.currentSessionId.value == expectedSessionId
+                        ) {
+                            if (outcome.getOrDefault(false)) {
+                                reviewDialogKey = null
+                            } else {
+                                reviewActionInProgress = false
+                                reviewActionMessage = tx(
+                                    lang,
+                                    "拒绝失败；候选稿可能已被处理，请重试或等待状态同步。",
+                                    "Rejection failed. The candidate may already be resolved; retry or wait for refresh.",
+                                )
+                                reviewReloadRevision += 1
+                            }
+                        }
+                    }
+                }
+            },
+            onAccept = {
+                if (!reviewActionInProgress && reviewPayload != null && agent.pendingReview.value == review) {
+                    val expectedKey = agentReviewKey(review)
+                    val expectedSessionId = agent.currentSessionId.value
+                    reviewActionInProgress = true
+                    reviewActionMessage = null
+                    screenScope.launch {
+                        val outcome: Result<CandidateAdoptionResult> = try {
+                            Result.success(withContext(Dispatchers.IO) {
+                                vm.adoptChapterCandidate(
+                                    review.projectId,
+                                    review.runId,
+                                    review.candidateId,
+                                )
+                            })
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (error: Throwable) {
+                            Result.failure(error)
+                        }
+                        if (
+                            reviewDialogKey == expectedKey &&
+                            agent.currentSessionId.value == expectedSessionId
+                        ) {
+                            val result = outcome.getOrNull()
+                            if (result is CandidateAdoptionResult.Adopted) {
+                                reviewDialogKey = null
+                            } else {
+                                reviewActionInProgress = false
+                                reviewActionMessage = when (result) {
+                                    is CandidateAdoptionResult.SourceChanged -> tx(
+                                        lang,
+                                        "候选稿已保留，但章节或生成上下文已变化，不能覆盖新内容。",
+                                        "The candidate was kept, but the chapter or generation context changed, so newer content was not overwritten.",
+                                    )
+                                    is CandidateAdoptionResult.Unavailable -> tx(
+                                        lang,
+                                        "候选稿当前不能采用（${result.reason}）。",
+                                        "The candidate cannot be accepted (${result.reason}).",
+                                    )
+                                    else -> tx(
+                                        lang,
+                                        "采用失败；候选稿已保留，请重试。",
+                                        "Acceptance failed. The candidate was kept; please retry.",
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+        )
     }
 
     if (confirmClear) {
@@ -746,6 +918,271 @@ fun AgentScreen(
             },
             onDismiss = { showContextDetails = false },
         )
+    }
+}
+
+private data class AgentChapterReviewPayload(
+    val run: GenerationRun,
+    val candidate: CandidateChapter,
+)
+
+internal data class AgentReviewTextSlice(
+    val start: Int,
+    val endExclusive: Int,
+)
+
+private fun agentReviewKey(review: AgentPendingReview): String =
+    "${review.runId}:${review.candidateId}"
+
+/**
+ * Keep the durable body as the only full copy. Lazy list items materialize only the visible slices,
+ * avoiding one very large text layout and a second list containing copies of every paragraph.
+ */
+internal fun agentReviewTextSlices(
+    text: String,
+    maxChars: Int = 3_200,
+): List<AgentReviewTextSlice> {
+    require(maxChars > 0)
+    if (text.isEmpty()) return emptyList()
+    val slices = mutableListOf<AgentReviewTextSlice>()
+    var start = 0
+    while (start < text.length) {
+        var end = minOf(text.length, start + maxChars)
+        if (end < text.length) {
+            val newline = text.lastIndexOf(char = "\n"[0], startIndex = end - 1)
+            if (newline >= start + maxChars / 2) end = newline + 1
+        }
+        if (
+            end < text.length &&
+            end > start &&
+            Character.isHighSurrogate(text[end - 1]) &&
+            Character.isLowSurrogate(text[end])
+        ) {
+            end -= 1
+        }
+        if (end <= start) end = minOf(text.length, start + maxChars)
+        slices += AgentReviewTextSlice(start, end)
+        start = end
+    }
+    return slices
+}
+
+@Composable
+private fun AgentChapterReviewDialog(
+    lang: String,
+    projectTitle: String?,
+    chapterTitle: String?,
+    payload: AgentChapterReviewPayload?,
+    loading: Boolean,
+    loadError: String?,
+    actionInProgress: Boolean,
+    actionMessage: String?,
+    onDismiss: () -> Unit,
+    onRetry: () -> Unit,
+    onReject: () -> Unit,
+    onAccept: () -> Unit,
+) {
+    val candidate = payload?.candidate
+    val report = candidate?.qualityReport
+    val canAccept = candidate != null &&
+        candidate.body.isNotBlank() &&
+        report?.completedStream == true &&
+        !report.blocking
+    val textSlices = remember(candidate?.id) {
+        candidate?.body?.let(::agentReviewTextSlices).orEmpty()
+    }
+    val operationLabel = when (payload?.run?.operation) {
+        GenerationRun.OPERATION_GENERATE -> tx(lang, "生成", "Generate")
+        GenerationRun.OPERATION_CONTINUE -> tx(lang, "续写", "Continue")
+        GenerationRun.OPERATION_REVISE -> tx(lang, "整章修订", "Revise")
+        GenerationRun.OPERATION_REPLACE -> tx(lang, "精确替换", "Replace")
+        GenerationRun.OPERATION_EDIT_PARAGRAPH -> tx(lang, "段落编辑", "Edit paragraph")
+        GenerationRun.OPERATION_SET_BODY -> tx(lang, "设置正文", "Set body")
+        else -> null
+    }
+
+    Dialog(
+        onDismissRequest = { if (!actionInProgress) onDismiss() },
+        properties = DialogProperties(
+            dismissOnBackPress = !actionInProgress,
+            dismissOnClickOutside = false,
+            usePlatformDefaultWidth = false,
+        ),
+    ) {
+        Surface(
+            modifier = Modifier.fillMaxSize(),
+            color = MaterialTheme.colorScheme.surface,
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .windowInsetsPadding(WindowInsets.systemBars),
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            tx(lang, "章节候选稿审核", "Review chapter candidate"),
+                            style = MaterialTheme.typography.titleLarge,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.semantics { heading() },
+                        )
+                        Text(
+                            listOfNotNull(projectTitle, chapterTitle).joinToString(" · ").ifBlank {
+                                tx(lang, "目标章节", "Target chapter")
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    IconButton(onClick = onDismiss, enabled = !actionInProgress) {
+                        Icon(
+                            Icons.Outlined.Close,
+                            contentDescription = tx(lang, "关闭正文预览", "Close text preview"),
+                        )
+                    }
+                }
+                HorizontalDivider()
+
+                when {
+                    loading -> Box(
+                        modifier = Modifier.fillMaxWidth().weight(1f),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(10.dp),
+                        ) {
+                            CircularProgressIndicator()
+                            Text(tx(lang, "正在读取候选正文…", "Loading candidate text…"))
+                        }
+                    }
+                    candidate != null -> LazyColumn(
+                        modifier = Modifier.fillMaxWidth().weight(1f),
+                        state = rememberLazyListState(),
+                        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
+                    ) {
+                        item {
+                            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                val meta = buildList {
+                                    operationLabel?.let { add(tx(lang, "操作：$it", "Operation: $it")) }
+                                    add(tx(lang, "${candidate.wordCount} 字", "${candidate.wordCount} words"))
+                                }.joinToString(" · ")
+                                Text(
+                                    meta,
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                                report?.findings.orEmpty().forEach { finding ->
+                                    Text(
+                                        "• ${finding.message}",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = if (finding.severity == "error") {
+                                            MaterialTheme.colorScheme.error
+                                        } else {
+                                            MaterialTheme.colorScheme.onSurfaceVariant
+                                        },
+                                    )
+                                }
+                                if (!canAccept) {
+                                    Text(
+                                        tx(
+                                            lang,
+                                            "该候选稿未通过完整性或硬性质量检查，不能采用，但可以拒绝。",
+                                            "This candidate failed completeness or blocking quality checks. It cannot be accepted, but it can be rejected.",
+                                        ),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.error,
+                                    )
+                                }
+                                HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+                            }
+                        }
+                        if (textSlices.isEmpty()) {
+                            item {
+                                Text(
+                                    tx(lang, "候选正文为空", "Candidate body is empty"),
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.error,
+                                )
+                            }
+                        } else {
+                            items(textSlices, key = { it.start }) { slice ->
+                                val chunk = remember(candidate.id, slice.start, slice.endExclusive) {
+                                    candidate.body.substring(slice.start, slice.endExclusive)
+                                }
+                                Text(
+                                    chunk,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontFamily = FontFamily.Serif,
+                                )
+                            }
+                        }
+                    }
+                    else -> Box(
+                        modifier = Modifier.fillMaxWidth().weight(1f).padding(24.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            loadError ?: tx(lang, "候选正文暂不可用。", "Candidate text is unavailable."),
+                            color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                    }
+                }
+
+                HorizontalDivider()
+                Column(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    val feedback = when {
+                        actionInProgress -> tx(lang, "正在提交审核结果…", "Submitting review decision…")
+                        actionMessage != null -> actionMessage
+                        loadError != null -> loadError
+                        else -> null
+                    }
+                    feedback?.let {
+                        Text(
+                            it,
+                            style = MaterialTheme.typography.labelMedium,
+                            color = if (actionInProgress) {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            } else {
+                                MaterialTheme.colorScheme.error
+                            },
+                            modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
+                        )
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        if (loadError != null && !loading) {
+                            TextButton(onClick = onRetry, enabled = !actionInProgress) {
+                                Text(tx(lang, "重试", "Retry"))
+                            }
+                        }
+                        TextButton(
+                            onClick = onReject,
+                            enabled = candidate != null && !loading && !actionInProgress,
+                        ) {
+                            Text(tx(lang, "拒绝", "Reject"))
+                        }
+                        Spacer(Modifier.width(8.dp))
+                        FilledTonalButton(
+                            onClick = onAccept,
+                            enabled = canAccept && !loading && !actionInProgress,
+                        ) {
+                            Text(tx(lang, "通过并采用", "Accept"))
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

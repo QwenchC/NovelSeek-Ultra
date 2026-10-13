@@ -40,6 +40,7 @@ import java.net.UnknownHostException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 data class ChatMessage(val role: String, val content: String)
 
@@ -91,6 +92,41 @@ class AiService {
         .build()
 
     private val sseFactory = EventSources.createFactory(client)
+
+    private val comfyClientLock = Any()
+    private val comfyTrustEpoch = AtomicLong()
+    private val comfyPinnedClients = mutableMapOf<ComfyCertificateTrust, OkHttpClient>()
+
+    fun currentComfyTrustRevision(): Long = comfyTrustEpoch.get()
+
+    /** Revocation fences new/reused exchanges, cancels local calls and drops only ComfyUI pools. */
+    fun invalidateComfyCertificateTrust() {
+        val invalidated = synchronized(comfyClientLock) {
+            comfyTrustEpoch.incrementAndGet()
+            comfyPinnedClients.values.toList().also { comfyPinnedClients.clear() }
+        }
+        invalidated.forEach {
+            it.dispatcher.cancelAll()
+            it.connectionPool.evictAll()
+        }
+    }
+
+    private fun comfyClientFor(baseUrl: String, trust: ComfyCertificateTrust?, expectedTrustRevision: Long?): OkHttpClient {
+        if (trust == null) return ComfyTlsTrust.clientFor(baseUrl, null)
+        // Check the supplied origin even if the private pool is already cached for this pin.
+        if (!ComfyTlsTrust.isTrustForOrigin(baseUrl, trust)) {
+            throw ComfyCertificateTrustException("证书授权仅适用于原 HTTPS 主机和端口，请重新核对当前地址。")
+        }
+        return synchronized(comfyClientLock) {
+            if (expectedTrustRevision != null && comfyTrustEpoch.get() != expectedTrustRevision) {
+                throw ComfyCertificateTrustException("证书授权已变更，请重新执行连接测试或生成。(Certificate approval changed before this operation started.)")
+            }
+            comfyPinnedClients.getOrPut(trust) {
+                val epoch = comfyTrustEpoch.get()
+                ComfyTlsTrust.clientFor(baseUrl, trust) { comfyTrustEpoch.get() == epoch }
+            }
+        }
+    }
 
     /**
      * Some OpenAI-compatible gateways reject `response_format` even though the rest of the chat
@@ -423,14 +459,22 @@ class AiService {
     // subpath). No gateway credentials are embedded in URLs or added to this keyless client.
 
     /** Validate the actual ComfyUI API; a tunnel login/landing page returning 200 is not success. */
-    suspend fun diagnoseComfyUIConnection(baseUrl: String): ComfyUIConnectionResult {
+    suspend fun inspectComfyCertificate(baseUrl: String): ComfyCertificateInfo = ComfyTlsTrust.inspect(baseUrl)
+
+    suspend fun diagnoseComfyUIConnection(
+        baseUrl: String,
+        trustedCertificate: ComfyCertificateTrust? = null,
+        expectedTrustRevision: Long? = null,
+    ): ComfyUIConnectionResult {
         var normalizedUrl: String? = null
+        var comfyClient: OkHttpClient? = null
         return try {
             currentCoroutineContext().ensureActive()
             val endpoint = ComfyUIEndpoint.parse(baseUrl)
             normalizedUrl = endpoint.normalizedUrl
+            comfyClient = comfyClientFor(baseUrl, trustedCertificate, expectedTrustRevision)
             val req = Request.Builder().url(endpoint.route("system_stats")).get().build()
-            val body = executeForString(req, COMFY_REQUEST_TIMEOUT_SEC)
+            val body = executeForString(req, COMFY_REQUEST_TIMEOUT_SEC, networkClient = comfyClient)
             if (isComfyUISystemStats(body)) {
                 ComfyUIConnectionResult(true, "连接成功：已识别 ComfyUI API；模型和工作流兼容性需在生成时验证。", normalizedUrl)
             } else {
@@ -439,11 +483,22 @@ class AiService {
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (error: Exception) {
-            ComfyUIConnectionResult(false, comfyUIConnectionFailureMessage(error, normalizedUrl), normalizedUrl)
+            ComfyUIConnectionResult(
+                false,
+                comfyUIConnectionFailureMessage(error, normalizedUrl),
+                normalizedUrl,
+                certificateInspectionAvailable = normalizedUrl?.startsWith("https://") == true && error is javax.net.ssl.SSLException,
+            )
+        } finally {
+            if (trustedCertificate == null) comfyClient?.connectionPool?.evictAll()
         }
     }
 
-    suspend fun testComfyUIConnection(baseUrl: String): Boolean = diagnoseComfyUIConnection(baseUrl).success
+    suspend fun testComfyUIConnection(
+        baseUrl: String,
+        trustedCertificate: ComfyCertificateTrust? = null,
+        expectedTrustRevision: Long? = null,
+    ): Boolean = diagnoseComfyUIConnection(baseUrl, trustedCertificate, expectedTrustRevision).success
 
     /**
      * Generate an image via ComfyUI and return the raw PNG/JPEG bytes (parity with
@@ -455,12 +510,19 @@ class AiService {
         height: Int,
         baseUrl: String,
         negativePrompt: String = COMFY_DEFAULT_NEGATIVE,
+        trustedCertificate: ComfyCertificateTrust? = null,
+        expectedTrustRevision: Long? = null,
     ): ByteArray {
         currentCoroutineContext().ensureActive()
         val base = ComfyUIEndpoint.parse(baseUrl)
-        val promptId = submitComfyPrompt(base, prompt, negativePrompt, width, height)
-        val image = pollComfyHistory(base, promptId)
-        return downloadComfyImage(base, image)
+        val comfyClient = comfyClientFor(baseUrl, trustedCertificate, expectedTrustRevision)
+        try {
+            val promptId = submitComfyPrompt(base, prompt, negativePrompt, width, height, comfyClient)
+            val image = pollComfyHistory(base, promptId, comfyClient)
+            return downloadComfyImage(base, image, comfyClient)
+        } finally {
+            if (trustedCertificate == null) comfyClient.connectionPool.evictAll()
+        }
     }
 
     private data class ComfyImageRef(val filename: String, val subfolder: String, val type: String)
@@ -567,6 +629,7 @@ class AiService {
         negative: String,
         width: Int,
         height: Int,
+        comfyClient: OkHttpClient,
     ): String {
         val payload = buildJsonObject {
             put("prompt", buildComfyPrompt(positive, negative, width, height))
@@ -576,14 +639,14 @@ class AiService {
             .addHeader("Content-Type", "application/json")
             .post(payload.toRequestBody("application/json".toMediaType()))
             .build()
-        val body = executeForString(req, COMFY_REQUEST_TIMEOUT_SEC, friendlyComfyError = true)
+        val body = executeForString(req, COMFY_REQUEST_TIMEOUT_SEC, friendlyComfyError = true, networkClient = comfyClient)
         val root = kotlinx.serialization.json.Json.parseToJsonElement(body).jsonObject
         return root["prompt_id"]?.jsonPrimitive?.contentOrNull
             ?: throw IOException("ComfyUI 未返回 prompt_id：${body.take(200)}")
     }
 
     /** Poll GET /history/{id} until the job completes; returns the first SaveImage output. */
-    private suspend fun pollComfyHistory(base: ComfyUIEndpoint, promptId: String): ComfyImageRef {
+    private suspend fun pollComfyHistory(base: ComfyUIEndpoint, promptId: String, comfyClient: OkHttpClient): ComfyImageRef {
         val deadline = System.currentTimeMillis() + COMFY_JOB_TIMEOUT_SEC * 1000
         while (true) {
             if (System.currentTimeMillis() > deadline) {
@@ -591,7 +654,7 @@ class AiService {
             }
             currentCoroutineContext().ensureActive()
             val req = Request.Builder().url(base.route("history", promptId)).get().build()
-            val body = executeForString(req, COMFY_REQUEST_TIMEOUT_SEC)
+            val body = executeForString(req, COMFY_REQUEST_TIMEOUT_SEC, networkClient = comfyClient)
             val history = kotlinx.serialization.json.Json.parseToJsonElement(body).jsonObject
             val entry = history[promptId]?.jsonObject
             if (entry != null) {
@@ -639,7 +702,7 @@ class AiService {
     }
 
     /** GET /view → image bytes. Retries to ride out stale keep-alive connections. */
-    private suspend fun downloadComfyImage(base: ComfyUIEndpoint, img: ComfyImageRef): ByteArray {
+    private suspend fun downloadComfyImage(base: ComfyUIEndpoint, img: ComfyImageRef, comfyClient: OkHttpClient): ByteArray {
         val url = base.view(img.filename, img.subfolder, img.type)
         val req = Request.Builder().url(url).get().build()
         var lastErr: Throwable? = null
@@ -647,7 +710,7 @@ class AiService {
             currentCoroutineContext().ensureActive()
             if (attempt > 0) kotlinx.coroutines.delay(800L * attempt)
             try {
-                return executeForBytes(req, COMFY_REQUEST_TIMEOUT_SEC)
+                return executeForBytes(req, COMFY_REQUEST_TIMEOUT_SEC, networkClient = comfyClient)
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (e: IOException) {
@@ -662,8 +725,9 @@ class AiService {
         req: Request,
         timeoutSec: Long,
         friendlyComfyError: Boolean = false,
+        networkClient: OkHttpClient = client,
     ): String = kotlinx.coroutines.suspendCancellableCoroutine { cont ->
-        val call = client.newCall(req)
+        val call = networkClient.newCall(req)
         call.timeout().timeout(timeoutSec, TimeUnit.SECONDS)
         cont.invokeOnCancellation { call.cancel() }
         call.enqueue(object : Callback {
@@ -695,8 +759,9 @@ class AiService {
     private suspend fun executeForBytes(
         req: Request,
         timeoutSec: Long,
+        networkClient: OkHttpClient = client,
     ): ByteArray = kotlinx.coroutines.suspendCancellableCoroutine { cont ->
-        val call = client.newCall(req)
+        val call = networkClient.newCall(req)
         call.timeout().timeout(timeoutSec, TimeUnit.SECONDS)
         cont.invokeOnCancellation { call.cancel() }
         call.enqueue(object : Callback {

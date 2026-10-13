@@ -1,10 +1,18 @@
 # NovelSeek Ultra
 
-> 一款基于 AI 的 Android 小说创作助手，保留与桌面端 [NovelSeek-Ultra-PC](https://github.com/QwenchC/NovelSeek-Ultra-PC) 的备份兼容。Android 1.6.1 与桌面 2.1.0 支持 ZIP／JSON 双向数据交换，保留场景档案与按项目扩展；跨端旧任务和审核候选不会自动执行。参阅 [两端数据交换说明](docs/DATA_INTERCHANGE.md)。
+> 一款基于 AI 的 Android 小说创作助手，保留与桌面端 [NovelSeek-Ultra-PC](https://github.com/QwenchC/NovelSeek-Ultra-PC) 的备份兼容。Android 1.6.2 与桌面 2.1.0 支持 ZIP／JSON 双向数据交换，保留场景档案与按项目扩展；跨端旧任务和审核候选不会自动执行。参阅 [两端数据交换说明](docs/DATA_INTERCHANGE.md)。
 
 ---
 
 ## 功能概览
+
+### 1.6.2 ComfyUI 外网连接与自签名证书修复
+
+- 设置页支持核对完整 SHA-256 后，仅在本机授权指定 ComfyUI HTTPS 主机、端口和证书；没有自有域名也可使用域名匹配的自签名隧道证书。
+- 保留域名、有效期和证书一致性校验；证书变化会阻断，授权可撤销且不随备份迁移，不影响其他模型服务。
+- 517 项单元测试通过，并在 Android 模拟器通过真实公网入口完成一张 256×256 图片的生成和下载；实际手机移动网络仍待验收。
+
+下载 [1.6.2 Release](https://github.com/QwenchC/NovelSeek-Ultra/releases/tag/v1.6.2)，参阅 [更新说明](docs/RELEASE_NOTES_1.6.2.md)、[连接与证书配置指南](docs/COMFYUI_REMOTE.md)、[验证记录](docs/1.6.2-VERIFICATION.md)。保留历史 1.6.1 Release。
 
 ### 1.6.1 审稿与设置改进
 
@@ -94,9 +102,9 @@
 
 ### 🎨 图片生成引擎
 - **Pollinations**（默认）：云端免费图片生成，无需本地环境
-- **ComfyUI**：连接局域网内本地运行的 ComfyUI，使用 `z-image-turbo` 工作流，支持高质量本地推理
-  - 设置中填写局域网 IP 地址（如 `http://192.168.1.100:8188`）
-  - 内置连接测试按钮
+- **ComfyUI**：连接局域网或内网穿透后的 ComfyUI，使用固定 `z-image-turbo` 工作流
+  - 设置中填写局域网地址或完整公网 HTTP／HTTPS 基址，支持远程端口与代理子路径
+  - 内置连接诊断；1.6.2 支持明确核对后的单服务器自签名证书授权
 
 ### ⚙️ 设置
 - 配置 AI 服务的 API Key 与 Base URL；各 API 配置区附带获取地址超链接
@@ -736,6 +744,12 @@ app/src/main/java/com/example/novelseek_ultra/
 ---
 
 ## 版本历史
+
+### v1.6.2
+
+- ComfyUI 设置页增加单服务器证书查看、完整 SHA-256 核对、明确批准和撤销；没有自有域名也可使用域名匹配的自签名 HTTPS 隧道证书。
+- 授权绑定 HTTPS 主机、端口和完整证书，不继承到其他服务或备份；域名、有效期、证书变化及撤销状态继续检查，禁止请求重定向。
+- 517 项 JVM 回归通过，Android 模拟器真实公网连接与 256×256 图片生成测试通过；`versionCode 17`。手机移动网络、旧版覆盖升级和大图后台任务仍待实机验收。
 
 ### v1.6.1
 

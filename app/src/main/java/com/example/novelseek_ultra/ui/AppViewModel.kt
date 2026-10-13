@@ -300,6 +300,13 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     private val repo: AppRepository = AppRepository.get(application)
     private val ai = AiService()
+    // noBackupFilesDir excludes these approvals from Android cloud/device-transfer backups too.
+    private val comfyCertificateStore = com.example.novelseek_ultra.data.ComfyCertificateTrustStore(
+        File(application.noBackupFilesDir, "comfy_tls_trust"),
+    )
+    private val comfyTrustMutationLock = Any()
+    private val _comfyTrustRevision = MutableStateFlow(0)
+    val comfyTrustRevision: StateFlow<Int> = _comfyTrustRevision.asStateFlow()
     private val novelGenerationEngine = NovelGenerationEngine(repo)
     private val sceneWritingStore = repo.sceneWritingStore
     private val chapterWriter = ChapterWritingService(repo, ai, novelGenerationEngine, sceneWritingStore)
@@ -618,11 +625,51 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun setComfyUIUrl(url: String) = repo.setComfyUIUrl(url)
 
     suspend fun testComfyUIConnection(): Boolean = withContext(Dispatchers.IO) {
-        ai.testComfyUIConnection(repo.comfyUIUrl())
+        diagnoseComfyUIConnection(repo.comfyUIUrl()).success
     }
 
     suspend fun diagnoseComfyUIConnection(url: String): com.example.novelseek_ultra.data.ai.ComfyUIConnectionResult =
-        withContext(Dispatchers.IO) { ai.diagnoseComfyUIConnection(url) }
+        withContext(Dispatchers.IO) {
+            try {
+                val approval = comfyApprovalSnapshot(url)
+                ai.diagnoseComfyUIConnection(url, approval.first, expectedTrustRevision = approval.second)
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (_: Exception) {
+                com.example.novelseek_ultra.data.ai.ComfyUIConnectionResult(false,
+                    "连接地址或本机证书授权记录无效，请检查地址和证书；未降低安全校验。")
+            }
+        }
+
+    private fun comfyApprovalSnapshot(url: String) = synchronized(comfyTrustMutationLock) {
+        comfyCertificateStore.find(url) to ai.currentComfyTrustRevision()
+    }
+
+    suspend fun inspectComfyCertificate(url: String): com.example.novelseek_ultra.data.ai.ComfyCertificateInfo =
+        withContext(Dispatchers.IO) { ai.inspectComfyCertificate(url) }
+
+    suspend fun trustedComfyCertificate(url: String): com.example.novelseek_ultra.data.ai.ComfyCertificateTrust? =
+        withContext(Dispatchers.IO) { synchronized(comfyTrustMutationLock) { comfyCertificateStore.find(url) } }
+
+    /** Called only after the settings confirmation explicitly approves the displayed fingerprint. */
+    suspend fun approveComfyCertificate(url: String, info: com.example.novelseek_ultra.data.ai.ComfyCertificateInfo) =
+        withContext(Dispatchers.IO) {
+            check(com.example.novelseek_ultra.data.ai.ComfyTlsTrust.originFor(url) == info.origin) { "地址已变化，请重新核对证书。" }
+            synchronized(comfyTrustMutationLock) {
+                comfyCertificateStore.approve(info.toTrust())
+                ai.invalidateComfyCertificateTrust()
+                _comfyTrustRevision.update { it + 1 }
+            }
+        }
+
+    suspend fun forgetComfyCertificate(url: String) = withContext(Dispatchers.IO) {
+        synchronized(comfyTrustMutationLock) {
+            // Fence/cancel first, while snapshot readers hold the same lock. The store also
+            // denies this origin in memory if a disk failure prevents durable revocation.
+            ai.invalidateComfyCertificateTrust()
+            try { comfyCertificateStore.forget(url) }
+            finally { _comfyTrustRevision.update { it + 1 } }
+        }
+    }
 
     /**
      * Engine-agnostic image generation used by every image feature (portrait / illustration /
@@ -637,7 +684,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         model: String = "zimage",
     ): ByteArray {
         val raw = if (repo.imageEngine() == "comfyui") {
-            ai.generateImageComfyUI(prompt = prompt, width = width, height = height, baseUrl = repo.comfyUIUrl())
+            val url = repo.comfyUIUrl()
+            val approval = comfyApprovalSnapshot(url)
+            ai.generateImageComfyUI(prompt = prompt, width = width, height = height, baseUrl = url,
+                trustedCertificate = approval.first, expectedTrustRevision = approval.second)
         } else {
             ai.generateImage(
                 prompt = prompt,

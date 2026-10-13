@@ -82,7 +82,9 @@ class ComfyUIConnectionContractTest {
 
     @Test
     fun redirectedGatewayLoginIsNotMistakenForComfyApi() = runBlocking {
+        val paths = Collections.synchronizedList(mutableListOf<String>())
         val address = startServer { exchange ->
+            paths += exchange.requestURI.path
             if (exchange.requestURI.path == "/system_stats") {
                 exchange.responseHeaders.add("Location", "/login")
                 exchange.respond(302, "login required")
@@ -92,7 +94,8 @@ class ComfyUIConnectionContractTest {
         }
         val result = withTimeout(5_000) { AiService().diagnoseComfyUIConnection(address) }
         assertFalse(result.success)
-        assertTrue(result.message.contains("登录页"))
+        assertTrue(result.message.contains("HTTP 302"))
+        assertEquals(listOf("/system_stats"), paths)
     }
 
     @Test

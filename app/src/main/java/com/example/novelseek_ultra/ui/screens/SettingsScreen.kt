@@ -1210,6 +1210,12 @@ private fun ImageEngineSection(vm: AppViewModel, lang: String) {
                 Text(result.message, style = MaterialTheme.typography.labelMedium,
                     color = if (result.success) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error)
             }
+            Spacer(Modifier.height(10.dp))
+            com.example.novelseek_ultra.ui.components.ComfyCertificateSettings(
+                vm = vm, language = lang, url = comfyUrl, enabled = !saving && !testing,
+                onUseHttps = { comfyUrl = it; testResult = null; saveMessage = null },
+                onTrustChanged = { testResult = null },
+            )
         }
     }
 }

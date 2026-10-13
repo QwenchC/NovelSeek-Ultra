@@ -17,6 +17,7 @@ data class ComfyUIConnectionResult(
     val success: Boolean,
     val message: String,
     val normalizedUrl: String? = null,
+    val certificateInspectionAvailable: Boolean = false,
 )
 
 /** Preserve the user-selected tunnel authority and reverse-proxy prefix for every API route. */
@@ -99,7 +100,11 @@ internal fun isComfyUIAutomaticHttpsLanding(body: String): Boolean {
 }
 
 /** Never show an HTML gateway body or URL credentials in the connection diagnosis. */
-internal fun comfyUIConnectionFailureMessage(error: Exception, normalizedUrl: String? = null): String = when (error) {
+internal fun comfyUIConnectionFailureMessage(error: Exception, normalizedUrl: String? = null): String {
+    val pinnedFailure = generateSequence(error as Throwable) { it.cause }.take(8)
+        .filterIsInstance<ComfyCertificateTrustException>().firstOrNull()
+    if (pinnedFailure != null) return pinnedFailure.message ?: "证书授权核对失败，已阻止连接。"
+    return when (error) {
     is IllegalArgumentException -> error.message ?: "ComfyUI 地址格式不正确。"
     is ComfyUIHttpException -> when (error.statusCode) {
         401, 403 -> "HTTP ${error.statusCode}：隧道或网关要求登录/拒绝访问；当前连接不支持网关凭据，请使用允许该设备访问的 API 地址。"
@@ -110,7 +115,7 @@ internal fun comfyUIConnectionFailureMessage(error: Exception, normalizedUrl: St
                 ?.toString()?.removeSuffix("/")
             "HTTP 501：该隧道已启用“自动 HTTPS”，请将地址改为 " +
                 (httpsAddress ?: "https:// 开头的同域名、端口和路径") +
-                " 后重新测试；如遇证书不受信任，请修复隧道证书，不会绕过 TLS 校验。"
+                " 后重新测试；如为自己的自签名隧道，可检查证书并与电脑端指纹核对后仅授权该主机和端口。"
         } else {
             "ComfyUI 返回 HTTP 501，请检查服务和隧道配置。"
         }
@@ -118,8 +123,11 @@ internal fun comfyUIConnectionFailureMessage(error: Exception, normalizedUrl: St
         else -> "ComfyUI 返回 HTTP ${error.statusCode}，请检查服务和隧道配置。"
     }
     is UnknownHostException -> "无法解析主机名，请检查公网域名、手机网络和 DNS。"
-    is SSLException -> "HTTPS/TLS 连接失败，请检查地址协议、域名和有效证书；不会绕过证书校验。"
+    is ComfyCertificateTrustException -> error.message ?: "证书授权核对失败，已阻止连接。"
+    is javax.net.ssl.SSLPeerUnverifiedException -> "HTTPS 主机名与证书不匹配；即使授权自签名证书，也必须使用证书覆盖的域名，不能随意改为 IP 地址。"
+    is SSLException -> "HTTPS/TLS 连接失败，请检查地址协议、域名和证书；若为自己的自签名隧道，可检查并与电脑端指纹核对后授权，不能直接跳过校验。"
     is ConnectException -> "无法连接服务器，请检查公网主机/端口、隧道在线状态和本地 ComfyUI 端口映射。"
     is InterruptedIOException -> "连接超时，请检查手机网络、隧道在线状态和 HTTP/HTTPS 协议是否与隧道一致。"
     else -> "连接失败，请检查手机网络、ComfyUI 服务和公网隧道设置。"
+}
 }

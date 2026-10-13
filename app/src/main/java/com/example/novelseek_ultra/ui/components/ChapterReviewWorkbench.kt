@@ -11,16 +11,18 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Check
 import androidx.compose.material.icons.outlined.Close
-import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -42,6 +44,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.disabled
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
@@ -125,7 +129,7 @@ fun ChapterReviewWorkbench(
     ) {
         Surface(Modifier.fillMaxSize()) {
             Scaffold(
-                modifier = Modifier.imePadding(),
+                modifier = Modifier.imePadding().navigationBarsPadding(),
                 contentWindowInsets = WindowInsets(0),
                 topBar = {
                     AppTopBar(
@@ -142,6 +146,23 @@ fun ChapterReviewWorkbench(
                         },
                         actions = {
                             if (isBusy) CircularProgressIndicator(Modifier.padding(12.dp).size(20.dp), strokeWidth = 2.dp)
+                        },
+                    )
+                },
+                floatingActionButton = {
+                    // Approval stays reachable independently of the revision editor and keyboard.
+                    // Extended FAB has no enabled parameter, so preserve both the write guard and
+                    // disabled accessibility semantics instead of letting a disabled tap adopt.
+                    ExtendedFloatingActionButton(
+                        onClick = { if (adoptEnabled) onAdopt(assembledText) },
+                        modifier = Modifier.semantics { if (!adoptEnabled) disabled() },
+                        containerColor = if (adoptEnabled) MaterialTheme.colorScheme.primaryContainer
+                            else MaterialTheme.colorScheme.surfaceVariant,
+                        contentColor = if (adoptEnabled) MaterialTheme.colorScheme.onPrimaryContainer
+                            else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.38f),
+                        icon = { Icon(Icons.Outlined.Check, contentDescription = null) },
+                        text = {
+                            Text(if (selectedIds.size == allChangeIds.size) tx(language, "通过并采用", "Approve and adopt") else tx(language, "采用所选修改", "Adopt selected changes"))
                         },
                     )
                 },
@@ -169,13 +190,11 @@ fun ChapterReviewWorkbench(
                                         enabled = !isBusy && revisionInstruction.isNotBlank(),
                                     ) { Text(tx(language, "按意见修订", "Request revision")) }
                                 }
-                            } else {
-                                TextButton(onClick = { revisionExpanded = true }, enabled = !isBusy) { Text(tx(language, "提出修改意见", "Add revision instructions")) }
                             }
-                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                                TextButton(onClick = onReject, enabled = !isBusy, modifier = Modifier.weight(1f)) { Text(tx(language, "拒绝候选稿", "Reject candidate")) }
-                                Button(onClick = { if (adoptEnabled) onAdopt(assembledText) }, enabled = adoptEnabled, modifier = Modifier.weight(1f)) {
-                                    Text(if (selectedIds.size == allChangeIds.size) tx(language, "通过并采用", "Approve and adopt") else tx(language, "采用所选修改", "Adopt selected changes"))
+                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                                TextButton(onClick = onReject, enabled = !isBusy) { Text(tx(language, "拒绝候选稿", "Reject candidate")) }
+                                if (!revisionExpanded) {
+                                    TextButton(onClick = { revisionExpanded = true }, enabled = !isBusy) { Text(tx(language, "提出修改意见", "Add revision instructions")) }
                                 }
                             }
                         }
@@ -193,7 +212,7 @@ fun ChapterReviewWorkbench(
                     } else when (selectedTab) {
                         0 -> LazyColumn(
                             modifier = Modifier.fillMaxSize(),
-                            contentPadding = PaddingValues(16.dp),
+                            contentPadding = PaddingValues(start = 16.dp, top = 16.dp, end = 16.dp, bottom = 104.dp),
                             verticalArrangement = Arrangement.spacedBy(4.dp),
                         ) {
                             item { Text(tx(language, "完整候选稿 · ${candidateText.length} 字符", "Full candidate · ${candidateText.length} characters"), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant) }
@@ -201,7 +220,7 @@ fun ChapterReviewWorkbench(
                         }
                         1 -> LazyColumn(
                             modifier = Modifier.fillMaxSize(),
-                            contentPadding = PaddingValues(16.dp),
+                            contentPadding = PaddingValues(start = 16.dp, top = 16.dp, end = 16.dp, bottom = 104.dp),
                             verticalArrangement = Arrangement.spacedBy(6.dp),
                         ) {
                             item {
@@ -252,7 +271,7 @@ fun ChapterReviewWorkbench(
                         }
                         else -> LazyColumn(
                             modifier = Modifier.fillMaxSize(),
-                            contentPadding = PaddingValues(16.dp),
+                            contentPadding = PaddingValues(start = 16.dp, top = 16.dp, end = 16.dp, bottom = 104.dp),
                             verticalArrangement = Arrangement.spacedBy(12.dp),
                         ) {
                             if (findings.isEmpty()) item {

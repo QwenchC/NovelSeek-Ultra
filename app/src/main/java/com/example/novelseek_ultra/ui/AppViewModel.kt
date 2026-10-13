@@ -12,6 +12,7 @@ import com.example.novelseek_ultra.data.NovelGenerationEngine
 import com.example.novelseek_ultra.data.writing.WritingWorkspace
 import com.example.novelseek_ultra.data.writing.StoryNoteSelector
 import com.example.novelseek_ultra.data.writing.ChapterWritingService
+import com.example.novelseek_ultra.data.writing.ChapterMaintenanceBarrier
 import com.example.novelseek_ultra.data.writing.PreparedChapterWriting
 import com.example.novelseek_ultra.data.writing.SceneWritingStore
 import com.example.novelseek_ultra.data.writing.ChapterScenePlan
@@ -81,6 +82,7 @@ import com.example.novelseek_ultra.data.nowIso
 import com.example.novelseek_ultra.util.buildRealmSystemContext
 import com.example.novelseek_ultra.util.buildVolumeRealmConstraint
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -320,6 +322,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     val projects: StateFlow<List<Project>> = repo.projects
     val state = repo.state
+    /** Includes secure-only changes; unrelated novel writes need not reload/decrypt settings. */
+    private val _settingsRevision = MutableStateFlow(0)
+    val settingsRevision: StateFlow<Int> = _settingsRevision.asStateFlow()
     /** Bumped when durable AI chapter candidates are created, completed, accepted, or rejected. */
     val generationRunRevision: StateFlow<Int> = repo.generationRunRevision
 
@@ -411,9 +416,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun textModelProfiles(): List<TextModelProfile> = repo.textModelProfiles()
-    fun saveTextModelProfile(profile: TextModelProfile) = repo.saveTextModelProfile(profile)
-    fun deleteTextModelProfile(profileId: String) = repo.deleteTextModelProfile(profileId)
-    fun setActiveProfile(profileId: String) = repo.setActiveProfile(profileId)
+    fun saveTextModelProfile(profile: TextModelProfile) = repo.saveTextModelProfile(profile).also { _settingsRevision.update { it + 1 } }
+    fun deleteTextModelProfile(profileId: String) = repo.deleteTextModelProfile(profileId).also { _settingsRevision.update { it + 1 } }
+    fun setActiveProfile(profileId: String) = repo.setActiveProfile(profileId).also { _settingsRevision.update { it + 1 } }
     fun activeTextModelConfig(): TextModelConfig = repo.activeTextModelConfig()
 
     fun writingWorkspace(projectId: String): WritingWorkspace = repo.writingWorkspace(projectId)
@@ -604,7 +609,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         _statusMessage.value = "已导入 $count 章；未调用 AI，可按需提取资料"
     }
     fun pollinationsKey(): String = repo.pollinationsKey()
-    fun setPollinationsKey(key: String) = repo.setPollinationsKey(key)
+    fun setPollinationsKey(key: String) = repo.setPollinationsKey(key).also { _settingsRevision.update { it + 1 } }
 
     // ── Image engine selection (Pollinations / ComfyUI) ───────────────────────
     fun imageEngine(): String = repo.imageEngine()
@@ -615,6 +620,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     suspend fun testComfyUIConnection(): Boolean = withContext(Dispatchers.IO) {
         ai.testComfyUIConnection(repo.comfyUIUrl())
     }
+
+    suspend fun diagnoseComfyUIConnection(url: String): com.example.novelseek_ultra.data.ai.ComfyUIConnectionResult =
+        withContext(Dispatchers.IO) { ai.diagnoseComfyUIConnection(url) }
 
     /**
      * Engine-agnostic image generation used by every image feature (portrait / illustration /
@@ -644,7 +652,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         return com.example.novelseek_ultra.util.ImageUtils.compressForStorage(raw)
     }
     fun embeddingConfig(): EmbeddingConfig = repo.embeddingConfig()
-    fun saveEmbeddingConfig(cfg: EmbeddingConfig) = repo.saveEmbeddingConfig(cfg)
+    fun saveEmbeddingConfig(cfg: EmbeddingConfig) = repo.saveEmbeddingConfig(cfg).also { _settingsRevision.update { it + 1 } }
 
     suspend fun testTextConnection(): Boolean = withContext(Dispatchers.IO) {
         ai.testConnection(repo.activeTextModelConfig())
@@ -1019,6 +1027,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         projectId: String,
         runId: String,
         candidateId: String,
+        runPostProcessing: Boolean = true,
     ): CandidateAdoptionResult {
         val run = repo.getGenerationRun(projectId, runId)
         val currentContextManifest = {
@@ -1058,13 +1067,15 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 } else {
                     "已采用候选稿并更新正式正文"
                 }
-                result.run.candidates.firstOrNull { it.id == candidateId }?.let { candidate ->
-                    onChapterSaved(
-                        projectId,
-                        result.chapter.id,
-                        result.chapter.title,
-                        candidate.body,
-                    )
+                if (runPostProcessing) {
+                    result.run.candidates.firstOrNull { it.id == candidateId }?.let { candidate ->
+                        onChapterSaved(
+                            projectId,
+                            result.chapter.id,
+                            result.chapter.title,
+                            candidate.body,
+                        )
+                    }
                 }
             }
             is CandidateAdoptionResult.SourceChanged -> {
@@ -3297,6 +3308,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             }
             if (backupImportPreviewRevision.get() != revision) return@launch
             result.onSuccess {
+                if (includeAppSettings) _settingsRevision.update { it + 1 }
                 val merged = preview.summary.projectIdsInBackup
                 _statusMessage.value = "Import done: merged metadata for $merged projects." +
                     if (includeAppSettings) " App settings and any included API keys imported." else ""
@@ -4405,31 +4417,77 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
      *   - re-embed the chapter into the vector store (if KB enabled)
      *   - regenerate the chapter summary (if summaries enabled)
      *   - extract entities from the chapter (if entities enabled)
+     *   - update configured per-chapter containers
      *
-     * All three are fire-and-forget; failures surface via [statusMessage] but never block the save.
+     * Manual saves retain fire-and-forget behavior in viewModelScope. Automatic adoption supplies
+     * its own scope and awaits the returned jobs; failures never roll back the completed save.
      */
-    fun onChapterSaved(projectId: String, chapterId: String, title: String, text: String) {
+    fun onChapterSaved(
+        projectId: String,
+        chapterId: String,
+        title: String,
+        text: String,
+        executionScope: CoroutineScope = viewModelScope,
+    ): List<Job> = buildList {
         val textLength = text.trim().length
-        if (textLength == 0) return
+        if (textLength == 0) return@buildList
         if (textLength >= 200) {
-            indexChapterIfEnabled(projectId, chapterId, title, text)
-            if (repo.summariesEnabled()) generateChapterSummary(projectId, chapterId, title, text)
+            indexChapterIfEnabled(projectId, chapterId, title, text, executionScope)?.let(::add)
+            if (repo.summariesEnabled()) {
+                generateChapterSummaryInScope(projectId, chapterId, title, text, executionScope)?.let(::add)
+            }
         }
         if (repo.entitiesEnabled() && textLength >= MIN_FACT_EXTRACTION_CHARS) {
-            extractEntitiesForChapter(projectId, chapterId, title, text)
+            extractEntitiesForChapterInScope(projectId, chapterId, title, text, executionScope)?.let(::add)
         }
-        updateContainersForChapter(projectId, chapterId, title, text)
+        updateContainersForChapter(projectId, chapterId, title, text, executionScope)?.let(::add)
+    }
+
+    /**
+     * Complete source-changing work before the next autonomous chapter captures its context.
+     * This must run outside the controller's state lock, after the accepted action is persisted.
+     * Child jobs belong to the current agent coroutine: cancellation waits for their cancellation
+     * instead of leaving fire-and-forget writes racing a new chapter or a replacement agent run.
+     * A maintenance timeout/failure never means the already-adopted official prose was rolled back.
+     */
+    suspend fun completeAutomaticChapterMaintenance(result: CandidateAdoptionResult.Adopted) {
+        currentCoroutineContext().ensureActive()
+        val candidate = result.run.candidates.singleOrNull {
+            it.id == result.run.selectedCandidateId
+        } ?: return
+        val completed = ChapterMaintenanceBarrier.complete(AUTOMATIC_CHAPTER_MAINTENANCE_TIMEOUT_MS) { maintenanceScope ->
+            onChapterSaved(
+                result.run.projectId,
+                result.chapter.id,
+                result.chapter.title,
+                candidate.body,
+                executionScope = maintenanceScope,
+            )
+        }
+        if (!completed) {
+            _statusMessage.value = if (_uiLanguage.value == "en") {
+                "Chapter accepted; follow-up maintenance timed out and was cancelled before continuing."
+            } else {
+                "正文已采用；章节后处理超时，已取消剩余任务后再继续，不会回滚正文。"
+            }
+        }
     }
 
     /** Index a single chapter (called after a successful chapter save when KB is enabled). */
-    fun indexChapterIfEnabled(projectId: String, chapterId: String, title: String, text: String) {
-        if (!repo.knowledgeBaseEnabled()) return
+    fun indexChapterIfEnabled(
+        projectId: String,
+        chapterId: String,
+        title: String,
+        text: String,
+        executionScope: CoroutineScope = viewModelScope,
+    ): Job? {
+        if (!repo.knowledgeBaseEnabled()) return null
         val cfg = repo.embeddingConfig()
-        if (!cfg.isUsableApiConfig()) return
-        if (text.trim().length < 200) return
-        val input = matchingChapterSource(projectId, chapterId, title, text) ?: return
+        if (!cfg.isUsableApiConfig()) return null
+        if (text.trim().length < 200) return null
+        val input = matchingChapterSource(projectId, chapterId, title, text) ?: return null
         val embeddingSignature = repo.embeddingSourceSignature(cfg)
-        viewModelScope.launch(Dispatchers.IO) {
+        return executionScope.launch(Dispatchers.IO) {
             runSuspendCatching {
                 val chunks = kb.indexChapter(chapterId, title, input.effectiveText, cfg)
                 currentCoroutineContext().ensureActive()
@@ -4453,30 +4511,42 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         chapterTitle: String,
         chapterText: String,
         onDone: (SummaryPayload?) -> Unit = {},
-    ) {
+    ): Job? = generateChapterSummaryInScope(projectId, chapterId, chapterTitle, chapterText, viewModelScope, onDone)
+
+    private fun generateChapterSummaryInScope(
+        projectId: String,
+        chapterId: String,
+        chapterTitle: String,
+        chapterText: String,
+        executionScope: CoroutineScope = viewModelScope,
+        onDone: (SummaryPayload?) -> Unit = {},
+    ): Job? {
         val cfg = repo.textModelForRole(projectId, "extraction")
-        if (!cfg.isValid()) { _statusMessage.value = "请先配置文本模型"; onDone(null); return }
+        if (!cfg.isValid()) { _statusMessage.value = "请先配置文本模型"; onDone(null); return null }
         val input = matchingChapterSource(projectId, chapterId, chapterTitle, chapterText)
-            ?: run { onDone(null); return }
+            ?: run { onDone(null); return null }
         val lang = _uiLanguage.value
-        viewModelScope.launch(Dispatchers.IO) {
-            val text = runSuspendCatching {
-                ai.chat(cfg, listOf(
+        return executionScope.launch(Dispatchers.IO) {
+            runSuspendCatching {
+                val text = ai.chat(cfg, listOf(
                     ChatMessage("system", Prompts.chapterSummarySystem(lang)),
                     ChatMessage("user", Prompts.chapterSummaryUser(input.source.title, input.effectiveText, lang)),
-                ))
-            }.getOrNull()?.trim() ?: run { onDone(null); return@launch }
-            currentCoroutineContext().ensureActive()
-            val payload = SummaryPayload(
-                id = "sum-ch-$chapterId",
-                scopeType = "chapter",
-                scopeId = chapterId,
-                summaryText = text,
-                isStale = false,
-                wordCount = text.length,
-            )
-            val committed = repo.commitChapterSummaryIfSourceCurrent(projectId, input.source, payload)
-            onDone(payload.takeIf { committed })
+                )).trim()
+                currentCoroutineContext().ensureActive()
+                val payload = SummaryPayload(
+                    id = "sum-ch-$chapterId",
+                    scopeType = "chapter",
+                    scopeId = chapterId,
+                    summaryText = text,
+                    isStale = false,
+                    wordCount = text.length,
+                )
+                val committed = repo.commitChapterSummaryIfSourceCurrent(projectId, input.source, payload)
+                onDone(payload.takeIf { committed })
+            }.onFailure {
+                _statusMessage.value = "章节摘要生成失败：${it.message}"
+                onDone(null)
+            }
         }
     }
 
@@ -4589,14 +4659,23 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         chapterTitle: String,
         chapterText: String,
         onDone: (added: Int, updated: Int) -> Unit = { _, _ -> },
-    ) {
+    ): Job? = extractEntitiesForChapterInScope(projectId, chapterId, chapterTitle, chapterText, viewModelScope, onDone)
+
+    private fun extractEntitiesForChapterInScope(
+        projectId: String,
+        chapterId: String,
+        chapterTitle: String,
+        chapterText: String,
+        executionScope: CoroutineScope = viewModelScope,
+        onDone: (added: Int, updated: Int) -> Unit = { _, _ -> },
+    ): Job? {
         val cfg = repo.textModelForRole(projectId, "extraction")
-        if (!cfg.isValid()) { _statusMessage.value = "请先配置文本模型"; onDone(0, 0); return }
+        if (!cfg.isValid()) { _statusMessage.value = "请先配置文本模型"; onDone(0, 0); return null }
         val ticket = repo.captureFactExtractionTicket(projectId, chapterId)
             ?.takeIf { it.input.source.title == chapterTitle && it.input.effectiveText == chapterText }
-            ?: run { onDone(0, 0); return }
+            ?: run { onDone(0, 0); return null }
         val lang = _uiLanguage.value
-        viewModelScope.launch(Dispatchers.IO) {
+        return executionScope.launch(Dispatchers.IO) {
             val result = runSuspendCatching {
                 requestAndMergeChapterFacts(
                     cfg = cfg,
@@ -4607,7 +4686,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     knownNames = ticket.knownNames,
                     lang = lang,
                 )
-            }.getOrNull()
+            }.onFailure { _statusMessage.value = "章节实体提取失败：${it.message}" }.getOrNull()
             onDone(result?.first ?: 0, result?.second ?: 0)
         }
     }
@@ -5255,14 +5334,20 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /** Fan out per-chapter AI updates for every auto-update container (called from onChapterSaved). */
-    private fun updateContainersForChapter(projectId: String, chapterId: String, title: String, text: String) {
+    private fun updateContainersForChapter(
+        projectId: String,
+        chapterId: String,
+        title: String,
+        text: String,
+        executionScope: CoroutineScope = viewModelScope,
+    ): Job? {
         val cfg = repo.textModelForRole(projectId, "extraction")
-        if (!cfg.isValid() || text.trim().length < 50) return
-        val input = matchingChapterSource(projectId, chapterId, title, text) ?: return
+        if (!cfg.isValid() || text.trim().length < 50) return null
+        val input = matchingChapterSource(projectId, chapterId, title, text) ?: return null
         val containers = repo.containers(projectId).filter { it.autoUpdatePerChapter }
-        if (containers.isEmpty()) return
+        if (containers.isEmpty()) return null
         val lang = _uiLanguage.value
-        viewModelScope.launch(Dispatchers.IO) {
+        return executionScope.launch(Dispatchers.IO) {
             containers.forEach { c ->
                 runSuspendCatching { updateOneContainer(projectId, c, input.source, input.effectiveText, cfg, lang) }
                     .onFailure { _statusMessage.value = "容器《${c.name}》更新失败：${it.message}" }
@@ -5409,6 +5494,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         /** Two beats produce the largest per-beat output allowance: 1250 * 2 + 512. */
         private const val STEPWISE_PREFLIGHT_OUTPUT_TOKENS = 3_012
         private const val MIN_FACT_EXTRACTION_CHARS = 20
+        /** Less than the agent's six-minute tool watchdog; provider calls keep their own limits. */
+        private const val AUTOMATIC_CHAPTER_MAINTENANCE_TIMEOUT_MS = 4 * 60 * 1000L
         private val STEPWISE_WRITTEN_TAIL_RESERVE = "文".repeat(1_500)
     }
 }

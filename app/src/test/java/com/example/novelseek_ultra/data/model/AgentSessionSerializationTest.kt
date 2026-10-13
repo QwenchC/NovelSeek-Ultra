@@ -7,6 +7,7 @@ import com.example.novelseek_ultra.agent.AgentRunCheckpoint
 import com.example.novelseek_ultra.agent.AgentRunPhase
 import kotlinx.serialization.json.Json
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -37,6 +38,7 @@ class AgentSessionSerializationTest {
         val session = json.decodeFromString(AgentSession.serializer(), legacyJson)
 
         assertEquals("classic", session.engineMode)
+        assertFalse(session.skipManualReview)
         assertEquals(AgentReasoningLevels.MEDIUM, session.reasoningLevel)
         assertEquals(AgentSessionCacheMetrics(), session.cacheMetrics)
         assertEquals(AgentSessionMemory(), session.memory)
@@ -51,6 +53,37 @@ class AgentSessionSerializationTest {
         assertEquals(AgentRunCheckpoint(), session.runCheckpoint)
         assertNull(session.pendingPrompt)
         assertNull(session.pendingReview)
+    }
+
+    @Test
+    fun legacyAutoContinueGrantNeverImpliesAutomaticChapterAdoption() {
+        val legacy = """{"id":"legacy-auto-session","lockedProjectId":"project-1","autoApprove":true}"""
+
+        val session = json.decodeFromString(AgentSession.serializer(), legacy)
+
+        assertTrue(session.autoApprove)
+        assertFalse(session.skipManualReview)
+    }
+
+    @Test
+    fun manualReviewPermissionRoundTripsIndependentlyOfToolApproval() {
+        listOf(false, true).forEach { autoApprove ->
+            listOf(false, true).forEach { skipManualReview ->
+                val original = AgentSession(
+                    id = "review-permission-session",
+                    lockedProjectId = "project-1",
+                    autoApprove = autoApprove,
+                    skipManualReview = skipManualReview,
+                )
+
+                val encoded = json.encodeToString(AgentSession.serializer(), original)
+                val decoded = json.decodeFromString(AgentSession.serializer(), encoded)
+
+                assertEquals(original, decoded)
+                assertEquals(autoApprove, decoded.autoApprove)
+                assertEquals(skipManualReview, decoded.skipManualReview)
+            }
+        }
     }
 
     @Test

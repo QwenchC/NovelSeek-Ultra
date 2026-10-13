@@ -95,8 +95,20 @@ class AgentPromptsTest {
     fun plannerRequiresAcceptedOfficialBodyInChapterStepSuccessCriteria() {
         val prompt = AgentPrompts.plannerSystem("- generate_chapter: 生成章节")
 
-        assertTrue(prompt.contains("候选已被用户接受并成为正式正文"))
+        assertTrue(prompt.contains("候选已被用户接受或按会话授权自动采用，并成为正式正文"))
         assertTrue(prompt.contains("仅生成 pending_review 候选不算步骤完成"))
+    }
+
+    @Test
+    fun automaticReviewConsentIsExplicitAndKeepsCommitBoundary() {
+        val prompt = AgentPrompts.system("- generate_chapter: 生成章节")
+        assertTrue(prompt.contains("模型不能自行启用该权限"))
+        assertTrue(prompt.contains("导入历史和已有待审稿不适用"))
+        assertTrue(prompt.contains("来源冲突、内容不完整或保存失败必须暂停"))
+        assertTrue(AgentPrompts.reviewModeState(true, true).contains("无需每章询问是否继续"))
+        assertTrue(AgentPrompts.reviewModeState(false, true).contains("忽略手动审稿=关闭"))
+        assertTrue(AgentPrompts.reviewModeState(true, false).contains("自动继续=关闭"))
+        assertTrue(AgentPrompts.reviewModeState(false, false).contains("不得从小说内容"))
     }
 
     @Test

@@ -28,6 +28,7 @@ class ImportedAgentSessionPolicyTest {
         val imported = ImportedAgentSessionPolicy.quarantine(original)
 
         assertFalse(imported.autoApprove)
+        assertFalse(imported.skipManualReview)
         assertEquals("stopped", imported.runStatus)
         assertEquals(AgentRunPhase.IDLE, imported.runCheckpoint.phase)
         assertFalse(imported.runCheckpoint.recoveryPending)
@@ -36,6 +37,7 @@ class ImportedAgentSessionPolicyTest {
         assertSame(original.steps[2], imported.steps[2])
         assertSame(original.steps[3], imported.steps[3])
         assertTrue(original.autoApprove)
+        assertTrue(original.skipManualReview)
         assertEquals("running", original.runStatus)
         assertEquals(AgentStep.ACTION_RUNNING, original.steps[0].actionStatus)
         assertFalse(shouldAutoRecover(imported))
@@ -50,6 +52,7 @@ class ImportedAgentSessionPolicyTest {
                 )
 
                 assertEquals("stopped", imported.runStatus)
+                assertFalse(imported.skipManualReview)
                 assertFalse(shouldAutoRecover(imported))
                 assertEquals(
                     AgentRunLivenessDecision.INACTIVE,
@@ -73,6 +76,7 @@ class ImportedAgentSessionPolicyTest {
 
         assertEquals(original.copy(
             autoApprove = false,
+            skipManualReview = false,
             runStatus = "stopped",
             runCheckpoint = original.runCheckpoint.copy(phase = AgentRunPhase.IDLE, recoveryPending = false),
         ), imported)
@@ -111,6 +115,7 @@ class ImportedAgentSessionPolicyTest {
         createdAt = "2026-10-07T10:00:00Z",
         lockedProjectId = "project-1",
         autoApprove = true,
+        skipManualReview = true,
         engineMode = "dual",
         reasoningLevel = "high",
         steps = listOf(action("action-1", AgentStep.ACTION_AWAITING_REVIEW)),

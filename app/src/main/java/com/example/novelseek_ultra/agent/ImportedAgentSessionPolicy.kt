@@ -6,12 +6,13 @@ import com.example.novelseek_ultra.data.model.AgentStep
 /**
  * A backup transports conversation history, not permission to execute on another installation.
  * Keep historical identities and review links intact, but never restore automatic execution or
- * auto-approval. A subsequent explicit user command/continue still uses the controller's normal
- * confirmation and interrupted-action checks.
+ * auto-approval or automatic chapter adoption. A subsequent explicit user command/continue still
+ * uses the controller's normal confirmation and interrupted-action checks.
  */
 object ImportedAgentSessionPolicy {
     fun quarantine(session: AgentSession): AgentSession = session.copy(
         autoApprove = false,
+        skipManualReview = false,
         runStatus = "stopped",
         runCheckpoint = session.runCheckpoint.copy(
             phase = AgentRunPhase.IDLE,

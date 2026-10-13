@@ -54,6 +54,8 @@ import com.example.novelseek_ultra.data.ai.TextModelRequestPolicy
 import com.example.novelseek_ultra.data.ai.isDirectDeepSeek
 import com.example.novelseek_ultra.data.ai.isUsableApiConfig
 import com.example.novelseek_ultra.data.model.AgentReasoningLevels
+import com.example.novelseek_ultra.data.model.EmbeddingConfig
+import com.example.novelseek_ultra.data.model.KbStats
 import com.example.novelseek_ultra.data.model.TextModelConfig
 import com.example.novelseek_ultra.data.model.TextModelProfile
 import com.example.novelseek_ultra.data.model.TextModelThinkingModes
@@ -96,11 +98,12 @@ fun SettingsScreen(vm: AppViewModel) {
     val lang by vm.uiLanguage.collectAsState()
     val theme by vm.theme.collectAsState()
     val appState by vm.state.collectAsState()
-    val agentEngine = remember(appState) { vm.agentEngine() }
-    val dualAgentReasoningLevel = remember(appState) { vm.dualAgentReasoningLevel() }
+    val agentEngine = remember(appState["agentEngine"]) { vm.agentEngine() }
+    val dualAgentReasoningLevel = remember(appState["dualAgentReasoningLevel"]) { vm.dualAgentReasoningLevel() }
     val importPreview by vm.importPreview.collectAsState()
     val status by vm.statusMessage.collectAsState()
     val scope = rememberCoroutineScope()
+    var changingSetting by remember { mutableStateOf(false) }
     var includeAppSettings by rememberSaveable { mutableStateOf(false) }
     var includeSecretsInExport by rememberSaveable { mutableStateOf(false) }
     var showSecretExportConfirmation by rememberSaveable { mutableStateOf(false) }
@@ -150,6 +153,16 @@ fun SettingsScreen(vm: AppViewModel) {
         createFileLauncher.launch("novelseek-backup-$stamp.${backupExportFormat.extension}")
     }
 
+    fun applySetting(action: () -> Unit) {
+        if (changingSetting) return
+        changingSetting = true
+        scope.launch {
+            val result = withContext(Dispatchers.IO) { runCatching(action) }
+            result.onFailure { vm.showStatus(tx(lang, "设置保存失败，请重试。", "Could not save the setting. Please retry.")) }
+            changingSetting = false
+        }
+    }
+
     Scaffold(
         contentWindowInsets = androidx.compose.foundation.layout.WindowInsets(0),
         topBar = {
@@ -165,7 +178,7 @@ fun SettingsScreen(vm: AppViewModel) {
                     // Light/dark toggle — icon only, no label. Filled bulb = light theme (lamp
                     // on); outlined bulb = dark theme (lamp off). Tap to flip.
                     val isDark = theme == "dark"
-                    IconButton(onClick = { vm.setTheme(if (isDark) "light" else "dark") }) {
+                    IconButton(onClick = { applySetting { vm.setTheme(if (isDark) "light" else "dark") } }, enabled = !changingSetting) {
                         Icon(
                             imageVector = if (isDark) Icons.Outlined.Lightbulb
                                           else Icons.Filled.Lightbulb,
@@ -199,12 +212,14 @@ fun SettingsScreen(vm: AppViewModel) {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     FilterChip(
                         selected = lang == "zh",
-                        onClick = { vm.setUiLanguage("zh") },
+                        onClick = { applySetting { vm.setUiLanguage("zh") } },
+                        enabled = !changingSetting,
                         label = { Text("中文") },
                     )
                     FilterChip(
                         selected = lang == "en",
-                        onClick = { vm.setUiLanguage("en") },
+                        onClick = { applySetting { vm.setUiLanguage("en") } },
+                        enabled = !changingSetting,
                         label = { Text("English") },
                     )
                 }
@@ -218,8 +233,9 @@ fun SettingsScreen(vm: AppViewModel) {
                 lang = lang,
                 selectedEngine = agentEngine,
                 selectedReasoningLevel = dualAgentReasoningLevel,
-                onSelectEngine = vm::setAgentEngine,
-                onSelectReasoningLevel = vm::setDualAgentReasoningLevel,
+                enabled = !changingSetting,
+                onSelectEngine = { selected -> applySetting { vm.setAgentEngine(selected) } },
+                onSelectReasoningLevel = { selected -> applySetting { vm.setDualAgentReasoningLevel(selected) } },
             )
 
             // ── Image generation engine (Pollinations / ComfyUI) ──────
@@ -229,13 +245,22 @@ fun SettingsScreen(vm: AppViewModel) {
             PollinationsKeySection(vm, lang)
 
             // ── Local Knowledge Base (RAG) ────────────────────────────
-            KnowledgeBaseSection(vm, lang)
+            DeferredSettingsSection(
+                title = tx(lang, "本地知识库（Embedding）", "Local knowledge base (embedding)"),
+                lang = lang,
+            ) { KnowledgeBaseSection(vm, lang) }
 
             // ── Project KB management ─────────────────────────────────
-            ProjectKbManagementSection(vm, lang)
+            DeferredSettingsSection(
+                title = tx(lang, "项目知识库管理", "Project knowledge base"),
+                lang = lang,
+            ) { ProjectKbManagementSection(vm, lang) }
 
             // ── Augmentation layers (summaries + entities) ────────────
-            AugmentationLayersSection(vm, lang)
+            DeferredSettingsSection(
+                title = tx(lang, "增强层（摘要 / 事实证据）", "Augmentation (summaries / fact evidence)"),
+                lang = lang,
+            ) { AugmentationLayersSection(vm, lang) }
 
             // ── Backup / Restore ──────────────────────────────────────
             SectionCard {
@@ -438,6 +463,7 @@ private fun AgentEngineSection(
     selectedReasoningLevel: String,
     onSelectEngine: (String) -> Unit,
     onSelectReasoningLevel: (String) -> Unit,
+    enabled: Boolean = true,
 ) {
     SectionCard {
         Text(
@@ -459,6 +485,7 @@ private fun AgentEngineSection(
         FilterChip(
             selected = selectedEngine == "classic",
             onClick = { onSelectEngine("classic") },
+            enabled = enabled,
             label = { Text(tx(lang, "经典单智能体（ReAct）", "Classic single agent (ReAct)")) },
         )
         Text(
@@ -476,6 +503,7 @@ private fun AgentEngineSection(
         FilterChip(
             selected = selectedEngine == "dual",
             onClick = { onSelectEngine("dual") },
+            enabled = enabled,
             label = { Text(tx(lang, "双智能体（规划 + 执行）", "Dual agents (planner + executor)")) },
         )
         Text(
@@ -508,6 +536,7 @@ private fun AgentEngineSection(
                     FilterChip(
                         selected = selectedReasoningLevel == level,
                         onClick = { onSelectReasoningLevel(level) },
+                        enabled = enabled,
                         label = { Text(label) },
                         modifier = Modifier.weight(1f),
                     )
@@ -559,6 +588,30 @@ private fun SectionCard(content: @Composable () -> Unit) {
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
             content()
+        }
+    }
+}
+
+/** Defer heavy advanced controls until requested, without disposing drafts or running jobs on scroll. */
+@Composable
+private fun DeferredSettingsSection(title: String, lang: String, content: @Composable () -> Unit) {
+    var opened by rememberSaveable { mutableStateOf(false) }
+    if (opened) {
+        content()
+    } else {
+        SectionCard {
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                Text(title, style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+                TextButton(onClick = { opened = true }) {
+                    Text(tx(lang, "展开", "Open"))
+                    Icon(Icons.Outlined.ExpandMore, contentDescription = null)
+                }
+            }
+            Text(
+                tx(lang, "按需加载高级设置，展开后保留草稿和任务状态。", "Advanced controls load on demand; opened drafts and tasks remain active."),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
     }
 }
@@ -661,8 +714,14 @@ private fun CollapsibleProjectSelector(
 @Composable
 private fun TextModelProfilesSection(vm: AppViewModel, lang: String) {
     val state by vm.state.collectAsState()
+    val settingsRevision by vm.settingsRevision.collectAsState()
     val usage by vm.textUsageStats.collectAsState()
-    val profiles = remember(state) { vm.textModelProfiles() }
+    var profiles by remember { mutableStateOf<List<TextModelProfile>>(emptyList()) }
+    var loading by remember { mutableStateOf(true) }
+    var loadError by remember { mutableStateOf(false) }
+    var loadRetry by remember { mutableStateOf(0) }
+    var saving by remember { mutableStateOf(false) }
+    var saveError by remember { mutableStateOf<String?>(null) }
     val activeId = state["activeTextModelProfileId"]?.let {
         (it as? kotlinx.serialization.json.JsonPrimitive)?.content
     }
@@ -673,6 +732,30 @@ private fun TextModelProfilesSection(vm: AppViewModel, lang: String) {
     val scope = rememberCoroutineScope()
     val activeConnectionIdentity = profiles.firstOrNull { it.id == activeId }
     val latestConnectionIdentity by rememberUpdatedState(activeConnectionIdentity)
+
+    LaunchedEffect(state["textModelProfiles"], settingsRevision, loadRetry) {
+        loading = true
+        loadError = false
+        val result = withContext(Dispatchers.IO) { runCatching { vm.textModelProfiles() } }
+        result.onSuccess { profiles = it }.onFailure { loadError = true }
+        loading = false
+    }
+
+    fun saveProfile(profile: TextModelProfile, created: Boolean) {
+        if (saving) return
+        saving = true
+        saveError = null
+        testResult = null
+        scope.launch {
+            val result = withContext(Dispatchers.IO) { runCatching { vm.saveTextModelProfile(profile) } }
+            result.onSuccess {
+                if (created) showCreate = false else editing = null
+            }.onFailure {
+                saveError = tx(lang, "保存失败，草稿已保留，请重试。", "Save failed; your draft is retained. Please retry.")
+            }
+            saving = false
+        }
+    }
 
     LaunchedEffect(activeConnectionIdentity) {
         testResult = null
@@ -685,7 +768,7 @@ private fun TextModelProfilesSection(vm: AppViewModel, lang: String) {
                 style = MaterialTheme.typography.titleMedium,
                 modifier = Modifier.weight(1f),
             )
-            IconButton(onClick = { showCreate = true }) {
+            IconButton(onClick = { saveError = null; showCreate = true }, enabled = !saving) {
                 Icon(Icons.Outlined.Add, contentDescription = null)
             }
         }
@@ -731,7 +814,12 @@ private fun TextModelProfilesSection(vm: AppViewModel, lang: String) {
             )
         }
         Spacer(Modifier.height(8.dp))
-        if (profiles.isEmpty()) {
+        if (loading) {
+            CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+        } else if (loadError) {
+            Text(tx(lang, "读取模型配置失败。", "Could not load model profiles."), color = MaterialTheme.colorScheme.error)
+            TextButton(onClick = { loadRetry++ }) { Text(tx(lang, "重试", "Retry")) }
+        } else if (profiles.isEmpty()) {
             Text(
                 tx(lang, "尚未配置任何模型。点击 + 新建。", "No profiles yet. Tap + to add one."),
                 style = MaterialTheme.typography.bodyMedium,
@@ -742,8 +830,14 @@ private fun TextModelProfilesSection(vm: AppViewModel, lang: String) {
                     AssistChip(
                         onClick = {
                             testResult = null
-                            vm.setActiveProfile(p.id)
+                            saving = true
+                            scope.launch {
+                                val result = withContext(Dispatchers.IO) { runCatching { vm.setActiveProfile(p.id) } }
+                                result.onFailure { vm.showStatus(tx(lang, "切换模型失败，请重试。", "Could not switch the model. Please retry.")) }
+                                saving = false
+                            }
                         },
+                        enabled = !saving,
                         label = { Text(p.name) },
                         colors = AssistChipDefaults.assistChipColors(
                             containerColor = if (activeId == p.id) MaterialTheme.colorScheme.primaryContainer
@@ -757,14 +851,19 @@ private fun TextModelProfilesSection(vm: AppViewModel, lang: String) {
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.weight(1f),
                     )
-                    IconButton(onClick = { editing = p }) {
+                    IconButton(onClick = { saveError = null; editing = p }, enabled = !saving) {
                         Icon(Icons.Outlined.Add, contentDescription = null)
                     }
                     if (!p.builtIn) {
                         IconButton(onClick = {
                             testResult = null
-                            vm.deleteTextModelProfile(p.id)
-                        }) {
+                            saving = true
+                            scope.launch {
+                                val result = withContext(Dispatchers.IO) { runCatching { vm.deleteTextModelProfile(p.id) } }
+                                result.onFailure { vm.showStatus(tx(lang, "删除模型配置失败，请重试。", "Could not delete the profile. Please retry.")) }
+                                saving = false
+                            }
+                        }, enabled = !saving) {
                             Icon(Icons.Outlined.Delete, contentDescription = null)
                         }
                     }
@@ -791,7 +890,7 @@ private fun TextModelProfilesSection(vm: AppViewModel, lang: String) {
                     }
                     testing = false
                 }
-            }, enabled = !testing) {
+            }, enabled = !testing && !saving && !loading && !loadError) {
                 if (testing) CircularProgressIndicator(modifier = Modifier.width(16.dp).height(16.dp))
                 else Text(tx(lang, "测试当前模型", "Test Active Model"))
             }
@@ -808,20 +907,18 @@ private fun TextModelProfilesSection(vm: AppViewModel, lang: String) {
 
     if (showCreate) {
         ProfileDialog(lang = lang, initial = null,
-            onDismiss = { showCreate = false },
+            saving = saving, saveError = saveError,
+            onDismiss = { if (!saving) showCreate = false },
             onSave = { saved ->
-                testResult = null
-                vm.saveTextModelProfile(saved.copy(id = "custom-${System.currentTimeMillis()}"))
-                showCreate = false
+                saveProfile(saved.copy(id = "custom-${System.currentTimeMillis()}"), created = true)
             })
     }
     editing?.let { p ->
         ProfileDialog(lang = lang, initial = p,
-            onDismiss = { editing = null },
+            saving = saving, saveError = saveError,
+            onDismiss = { if (!saving) editing = null },
             onSave = { saved ->
-                testResult = null
-                vm.saveTextModelProfile(saved)
-                editing = null
+                saveProfile(saved, created = false)
             })
     }
 }
@@ -832,6 +929,8 @@ private fun ProfileDialog(
     initial: TextModelProfile?,
     onDismiss: () -> Unit,
     onSave: (TextModelProfile) -> Unit,
+    saving: Boolean = false,
+    saveError: String? = null,
 ) {
     var name by remember { mutableStateOf(initial?.name.orEmpty()) }
     var provider by remember { mutableStateOf(initial?.provider ?: "custom") }
@@ -859,9 +958,9 @@ private fun ProfileDialog(
         title = { Text(if (initial == null) tx(lang, "新建模型 Profile", "New Profile") else tx(lang, "编辑模型 Profile", "Edit Profile")) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedTextField(name, { name = it }, label = { Text(tx(lang, "名称", "Name")) }, singleLine = true)
-                OutlinedTextField(provider, { provider = it }, label = { Text(tx(lang, "Provider", "Provider")) }, singleLine = true)
-                OutlinedTextField(apiUrl, { apiUrl = it }, label = { Text("API URL") }, singleLine = true)
+                OutlinedTextField(name, { name = it }, label = { Text(tx(lang, "名称", "Name")) }, singleLine = true, enabled = !saving)
+                OutlinedTextField(provider, { provider = it }, label = { Text(tx(lang, "Provider", "Provider")) }, singleLine = true, enabled = !saving)
+                OutlinedTextField(apiUrl, { apiUrl = it }, label = { Text("API URL") }, singleLine = true, enabled = !saving)
                 endpointAssessment?.takeUnless { it.allowed }?.message?.let { message ->
                     Text(
                         message,
@@ -869,7 +968,7 @@ private fun ProfileDialog(
                         color = MaterialTheme.colorScheme.error,
                     )
                 }
-                OutlinedTextField(model, { model = it }, label = { Text(tx(lang, "模型名", "Model")) }, singleLine = true)
+                OutlinedTextField(model, { model = it }, label = { Text(tx(lang, "模型名", "Model")) }, singleLine = true, enabled = !saving)
                 Text(
                     tx(lang, "推理模式（DeepSeek V4）", "Thinking mode (DeepSeek V4)"),
                     style = MaterialTheme.typography.labelMedium,
@@ -886,17 +985,19 @@ private fun ProfileDialog(
                         FilterChip(
                             selected = thinkingMode == value,
                             onClick = { thinkingMode = value },
+                            enabled = !saving,
                             label = { Text(label) },
                             modifier = Modifier.weight(1f),
                         )
                     }
                 }
-                ApiKeyField(value = apiKey, onValueChange = { apiKey = it }, label = "API Key")
+                ApiKeyField(value = apiKey, onValueChange = { apiKey = it }, label = "API Key", enabled = !saving)
                 initial?.keyUrl?.takeIf { it.isNotBlank() }?.let { ApiKeyLink(it, lang) }
                 OutlinedTextField(
                     temp,
                     { temp = it },
                     label = { Text("Temperature (0–2)") },
+                    enabled = !saving,
                     singleLine = true,
                     isError = !temperatureValid,
                     supportingText = if (!temperatureValid) {
@@ -918,6 +1019,7 @@ private fun ProfileDialog(
                         contextTokens,
                         { contextTokens = it.filter(Char::isDigit) },
                         label = { Text(tx(lang, "上下文 tokens", "Context tokens")) },
+                        enabled = !saving,
                         singleLine = true,
                         modifier = Modifier.weight(1f),
                     )
@@ -925,6 +1027,7 @@ private fun ProfileDialog(
                         outputTokens,
                         { outputTokens = it.filter(Char::isDigit) },
                         label = { Text(tx(lang, "最大输出 tokens", "Max output tokens")) },
+                        enabled = !saving,
                         singleLine = true,
                         modifier = Modifier.weight(1f),
                         isError = !outputTokensValid,
@@ -949,8 +1052,10 @@ private fun ProfileDialog(
             }
         },
         confirmButton = {
+            Column {
+            saveError?.let { Text(it, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.error) }
             TextButton(
-                enabled = name.isNotBlank() && apiUrl.isNotBlank() && model.isNotBlank() &&
+                enabled = !saving && name.isNotBlank() && apiUrl.isNotBlank() && model.isNotBlank() &&
                     endpointAssessment?.allowed == true && temperatureValid && outputTokensValid,
                 onClick = {
                 onSave(
@@ -969,7 +1074,8 @@ private fun ProfileDialog(
                         keyUrl = initial?.keyUrl,
                     )
                 )
-            }) { Text(tx(lang, "保存", "Save")) }
+            }) { Text(if (saving) tx(lang, "保存中…", "Saving…") else tx(lang, "保存", "Save")) }
+            }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text(tx(lang, "取消", "Cancel")) } },
     )
@@ -978,10 +1084,18 @@ private fun ProfileDialog(
 @Composable
 private fun ImageEngineSection(vm: AppViewModel, lang: String) {
     val state by vm.state.collectAsState()
-    var engine by remember(state) { mutableStateOf(vm.imageEngine()) }
-    var comfyUrl by remember(state) { mutableStateOf(vm.comfyUIUrl()) }
+    val engine = remember(state["imageEngine"]) { vm.imageEngine() }
+    val savedUrl = remember(state["comfyUIUrl"]) { vm.comfyUIUrl() }
+    var comfyUrl by rememberSaveable { mutableStateOf(savedUrl) }
+    var appliedComfyUrl by remember { mutableStateOf(savedUrl) }
+    LaunchedEffect(savedUrl) {
+        comfyUrl = reloadCleanSettingsDraft(comfyUrl, appliedComfyUrl, savedUrl)
+        appliedComfyUrl = savedUrl
+    }
+    var saving by remember { mutableStateOf(false) }
+    var saveMessage by remember { mutableStateOf<String?>(null) }
     var testing by remember { mutableStateOf(false) }
-    var testResult by remember { mutableStateOf<Boolean?>(null) }
+    var testResult by remember { mutableStateOf<com.example.novelseek_ultra.data.ai.ComfyUIConnectionResult?>(null) }
     val scope = rememberCoroutineScope()
 
     SectionCard {
@@ -991,9 +1105,9 @@ private fun ImageEngineSection(vm: AppViewModel, lang: String) {
         Text(
             tx(lang,
                 "选择图像生成后端，作用于角色立绘、封面图、章节插图与章节推文。\n" +
-                    "Pollinations 走云端，无需本地环境；ComfyUI 连接你本地/局域网运行的 ComfyUI，使用固定的 z-image-turbo 工作流（不带 LoRA）。",
+                    "Pollinations 走云端；ComfyUI 可连接局域网或内网穿透后的 HTTP/HTTPS 地址，使用固定的 z-image-turbo 工作流（不带 LoRA）。",
                 "Pick the backend for character portraits, covers, chapter illustrations and promos.\n" +
-                    "Pollinations is cloud-based (no local setup); ComfyUI connects to your local/LAN ComfyUI instance using a fixed z-image-turbo workflow (no LoRA)."),
+                    "Pollinations is cloud-based; ComfyUI connects to LAN or tunneled HTTP/HTTPS endpoints using a fixed z-image-turbo workflow (no LoRA)."),
             style = MaterialTheme.typography.labelMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -1001,12 +1115,30 @@ private fun ImageEngineSection(vm: AppViewModel, lang: String) {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             FilterChip(
                 selected = engine == "pollinations",
-                onClick = { engine = "pollinations"; vm.setImageEngine("pollinations") },
+                onClick = {
+                    saving = true
+                    scope.launch {
+                        try { withContext(Dispatchers.IO) { vm.setImageEngine("pollinations") } }
+                        catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
+                        catch (_: Exception) { saveMessage = tx(lang, "保存失败，请重试。", "Save failed; retry.") }
+                        finally { saving = false }
+                    }
+                },
+                enabled = !saving,
                 label = { Text("Pollinations") },
             )
             FilterChip(
                 selected = engine == "comfyui",
-                onClick = { engine = "comfyui"; vm.setImageEngine("comfyui") },
+                onClick = {
+                    saving = true
+                    scope.launch {
+                        try { withContext(Dispatchers.IO) { vm.setImageEngine("comfyui") } }
+                        catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
+                        catch (_: Exception) { saveMessage = tx(lang, "保存失败，请重试。", "Save failed; retry.") }
+                        finally { saving = false }
+                    }
+                },
+                enabled = !saving,
                 label = { Text("ComfyUI") },
             )
         }
@@ -1015,44 +1147,68 @@ private fun ImageEngineSection(vm: AppViewModel, lang: String) {
             Spacer(Modifier.height(10.dp))
             OutlinedTextField(
                 value = comfyUrl,
-                onValueChange = { comfyUrl = it; vm.setComfyUIUrl(it); testResult = null },
+                onValueChange = { comfyUrl = it; testResult = null; saveMessage = null },
                 label = { Text(tx(lang, "ComfyUI 地址", "ComfyUI URL")) },
                 placeholder = { Text("http://192.168.1.100:8188") },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
+                enabled = !saving,
             )
             Spacer(Modifier.height(4.dp))
             Text(
                 tx(lang,
-                    "手机需与运行 ComfyUI 的电脑在同一局域网。请填电脑的局域网 IP（例如 http://192.168.1.100:8188），不要用 localhost——那指向手机自己。",
-                    "Your phone must be on the same LAN as the ComfyUI machine. Use that PC's LAN IP (e.g. http://192.168.1.100:8188), not localhost — localhost points at the phone itself."),
+                    "局域网：http://电脑IP:8188。TCP 穿透：http://节点域名:分配的远程端口（不是本机 8188）。HTTP/HTTPS 穿透：填写绑定的完整域名，如 https://comfy.example.com；可保留代理子路径。localhost 指向手机自身，不能连接电脑。",
+                    "LAN: http://PC-IP:8188. TCP tunnel: http://node-host:assigned-remote-port (not local 8188). HTTP/HTTPS tunnel: its full bound URL, e.g. https://comfy.example.com; proxy subpaths are supported. localhost refers to the phone, not the PC."),
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            Text(tx(lang,
+                "建议使用 HTTPS 和受保护的网关；不要把无鉴权的 ComfyUI 直接公开。公网 HTTP 的提示词和图片可能被窃听。请勿在地址内填写密码、令牌或登录网页路径。",
+                "Prefer HTTPS and a protected gateway. Do not expose unauthenticated ComfyUI publicly. Public HTTP may expose prompts and images. Do not place passwords, tokens or login-page paths in the URL."),
+                style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Spacer(Modifier.height(10.dp))
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(
-                    enabled = !testing && comfyUrl.isNotBlank(),
+                Button(
+                    enabled = !saving && comfyUrl.isNotBlank() && comfyUrl.trim() != savedUrl,
                     onClick = {
+                        val draft = comfyUrl
+                        saving = true; saveMessage = null
+                        scope.launch {
+                            try {
+                                val normalized = com.example.novelseek_ultra.data.ai.ComfyUIEndpoint.normalize(draft)
+                                withContext(Dispatchers.IO) { vm.setComfyUIUrl(normalized) }
+                                comfyUrl = normalized
+                                saveMessage = tx(lang, "地址已应用", "Address applied")
+                            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                                throw cancelled
+                            } catch (error: Exception) {
+                                saveMessage = error.message ?: tx(lang, "应用失败，请重试。", "Apply failed; retry.")
+                            } finally { saving = false }
+                        }
+                    },
+                ) { Text(tx(lang, "应用地址", "Apply URL")) }
+                OutlinedButton(
+                    enabled = !testing && !saving && comfyUrl.isNotBlank(),
+                    onClick = {
+                        val draft = comfyUrl
                         testing = true; testResult = null
                         scope.launch {
-                            testResult = vm.testComfyUIConnection()
-                            testing = false
+                            try {
+                                val result = vm.diagnoseComfyUIConnection(draft)
+                                if (comfyUrl == draft) testResult = result
+                            } finally { testing = false }
                         }
                     },
                 ) {
                     if (testing) CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
                     else Text(tx(lang, "测试 ComfyUI 连接", "Test ComfyUI"))
                 }
-                when (testResult) {
-                    true -> Text(tx(lang, "✓ 连接成功", "✓ Connected"),
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.primary)
-                    false -> Text(tx(lang, "✕ 连接失败", "✕ Failed"),
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.error)
-                    null -> {}
-                }
+            }
+            saveMessage?.let { Text(it, style = MaterialTheme.typography.labelSmall) }
+            if (comfyUrl.trim() != savedUrl) Text(tx(lang, "修改尚未应用，生成仍使用已保存地址；连接测试使用当前输入。", "Changes are not applied. Generation uses the saved URL; connection tests use this draft."), style = MaterialTheme.typography.labelSmall)
+            testResult?.let { result ->
+                Text(result.message, style = MaterialTheme.typography.labelMedium,
+                    color = if (result.success) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error)
             }
         }
     }
@@ -1072,7 +1228,23 @@ private fun ApiKeyLink(url: String, lang: String) {
 
 @Composable
 private fun PollinationsKeySection(vm: AppViewModel, lang: String) {
-    var key by remember { mutableStateOf(vm.pollinationsKey()) }
+    val settingsRevision by vm.settingsRevision.collectAsState()
+    var key by remember { mutableStateOf("") }
+    var appliedKey by remember { mutableStateOf<String?>(null) }
+    var loading by remember { mutableStateOf(true) }
+    var applying by remember { mutableStateOf(false) }
+    var loadRetry by remember { mutableStateOf(0) }
+    var message by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
+    LaunchedEffect(settingsRevision, loadRetry) {
+        loading = true
+        val result = withContext(Dispatchers.IO) { runCatching { vm.pollinationsKey() } }
+        result.onSuccess { incoming ->
+            key = reloadCleanSettingsDraft(key, appliedKey, incoming)
+            appliedKey = incoming
+        }.onFailure { message = tx(lang, "读取密钥失败，请重试。", "Could not load the key. Please retry.") }
+        loading = false
+    }
     SectionCard {
         Text(tx(lang, "Pollinations 图像 Key", "Pollinations Image Key"),
             style = MaterialTheme.typography.titleMedium)
@@ -1093,10 +1265,34 @@ private fun PollinationsKeySection(vm: AppViewModel, lang: String) {
         Spacer(Modifier.height(8.dp))
         ApiKeyField(
             value = key,
-            onValueChange = { key = it; vm.setPollinationsKey(it) },
+            onValueChange = { key = it; message = null },
             label = "Pollinations Key (sk_… or pk_…)",
             modifier = Modifier.fillMaxWidth(),
+            enabled = !loading && !applying && appliedKey != null,
         )
+        Spacer(Modifier.height(6.dp))
+        Text(tx(lang, "输入仅保留为草稿，点击应用后保存加密密钥。", "Typing edits a local draft; Apply saves the encrypted key."),
+            style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        if (appliedKey == null && !loading) {
+            TextButton(onClick = { loadRetry++ }) { Text(tx(lang, "重新读取", "Reload")) }
+        }
+        Button(
+            enabled = !loading && !applying && appliedKey != null && key != appliedKey,
+            onClick = {
+                val submittedKey = key
+                applying = true
+                message = null
+                scope.launch {
+                    val result = withContext(Dispatchers.IO) { runCatching { vm.setPollinationsKey(submittedKey) } }
+                    result.onSuccess {
+                        appliedKey = submittedKey
+                        message = tx(lang, "✓ 密钥已应用", "✓ Key applied")
+                    }.onFailure { message = tx(lang, "保存失败，草稿已保留，请重试。", "Save failed; your draft is retained. Please retry.") }
+                    applying = false
+                }
+            },
+        ) { Text(if (applying) tx(lang, "应用中…", "Applying…") else tx(lang, "应用密钥", "Apply key")) }
+        message?.let { Text(it, style = MaterialTheme.typography.labelSmall) }
     }
 }
 
@@ -1105,18 +1301,31 @@ private fun PollinationsKeySection(vm: AppViewModel, lang: String) {
 @Composable
 private fun KnowledgeBaseSection(vm: AppViewModel, lang: String) {
     val state by vm.state.collectAsState()
-    val enabled = remember(state) { vm.knowledgeBaseEnabled() }
-    val persistedCfg = remember(state) { vm.embeddingConfig() }
-    var appliedCfg by remember(persistedCfg) { mutableStateOf(persistedCfg) }
-    var cfg by remember(persistedCfg) { mutableStateOf(persistedCfg) }
+    val settingsRevision by vm.settingsRevision.collectAsState()
+    val enabled = remember(state["knowledgeBaseEnabled"]) { vm.knowledgeBaseEnabled() }
+    var appliedCfg by remember { mutableStateOf<EmbeddingConfig?>(null) }
+    var cfg by remember { mutableStateOf(EmbeddingConfig()) }
+    var loading by remember { mutableStateOf(true) }
+    var loadRetry by remember { mutableStateOf(0) }
+    var togglingEnabled by remember { mutableStateOf(false) }
     var testing by remember { mutableStateOf(false) }
     var testResult by remember { mutableStateOf<Boolean?>(null) }
     var applying by remember { mutableStateOf(false) }
     var applyMessage by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
+    LaunchedEffect(state["embeddingConfig"], settingsRevision, loadRetry) {
+        loading = true
+        val result = withContext(Dispatchers.IO) { runCatching { vm.embeddingConfig() } }
+        result.onSuccess { incoming ->
+            cfg = reloadCleanSettingsDraft(cfg, appliedCfg, incoming)
+            appliedCfg = incoming
+        }.onFailure { applyMessage = tx(lang, "读取配置失败，请重试。", "Could not load the configuration. Please retry.") }
+        loading = false
+    }
     val normalizedCfg = cfg.copy(apiUrl = cfg.apiUrl.trim(), model = cfg.model.trim())
-    val dirty = normalizedCfg != appliedCfg
-    val vectorSpaceChanged = normalizedCfg.copy(apiKey = "") != appliedCfg.copy(apiKey = "")
+    val dirty = appliedCfg != null && normalizedCfg != appliedCfg
+    val vectorSpaceChanged = normalizedCfg.copy(apiKey = "") != appliedCfg?.copy(apiKey = "")
+    val editable = !loading && !applying && !testing && appliedCfg != null
     val endpointAssessment = if (cfg.apiUrl.isBlank()) null
     else ApiEndpointPolicy.assess(cfg.apiUrl, cfg.apiKey)
 
@@ -1144,7 +1353,16 @@ private fun KnowledgeBaseSection(vm: AppViewModel, lang: String) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Checkbox(
                 checked = enabled,
-                onCheckedChange = vm::setKnowledgeBaseEnabled,
+                onCheckedChange = { checked ->
+                    if (togglingEnabled) return@Checkbox
+                    togglingEnabled = true
+                    scope.launch {
+                        val result = withContext(Dispatchers.IO) { runCatching { vm.setKnowledgeBaseEnabled(checked) } }
+                        result.onFailure { vm.showStatus(tx(lang, "保存知识库开关失败。", "Could not save the knowledge-base switch.")) }
+                        togglingEnabled = false
+                    }
+                },
+                enabled = !togglingEnabled,
             )
             Text(tx(lang, "启用本地知识库", "Enable local knowledge base"))
         }
@@ -1171,6 +1389,7 @@ private fun KnowledgeBaseSection(vm: AppViewModel, lang: String) {
             onValueChange = { editConfig(cfg.copy(apiKey = it)) },
             label = "API Key",
             modifier = Modifier.fillMaxWidth(),
+            enabled = editable,
         )
         Spacer(Modifier.height(6.dp))
         OutlinedTextField(
@@ -1178,6 +1397,7 @@ private fun KnowledgeBaseSection(vm: AppViewModel, lang: String) {
             onValueChange = { editConfig(cfg.copy(apiUrl = it)) },
             label = { Text("API URL") }, singleLine = true,
             modifier = Modifier.fillMaxWidth(),
+            enabled = editable,
         )
         endpointAssessment?.takeUnless { it.allowed }?.message?.let { message ->
             Spacer(Modifier.height(4.dp))
@@ -1194,6 +1414,7 @@ private fun KnowledgeBaseSection(vm: AppViewModel, lang: String) {
                 onValueChange = { editConfig(cfg.copy(model = it)) },
                 label = { Text(tx(lang, "模型", "Model")) }, singleLine = true,
                 modifier = Modifier.weight(2f),
+                enabled = editable,
             )
             OutlinedTextField(
                 value = cfg.dimensions?.toString().orEmpty(),
@@ -1203,6 +1424,7 @@ private fun KnowledgeBaseSection(vm: AppViewModel, lang: String) {
                 },
                 label = { Text(tx(lang, "维度", "Dim")) }, singleLine = true,
                 modifier = Modifier.weight(1f),
+                enabled = editable,
             )
         }
 
@@ -1222,7 +1444,7 @@ private fun KnowledgeBaseSection(vm: AppViewModel, lang: String) {
         Spacer(Modifier.height(10.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             OutlinedButton(
-                enabled = !testing && !applying && normalizedCfg.isUsableApiConfig(),
+                enabled = editable && normalizedCfg.isUsableApiConfig(),
                 onClick = {
                     testing = true; testResult = null
                     scope.launch {
@@ -1237,7 +1459,7 @@ private fun KnowledgeBaseSection(vm: AppViewModel, lang: String) {
                 else Text(tx(lang, "测试草稿", "Test draft"))
             }
             Button(
-                enabled = dirty && !testing && !applying && normalizedCfg.isUsableApiConfig(),
+                enabled = dirty && editable && normalizedCfg.isUsableApiConfig(),
                 onClick = {
                     applying = true
                     applyMessage = null
@@ -1278,40 +1500,67 @@ private fun KnowledgeBaseSection(vm: AppViewModel, lang: String) {
                 else MaterialTheme.colorScheme.error,
             )
         }
+        if (appliedCfg == null && !loading) {
+            TextButton(onClick = { loadRetry++ }) { Text(tx(lang, "重新读取", "Reload")) }
+        }
     }
 }
 
 // ── 2) Project KB management — pick a project, see stats, rebuild ─────────────
 
+private data class ProjectSettingsStats(
+    val kb: KbStats,
+    val summaries: Int,
+    val entities: Int,
+    val coverage: com.example.novelseek_ultra.ui.FactEvidenceCoverage,
+)
+
 @Composable
 private fun ProjectKbManagementSection(vm: AppViewModel, lang: String) {
     val state by vm.state.collectAsState()
     val kbRev by vm.kbRevision.collectAsState()
-    val enabled = remember(state) { vm.knowledgeBaseEnabled() }
+    val enabled = remember(state["knowledgeBaseEnabled"]) { vm.knowledgeBaseEnabled() }
     val projects by vm.projects.collectAsState()
-    var selectedProjectId by remember(projects) { mutableStateOf(projects.firstOrNull()?.id.orEmpty()) }
+    var selectedProjectId by rememberSaveable { mutableStateOf(projects.firstOrNull()?.id.orEmpty()) }
     var rebuilding by remember { mutableStateOf(false) }
     var progressText by remember { mutableStateOf("") }
     val scope = rememberCoroutineScope()
 
-    // Recompute on kbRev too: auto-indexing (after chapter save/generation) writes chunks to a
-    // separate file that doesn't touch `state`, so without kbRev the stats would look frozen.
-    val stats = remember(state, kbRev, selectedProjectId, rebuilding) {
-        if (selectedProjectId.isNotBlank()) vm.kbStats(selectedProjectId) else null
+    LaunchedEffect(projects) {
+        if (projects.none { it.id == selectedProjectId }) selectedProjectId = projects.firstOrNull()?.id.orEmpty()
     }
-    val summaryCount = remember(state, selectedProjectId) {
-        if (selectedProjectId.isNotBlank()) vm.summariesOf(selectedProjectId).count { it.scopeType == "chapter" } else 0
-    }
-    val entityCount = remember(state, selectedProjectId) {
-        if (selectedProjectId.isNotBlank()) vm.entitiesOf(selectedProjectId).size else 0
-    }
-    val evidenceCoverage = remember(state, selectedProjectId) {
-        if (selectedProjectId.isNotBlank()) {
-            vm.factEvidenceCoverageOf(selectedProjectId)
-        } else {
-            com.example.novelseek_ultra.ui.FactEvidenceCoverage(0, 0, 0)
+    var snapshot by remember { mutableStateOf<ProjectSettingsStats?>(null) }
+    var loadingStats by remember { mutableStateOf(false) }
+    var statsFailed by remember { mutableStateOf(false) }
+    var statsRetry by remember { mutableStateOf(0) }
+    val relevantSources = listOf("chaptersByProject", "charactersByProject", "summariesByProject", "entitiesByProject", "factEvidenceByProject")
+        .map { field -> (state[field] as? kotlinx.serialization.json.JsonObject)?.get(selectedProjectId) }
+    // These readers load the chunk JSON and hash all eligible chapter bodies. Keep them out of
+    // composition/main-thread input handling; irrelevant setting changes do not invalidate them.
+    LaunchedEffect(selectedProjectId, kbRev, relevantSources, rebuilding, statsRetry) {
+        snapshot = null
+        statsFailed = false
+        loadingStats = false
+        if (selectedProjectId.isBlank()) return@LaunchedEffect
+        loadingStats = true
+        val projectId = selectedProjectId
+        val result = withContext(Dispatchers.IO) {
+            runCatching {
+                ProjectSettingsStats(
+                    vm.kbStats(projectId),
+                    vm.summariesOf(projectId).count { it.scopeType == "chapter" },
+                    vm.entitiesOf(projectId).size,
+                    vm.factEvidenceCoverageOf(projectId),
+                )
+            }
         }
+        result.onSuccess { snapshot = it }.onFailure { statsFailed = true }
+        loadingStats = false
     }
+    val stats = snapshot?.kb
+    val summaryCount = snapshot?.summaries ?: 0
+    val entityCount = snapshot?.entities ?: 0
+    val evidenceCoverage = snapshot?.coverage ?: com.example.novelseek_ultra.ui.FactEvidenceCoverage(0, 0, 0)
 
     SectionCard {
         Text(
@@ -1337,6 +1586,12 @@ private fun ProjectKbManagementSection(vm: AppViewModel, lang: String) {
 
         Spacer(Modifier.height(10.dp))
 
+        if (loadingStats) {
+            Text(tx(lang, "后台读取项目统计…", "Loading project statistics in the background…"), style = MaterialTheme.typography.labelSmall)
+        } else if (statsFailed) {
+            Text(tx(lang, "项目统计读取失败。", "Could not load project statistics."), color = MaterialTheme.colorScheme.error)
+            TextButton(onClick = { statsRetry++ }) { Text(tx(lang, "重试", "Retry")) }
+        }
         if (stats != null) {
             Text(
                 tx(lang,
@@ -1420,17 +1675,21 @@ private fun ProjectKbManagementSection(vm: AppViewModel, lang: String) {
 @Composable
 private fun AugmentationLayersSection(vm: AppViewModel, lang: String) {
     val state by vm.state.collectAsState()
-    var summariesOn by remember(state) { mutableStateOf(vm.summariesEnabled()) }
-    var entitiesOn by remember(state) { mutableStateOf(vm.entitiesEnabled()) }
+    val summariesOn = remember(state["summariesEnabled"]) { vm.summariesEnabled() }
+    val entitiesOn = remember(state["entitiesEnabled"]) { vm.entitiesEnabled() }
     val projects by vm.projects.collectAsState()
-    var selectedProjectId by remember(projects) { mutableStateOf(projects.firstOrNull()?.id.orEmpty()) }
+    var selectedProjectId by rememberSaveable { mutableStateOf(projects.firstOrNull()?.id.orEmpty()) }
     var buildingSummaries by remember { mutableStateOf(false) }
     var buildingEvidence by remember { mutableStateOf(false) }
     var buildingBook by remember { mutableStateOf(false) }
+    var changingLayer by remember { mutableStateOf(false) }
     var summariesProgress by remember { mutableStateOf("") }
     var evidenceProgress by remember { mutableStateOf("") }
     var bookProgress by remember { mutableStateOf("") }
     val scope = rememberCoroutineScope()
+    LaunchedEffect(projects) {
+        if (projects.none { it.id == selectedProjectId }) selectedProjectId = projects.firstOrNull()?.id.orEmpty()
+    }
 
     SectionCard {
         Text(
@@ -1453,7 +1712,16 @@ private fun AugmentationLayersSection(vm: AppViewModel, lang: String) {
             // silently swallowed the user's clicks when KB was off, so the feature never turned on.
             Checkbox(
                 checked = summariesOn,
-                onCheckedChange = { summariesOn = it; vm.setSummariesEnabled(it) },
+                onCheckedChange = { checked ->
+                    if (changingLayer) return@Checkbox
+                    changingLayer = true
+                    scope.launch {
+                        val result = withContext(Dispatchers.IO) { runCatching { vm.setSummariesEnabled(checked) } }
+                        result.onFailure { vm.showStatus(tx(lang, "保存摘要开关失败。", "Could not save the summary switch.")) }
+                        changingLayer = false
+                    }
+                },
+                enabled = !changingLayer,
             )
             Column {
                 Text(tx(lang, "启用分层摘要（章节 / 弧线 / 全书）",
@@ -1472,7 +1740,16 @@ private fun AugmentationLayersSection(vm: AppViewModel, lang: String) {
         Row(verticalAlignment = Alignment.Top) {
             Checkbox(
                 checked = entitiesOn,
-                onCheckedChange = { entitiesOn = it; vm.setEntitiesEnabled(it) },
+                onCheckedChange = { checked ->
+                    if (changingLayer) return@Checkbox
+                    changingLayer = true
+                    scope.launch {
+                        val result = withContext(Dispatchers.IO) { runCatching { vm.setEntitiesEnabled(checked) } }
+                        result.onFailure { vm.showStatus(tx(lang, "保存事实证据开关失败。", "Could not save the fact-evidence switch.")) }
+                        changingLayer = false
+                    }
+                },
+                enabled = !changingLayer,
             )
             Column {
                 Text(tx(lang, "启用实体抽取（人物登场 / 伏笔 / 地点 / 事件 / 物品）",

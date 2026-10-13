@@ -176,6 +176,8 @@ data class AgentPendingReview(
  * - [lockedProjectId]: the project this session operates on (set on create/focus).
  * - [autoApprove]: when true (and a project is locked), the agent runs sensitive steps WITHOUT
  *   pausing for per-step confirmation — the user has pre-authorized auto-continue for this project.
+ * - [skipManualReview]: separately authorizes adopting newly generated chapter candidates for the
+ *   locked project without a user review decision. It does not grant general tool auto-approval.
  */
 @Serializable
 data class AgentSession(
@@ -185,6 +187,8 @@ data class AgentSession(
     val steps: List<AgentStep> = emptyList(),
     val lockedProjectId: String? = null,
     val autoApprove: Boolean = false,
+    /** Explicit session permission; legacy and imported sessions keep manual chapter review. */
+    val skipManualReview: Boolean = false,
     /** Pinned per conversation. Old serialized sessions remain on the classic engine. */
     val engineMode: String = "classic",
     /** Session-level dual-engine depth; adjustable while idle and persisted with the conversation. */

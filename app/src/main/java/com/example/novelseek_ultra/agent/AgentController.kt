@@ -184,6 +184,9 @@ class AgentController(
     /** When true (and a project is locked), sensitive steps run without per-step confirmation. */
     private val _autoApprove = MutableStateFlow(false)
     val autoApprove: StateFlow<Boolean> = _autoApprove.asStateFlow()
+    /** Independent consent for automatic adoption of newly generated, source-checked candidates. */
+    private val _skipManualReview = MutableStateFlow(false)
+    val skipManualReview: StateFlow<Boolean> = _skipManualReview.asStateFlow()
     /** All sessions (newest-first) + which one is current. */
     private val _sessions = MutableStateFlow<List<AgentSessionMeta>>(emptyList())
     val sessions: StateFlow<List<AgentSessionMeta>> = _sessions.asStateFlow()
@@ -746,6 +749,37 @@ class AgentController(
         persist()
     }
 
+    /** Does not accept a waiting candidate or grant other sensitive-tool permissions. */
+    fun setSkipManualReview(enabled: Boolean) {
+        synchronized(stateMutationLock) {
+            if (closedOrObsolete || backupImportBlocked() || sessionTransitionPending) return
+            _skipManualReview.value = enabled && validLockedProjectId() != null
+        }
+        persist()
+    }
+
+    /** Atomically bind both grants to the project/session the settings dialog actually displayed. */
+    fun setSessionAutomation(
+        expectedSessionId: String?,
+        projectId: String?,
+        autoApprove: Boolean,
+        skipManualReview: Boolean,
+    ): Boolean {
+        synchronized(stateMutationLock) {
+            if (closedOrObsolete || backupImportBlocked() || sessionTransitionPending ||
+                _currentSessionId.value != expectedSessionId || expectedSessionId == null ||
+                job?.isCompleted == false || _status.value == Status.RUNNING) return false
+            if (projectId != null && repo.project(projectId) == null) return false
+            val previousId = _activeProjectId.value
+            updateLockedProject(projectId)
+            if (previousId != _activeProjectId.value) instructionRevision++
+            _autoApprove.value = autoApprove && projectId != null
+            _skipManualReview.value = skipManualReview && projectId != null
+        }
+        persist()
+        return true
+    }
+
     /** Apply a changed global preference immediately only when this conversation is still blank. */
     fun refreshDefaultsForBlankSession() {
         val changed = synchronized(stateMutationLock) {
@@ -1045,6 +1079,7 @@ class AgentController(
         }
         blockActivePlanForInterruptedActions(recovery.interruptedActionIds)
         _autoApprove.value = s.autoApprove && _activeProjectId.value != null
+        _skipManualReview.value = s.skipManualReview && _activeProjectId.value != null
         val tailQuestion = recovery.steps.lastOrNull()?.takeIf { it.type == AgentStep.QUESTION }
         val restoreQuestion = !recovery.hasInterruptedActions && tailQuestion != null &&
             (s.runStatus == "awaiting_user" || s.runStatus == "idle")
@@ -1114,6 +1149,7 @@ class AgentController(
         _steps.value = emptyList()
         _activeProjectId.value = null
         _autoApprove.value = false
+        _skipManualReview.value = false
         _engineMode.value = sanitizeEngineMode(vm.agentEngine())
         _reasoningLevel.value = AgentReasoningLevels.normalize(vm.dualAgentReasoningLevel())
         _sessionCacheMetrics.value = AgentSessionCacheMetrics()
@@ -2008,42 +2044,89 @@ class AgentController(
                         sessionId = _currentSessionId.value.orEmpty(),
                         engineMode = _engineMode.value,
                     )
+                    val automaticReviewAtStart: Boolean
                     synchronized(stateMutationLock) {
                         if (!runClaimMatchesLocked(runClaim)) return
                         streamingRunClaim = runClaim
+                        automaticReviewAtStart = _skipManualReview.value
                     }
                     val result = runCatchingNonCancellation {
                         tool.run(action.args, actionContext)
                     }
                     currentCoroutineContext().ensureActive()
-                    val execution = result.getOrElse {
+                    var execution = result.getOrElse {
                         AgentToolExecution.Completed("执行出错：" + it.message)
                     }
+                    var automaticallyAdopted: com.example.novelseek_ultra.data.model.CandidateAdoptionResult.Adopted? = null
                     if (execution is AgentToolExecution.PendingReview) {
-                        val committed = synchronized(stateMutationLock) {
-                            if (!runClaimMatchesLocked(runClaim)) {
-                                false
+                        val pendingExecution = execution
+                        val automaticOutcome = synchronized(stateMutationLock) {
+                            if (!runClaimMatchesLocked(runClaim)) return
+                            // An interjection or changed project during generation must not grant
+                            // an old result permission to write into the current task.
+                            if (!runContextMatches(modelRevision, modelSessionId, scopeAtProposal, runClaim)) {
+                                AgentAutomaticReviewPolicy.Outcome.Manual
                             } else {
-                                replaceActionStatus(stepId, AgentStep.ACTION_AWAITING_REVIEW)
-                                _streamingText.value = ""
-                                if (streamingRunClaim == runClaim) streamingRunClaim = null
-                                _pendingReview.value = execution.review
-                                _pendingPrompt.value =
-                                    "候选稿已生成；请预览并采用或拒绝后，智能体才会继续。"
-                                _status.value = Status.AWAITING_REVIEW
-                                addStep(
-                                    AgentStep.OBSERVATION,
-                                    execution.observation,
-                                    resultForActionId = stepId,
-                                    resultKind = AgentStep.RESULT_PENDING_REVIEW,
-                                )
-                                touchRunProgressLocked(AgentRunPhase.TOOL)
-                                true
+                                try {
+                                    AgentAutomaticReviewPolicy.resolve(
+                                        enabledAtStart = automaticReviewAtStart,
+                                        enabledNow = _skipManualReview.value,
+                                        lockedProjectId = validLockedProjectId(),
+                                        sessionId = _currentSessionId.value,
+                                        actionId = stepId,
+                                        review = pendingExecution.review,
+                                        run = repo.getGenerationRun(pendingExecution.review.projectId, pendingExecution.review.runId),
+                                    ) {
+                                        vm.adoptChapterCandidate(
+                                            pendingExecution.review.projectId,
+                                            pendingExecution.review.runId,
+                                            pendingExecution.review.candidateId,
+                                            runPostProcessing = false,
+                                        )
+                                    }
+                                } catch (cancelled: CancellationException) {
+                                    throw cancelled
+                                } catch (_: Exception) {
+                                    // Persistence errors are not successes and must not lose the
+                                    // durable candidate. Recovery can reconcile an accepted run.
+                                    AgentAutomaticReviewPolicy.Outcome.Blocked("自动采用未能确认完成，候选稿已保留，请手动检查。")
+                                }
                             }
                         }
-                        if (!committed) return
-                        persist()
-                        return
+                        if (automaticOutcome is AgentAutomaticReviewPolicy.Outcome.Accepted) {
+                            automaticallyAdopted = automaticOutcome.result
+                            execution = AgentToolExecution.Completed(
+                                "accepted / committed：已按本会话的“忽略手动审稿”授权自动采用章节候选稿；" +
+                                    "正式正文已更新。runId=${pendingExecution.review.runId}，" +
+                                    "candidateId=${pendingExecution.review.candidateId}。后续操作请读取正式正文核对。",
+                            )
+                        } else {
+                            val committed = synchronized(stateMutationLock) {
+                                if (!runClaimMatchesLocked(runClaim)) {
+                                    false
+                                } else {
+                                    replaceActionStatus(stepId, AgentStep.ACTION_AWAITING_REVIEW)
+                                    _streamingText.value = ""
+                                    if (streamingRunClaim == runClaim) streamingRunClaim = null
+                                    _pendingReview.value = pendingExecution.review
+                                    _pendingPrompt.value = (automaticOutcome as? AgentAutomaticReviewPolicy.Outcome.Blocked)?.message
+                                        ?: "候选稿已生成；请预览并采用或拒绝后，智能体才会继续。"
+                                    _status.value = Status.AWAITING_REVIEW
+                                    addStep(
+                                        AgentStep.OBSERVATION,
+                                        pendingExecution.observation +
+                                            ((automaticOutcome as? AgentAutomaticReviewPolicy.Outcome.Blocked)?.message?.let { "\n$it" } ?: ""),
+                                        resultForActionId = stepId,
+                                        resultKind = AgentStep.RESULT_PENDING_REVIEW,
+                                    )
+                                    touchRunProgressLocked(AgentRunPhase.TOOL)
+                                    true
+                                }
+                            }
+                            if (!committed) return
+                            persist()
+                            return
+                        }
                     }
                     val observation = (execution as AgentToolExecution.Completed).observation
                     val actionSucceeded =
@@ -2072,6 +2155,17 @@ class AgentController(
                     // Action status and its observation are committed together. If the process
                     // dies earlier, recovery sees RUNNING and will never replay it automatically.
                     persist()
+                    automaticallyAdopted?.let { adopted ->
+                        ensureRunClaim(runClaim)
+                        // Wait for this chapter's summaries/entities/containers before preparing
+                        // the next chapter, or late updates would invalidate its prompt baseline.
+                        vm.completeAutomaticChapterMaintenance(adopted)
+                        ensureRunClaim(runClaim)
+                        synchronized(stateMutationLock) {
+                            if (!runClaimMatchesLocked(runClaim)) return
+                            touchRunProgressLocked(AgentRunPhase.TOOL)
+                        }
+                    }
                 }
             }
         }
@@ -2423,6 +2517,7 @@ class AgentController(
             if (_activeProjectId.value != projectId || repo.project(projectId) != null) return
             _activeProjectId.value = null
             _autoApprove.value = false
+            _skipManualReview.value = false
             _activePlan.value = null
             instructionRevision++
             addStep(
@@ -2841,6 +2936,10 @@ class AgentController(
     ): String = buildString {
         val pid = activeProjectId
         appendLine("当前聚焦项目：${pid ?: "（无，可用 create_project 新建或 list_projects 查看）"}")
+        appendLine(AgentPrompts.reviewModeState(
+            automaticAdoption = _skipManualReview.value && pid != null && repo.project(pid) != null,
+            autoContinue = _autoApprove.value && pid != null && repo.project(pid) != null,
+        ))
         if (pid != null) repo.project(pid)?.let { p ->
             appendLine(
                 "项目《${p.title}》类型=${repo.novelType(pid)} " +
@@ -2959,6 +3058,7 @@ class AgentController(
             steps = _steps.value,
             lockedProjectId = _activeProjectId.value,
             autoApprove = _autoApprove.value,
+            skipManualReview = _skipManualReview.value,
             engineMode = _engineMode.value,
             reasoningLevel = _reasoningLevel.value,
             cacheMetrics = _sessionCacheMetrics.value,
@@ -3186,6 +3286,7 @@ class AgentController(
         val validId = projectId?.takeIf { repo.project(it) != null }
         if (_activeProjectId.value != validId) {
             _autoApprove.value = false
+            _skipManualReview.value = false
             if (_engineMode.value == ENGINE_DUAL) _activePlan.value = null
         }
         _activeProjectId.value = validId
@@ -3218,10 +3319,13 @@ class AgentController(
                     it.agentSessionId == context.sessionId &&
                     it.agentActionId == context.actionId
             }
-            ?: return AgentToolExecution.Completed(observation)
+            ?: return AgentToolExecution.Completed(
+                if (AgentToolOutcome.isSemanticFailure(observation)) observation
+                else "执行出错：未找到本动作生成的完整候选稿；未确认正式正文更新。",
+            )
         val candidate = run.candidates.firstOrNull {
             it.status == CandidateChapter.STATUS_COMPLETED
-        } ?: return AgentToolExecution.Completed(observation)
+        } ?: return AgentToolExecution.Completed("执行出错：本动作没有完整可审核的候选稿；正式正文未改变。")
         return AgentToolExecution.PendingReview(
             observation = observation,
             review = AgentPendingReview(

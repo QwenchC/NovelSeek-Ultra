@@ -419,17 +419,31 @@ class AiService {
     //   1. POST /prompt           → returns a prompt_id
     //   2. poll GET /history/{id} → until status.completed, reading SaveImage (node 9) outputs
     //   3. GET /view              → download the PNG bytes
-    // ComfyUI runs on the local network with no auth, so there's no API key here — only a base URL
-    // (default http://localhost:8188, configurable in Settings for a LAN host like 192.168.x.x).
+    // A base URL can be a LAN server, HTTP TCP tunnel or HTTPS reverse proxy (including a
+    // subpath). No gateway credentials are embedded in URLs or added to this keyless client.
 
-    /** Health check — ComfyUI exposes GET /system_stats. */
-    suspend fun testComfyUIConnection(baseUrl: String): Boolean = try {
-        val url = "${baseUrl.trimEnd('/')}/system_stats"
-        val req = Request.Builder().url(url).get().build()
-        executeForString(req, COMFY_REQUEST_TIMEOUT_SEC).let { true }
-    } catch (_: Throwable) {
-        false
+    /** Validate the actual ComfyUI API; a tunnel login/landing page returning 200 is not success. */
+    suspend fun diagnoseComfyUIConnection(baseUrl: String): ComfyUIConnectionResult {
+        var normalizedUrl: String? = null
+        return try {
+            currentCoroutineContext().ensureActive()
+            val endpoint = ComfyUIEndpoint.parse(baseUrl)
+            normalizedUrl = endpoint.normalizedUrl
+            val req = Request.Builder().url(endpoint.route("system_stats")).get().build()
+            val body = executeForString(req, COMFY_REQUEST_TIMEOUT_SEC)
+            if (isComfyUISystemStats(body)) {
+                ComfyUIConnectionResult(true, "连接成功：已识别 ComfyUI API；模型和工作流兼容性需在生成时验证。", normalizedUrl)
+            } else {
+                ComfyUIConnectionResult(false, "服务已响应，但 /system_stats 不是 ComfyUI API 数据；可能是隧道登录页、错误网页或基址路径不正确。", normalizedUrl)
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            ComfyUIConnectionResult(false, comfyUIConnectionFailureMessage(error, normalizedUrl), normalizedUrl)
+        }
     }
+
+    suspend fun testComfyUIConnection(baseUrl: String): Boolean = diagnoseComfyUIConnection(baseUrl).success
 
     /**
      * Generate an image via ComfyUI and return the raw PNG/JPEG bytes (parity with
@@ -442,7 +456,8 @@ class AiService {
         baseUrl: String,
         negativePrompt: String = COMFY_DEFAULT_NEGATIVE,
     ): ByteArray {
-        val base = baseUrl.trimEnd('/')
+        currentCoroutineContext().ensureActive()
+        val base = ComfyUIEndpoint.parse(baseUrl)
         val promptId = submitComfyPrompt(base, prompt, negativePrompt, width, height)
         val image = pollComfyHistory(base, promptId)
         return downloadComfyImage(base, image)
@@ -547,7 +562,7 @@ class AiService {
 
     /** POST /prompt → prompt_id (surfaces ComfyUI's node-validation error if the submit fails). */
     private suspend fun submitComfyPrompt(
-        base: String,
+        base: ComfyUIEndpoint,
         positive: String,
         negative: String,
         width: Int,
@@ -557,7 +572,7 @@ class AiService {
             put("prompt", buildComfyPrompt(positive, negative, width, height))
         }.toString()
         val req = Request.Builder()
-            .url("$base/prompt")
+            .url(base.route("prompt"))
             .addHeader("Content-Type", "application/json")
             .post(payload.toRequestBody("application/json".toMediaType()))
             .build()
@@ -568,13 +583,14 @@ class AiService {
     }
 
     /** Poll GET /history/{id} until the job completes; returns the first SaveImage output. */
-    private suspend fun pollComfyHistory(base: String, promptId: String): ComfyImageRef {
+    private suspend fun pollComfyHistory(base: ComfyUIEndpoint, promptId: String): ComfyImageRef {
         val deadline = System.currentTimeMillis() + COMFY_JOB_TIMEOUT_SEC * 1000
         while (true) {
             if (System.currentTimeMillis() > deadline) {
                 throw IOException("ComfyUI 任务超时（${COMFY_JOB_TIMEOUT_SEC / 60} 分钟），请检查 ComfyUI 是否在生成。")
             }
-            val req = Request.Builder().url("$base/history/$promptId").get().build()
+            currentCoroutineContext().ensureActive()
+            val req = Request.Builder().url(base.route("history", promptId)).get().build()
             val body = executeForString(req, COMFY_REQUEST_TIMEOUT_SEC)
             val history = kotlinx.serialization.json.Json.parseToJsonElement(body).jsonObject
             val entry = history[promptId]?.jsonObject
@@ -623,16 +639,18 @@ class AiService {
     }
 
     /** GET /view → image bytes. Retries to ride out stale keep-alive connections. */
-    private suspend fun downloadComfyImage(base: String, img: ComfyImageRef): ByteArray {
-        val enc = { s: String -> java.net.URLEncoder.encode(s, "UTF-8") }
-        val url = "$base/view?filename=${enc(img.filename)}&subfolder=${enc(img.subfolder)}&type=${enc(img.type)}"
+    private suspend fun downloadComfyImage(base: ComfyUIEndpoint, img: ComfyImageRef): ByteArray {
+        val url = base.view(img.filename, img.subfolder, img.type)
         val req = Request.Builder().url(url).get().build()
         var lastErr: Throwable? = null
         repeat(3) { attempt ->
+            currentCoroutineContext().ensureActive()
             if (attempt > 0) kotlinx.coroutines.delay(800L * attempt)
             try {
                 return executeForBytes(req, COMFY_REQUEST_TIMEOUT_SEC)
-            } catch (e: Throwable) {
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (e: IOException) {
                 lastErr = e
             }
         }
@@ -652,11 +670,20 @@ class AiService {
             override fun onFailure(call: Call, e: IOException) = cont.resumeWith(Result.failure(e))
             override fun onResponse(call: Call, response: Response) {
                 response.use { r ->
-                    val body = runCatching { r.body?.string().orEmpty() }.getOrDefault("")
+                    val body = try {
+                        r.body?.string().orEmpty()
+                    } catch (error: IOException) {
+                        cont.resumeWith(Result.failure(error))
+                        return
+                    }
                     if (!r.isSuccessful) {
                         val msg = if (friendlyComfyError) comfyValidationError(body)
                             else "ComfyUI HTTP ${r.code}：${body.take(200)}"
-                        cont.resumeWith(Result.failure(IOException(msg)))
+                        cont.resumeWith(Result.failure(ComfyUIHttpException(
+                            r.code,
+                            msg,
+                            automaticHttpsRequired = r.code == 501 && isComfyUIAutomaticHttpsLanding(body),
+                        )))
                     } else {
                         cont.resumeWith(Result.success(body))
                     }
@@ -677,10 +704,15 @@ class AiService {
             override fun onResponse(call: Call, response: Response) {
                 response.use { r ->
                     if (!r.isSuccessful) {
-                        cont.resumeWith(Result.failure(IOException("ComfyUI HTTP ${r.code}")))
+                        cont.resumeWith(Result.failure(ComfyUIHttpException(r.code, "ComfyUI HTTP ${r.code}")))
                         return
                     }
-                    val bytes = r.body?.bytes()
+                    val bytes = try {
+                        r.body?.bytes()
+                    } catch (error: IOException) {
+                        cont.resumeWith(Result.failure(error))
+                        return
+                    }
                     if (bytes == null) cont.resumeWith(Result.failure(IOException("empty image body")))
                     else cont.resumeWith(Result.success(bytes))
                 }
@@ -693,10 +725,10 @@ class AiService {
         val parsed = runCatching {
             kotlinx.serialization.json.Json.parseToJsonElement(body).jsonObject
         }.getOrNull() ?: return "ComfyUI /prompt 错误：${body.take(200)}"
-        val mainMsg = parsed["error"]?.jsonObject?.get("message")?.jsonPrimitive?.contentOrNull
-        val nodeDetail = parsed["node_errors"]?.jsonObject?.values?.firstOrNull()
-            ?.jsonObject?.get("errors")?.jsonArray?.firstOrNull()
-            ?.jsonObject?.get("details")?.jsonPrimitive?.contentOrNull
+        val mainMsg = ((parsed["error"] as? JsonObject)?.get("message") as? JsonPrimitive)?.contentOrNull
+        val nodeErrors = (parsed["node_errors"] as? JsonObject)?.values?.firstOrNull() as? JsonObject
+        val nodeError = (nodeErrors?.get("errors") as? JsonArray)?.firstOrNull() as? JsonObject
+        val nodeDetail = (nodeError?.get("details") as? JsonPrimitive)?.contentOrNull
         return when {
             mainMsg.isNullOrBlank() -> "ComfyUI /prompt 错误：${body.take(200)}"
             nodeDetail.isNullOrBlank() -> "ComfyUI 节点验证失败：$mainMsg"

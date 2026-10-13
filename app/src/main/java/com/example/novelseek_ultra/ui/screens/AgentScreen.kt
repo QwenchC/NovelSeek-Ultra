@@ -136,6 +136,7 @@ fun AgentScreen(
     val sessions by agent.sessions.collectAsState()
     val currentSessionId by agent.currentSessionId.collectAsState()
     val autoApprove by agent.autoApprove.collectAsState()
+    val skipManualReview by agent.skipManualReview.collectAsState()
     val lockedProjectId by agent.activeProjectId.collectAsState()
     val engineMode by agent.engineMode.collectAsState()
     val reasoningLevel by agent.reasoningLevel.collectAsState()
@@ -147,6 +148,7 @@ fun AgentScreen(
     val projects by vm.projects.collectAsState()
     val hasValidLockedProject = lockedProjectId?.let { id -> projects.any { it.id == id } } == true
     val autoContinueActive = autoApprove && hasValidLockedProject
+    val automaticChapterAdoptionActive = skipManualReview && hasValidLockedProject
     val agentName = remember(state) { vm.agentName().ifBlank { tx(lang, "智能体", "Agent") } }
 
     var input by remember { mutableStateOf("") }
@@ -159,6 +161,10 @@ fun AgentScreen(
     var showRenameAgent by remember { mutableStateOf(false) }
     var showSessions by remember { mutableStateOf(false) }
     var showLockAuto by remember { mutableStateOf(false) }
+    var automationSessionId by remember { mutableStateOf<String?>(null) }
+    var automationSaveError by remember { mutableStateOf<String?>(null) }
+    var automationSaveInProgress by remember { mutableStateOf(false) }
+    var automationDialogRevision by remember { mutableStateOf(0L) }
     var renamingSession by remember { mutableStateOf<com.example.novelseek_ultra.data.model.AgentSessionMeta?>(null) }
     var fullscreenImage by remember { mutableStateOf<String?>(null) }
     var reviewDialogKey by rememberSaveable(currentSessionId) { mutableStateOf<String?>(null) }
@@ -264,6 +270,15 @@ fun AgentScreen(
         showReasoningMenu = false
     }
 
+    LaunchedEffect(currentSessionId) {
+        if (showLockAuto && automationSessionId != currentSessionId) {
+            showLockAuto = false
+            automationSaveError = null
+            automationSaveInProgress = false
+            automationDialogRevision++
+        }
+    }
+
     LaunchedEffect(steps.size, status, streaming) {
         val count = steps.size + if (streaming.isNotBlank()) 1 else 0
         if (count > 0) listState.animateScrollToItem(count - 1)
@@ -324,8 +339,15 @@ fun AgentScreen(
                                 onClick = { showMenu = false; agent.newSession() }, enabled = !running)
                             DropdownMenuItem(text = { Text(tx(lang, "会话列表", "Sessions")) },
                                 onClick = { showMenu = false; showSessions = true }, enabled = !running)
-                            DropdownMenuItem(text = { Text(tx(lang, "锁定项目 / 自动继续", "Lock project / auto")) },
-                                onClick = { showMenu = false; showLockAuto = true }, enabled = !running)
+                            DropdownMenuItem(text = { Text(tx(lang, "会话设置 / 自动执行", "Session settings / automation")) },
+                                onClick = {
+                                    showMenu = false
+                                    automationSessionId = currentSessionId
+                                    automationSaveError = null
+                                    automationSaveInProgress = false
+                                    automationDialogRevision++
+                                    showLockAuto = true
+                                }, enabled = !running)
                             DropdownMenuItem(text = { Text(tx(lang, "重命名智能体", "Rename agent")) },
                                 onClick = { showMenu = false; showRenameAgent = true })
                             DropdownMenuItem(text = { Text(tx(lang, "清空当前会话", "Clear session")) },
@@ -430,6 +452,19 @@ fun AgentScreen(
                             Text(tx(lang, "继续执行", "Continue"))
                         }
                         Spacer(Modifier.height(6.dp))
+                    }
+                    if (automaticChapterAdoptionActive) {
+                        Text(
+                            tx(
+                                lang,
+                                if (reviewBlocked) "已忽略手动审稿；当前待审稿仍需确认" else "已忽略手动审稿 · 新生成章节将自动采纳",
+                                if (reviewBlocked) "Manual review skipped; the existing candidate still needs a decision" else "Manual review skipped · new chapters will be adopted automatically",
+                            ),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.tertiary,
+                            modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
+                        )
+                        Spacer(Modifier.height(4.dp))
                     }
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -835,16 +870,21 @@ fun AgentScreen(
     }
 
     if (showLockAuto) {
-        var auto by remember { mutableStateOf(autoApprove) }
-        var locked by remember { mutableStateOf(lockedProjectId) }
+        var auto by remember(automationSessionId) { mutableStateOf(autoApprove) }
+        var skipReview by remember(automationSessionId) { mutableStateOf(skipManualReview) }
+        var locked by remember(automationSessionId) { mutableStateOf(lockedProjectId) }
         val hasValidSelection = locked?.let { id -> projects.any { it.id == id } } == true
         AlertDialog(
-            onDismissRequest = { showLockAuto = false },
-            title = { Text(tx(lang, "锁定项目 / 自动继续", "Lock project / auto-continue")) },
+            onDismissRequest = { if (!automationSaveInProgress) showLockAuto = false },
+            title = { Text(tx(lang, "会话设置 / 自动执行", "Session settings / automation")) },
             text = {
                 LazyColumn(modifier = Modifier.heightIn(max = 380.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    // Auto-continue is the key switch — keep it at the TOP so it's never scrolled out of view.
+                    // Keep both independent, project-scoped permissions ahead of the project list.
                     item {
+                        automationSaveError?.let { message ->
+                            Text(message, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.error)
+                            Spacer(Modifier.height(8.dp))
+                        }
                         Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)) {
                             Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().padding(12.dp)) {
                                 Column(Modifier.weight(1f)) {
@@ -856,38 +896,73 @@ fun AgentScreen(
                                 }
                                 Switch(
                                     checked = auto && hasValidSelection,
-                                    onCheckedChange = { auto = it },
-                                    enabled = hasValidSelection,
+                                    onCheckedChange = { if (!automationSaveInProgress) auto = it },
+                                    enabled = hasValidSelection && !automationSaveInProgress,
+                                )
+                            }
+                        }
+                        Spacer(Modifier.height(8.dp))
+                        Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.tertiaryContainer)) {
+                            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().padding(12.dp)) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(tx(lang, "忽略手动审稿", "Skip manual review"),
+                                        style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
+                                    Text(tx(lang,
+                                        "下次新生成的章节候选稿将自动采纳并继续；已有待审稿仍需手动决定。此选项不会自动授权其他敏感操作。",
+                                        "New chapter candidates will be adopted automatically and execution will continue. Existing pending candidates still need a decision. This does not approve other sensitive actions."),
+                                        style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    if (skipReview && !auto) {
+                                        Text(tx(lang,
+                                            "生成等敏感操作仍可能需要确认；要连续执行，可另行开启上方的自动继续。",
+                                            "Sensitive actions such as generation may still need confirmation; enable auto-continue separately for uninterrupted execution."),
+                                            style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    }
+                                }
+                                Switch(
+                                    checked = skipReview && hasValidSelection,
+                                    onCheckedChange = { if (!automationSaveInProgress) skipReview = it },
+                                    enabled = hasValidSelection && !automationSaveInProgress,
                                 )
                             }
                         }
                         Spacer(Modifier.height(8.dp))
                         if (!hasValidSelection) {
                             Text(
-                                tx(lang, "请先选择项目，才能开启自动继续。", "Select a project before enabling auto-continue."),
+                                tx(lang, "请先选择项目，才能开启自动继续或忽略手动审稿。", "Select a project before enabling auto-continue or skipping manual review."),
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.error,
                             )
                             Spacer(Modifier.height(8.dp))
                         }
-                        Text(tx(lang, "锁定项目（自动继续必需）：", "Lock a project (required for auto-continue):"),
+                        Text(tx(lang, "锁定项目（自动执行选项必需）：", "Lock a project (required for automation):"),
                             style = MaterialTheme.typography.labelMedium)
                     }
                     item {
-                        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().clickable {
-                            locked = null
-                            auto = false
-                        }) {
-                            RadioButton(selected = locked == null, onClick = {
+                        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().clickable(enabled = !automationSaveInProgress) {
+                            if (!automationSaveInProgress) {
                                 locked = null
                                 auto = false
+                                skipReview = false
+                            }
+                        }) {
+                            RadioButton(selected = locked == null, enabled = !automationSaveInProgress, onClick = {
+                                if (!automationSaveInProgress) {
+                                    locked = null
+                                    auto = false
+                                    skipReview = false
+                                }
                             })
                             Text(tx(lang, "不锁定", "None"))
                         }
                     }
                     items(projects, key = { it.id }) { p ->
-                        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().clickable { locked = p.id }) {
-                            RadioButton(selected = locked == p.id, onClick = { locked = p.id })
+                        fun selectProject() {
+                            if (automationSaveInProgress) return
+                            if (locked != p.id) skipReview = false
+                            locked = p.id
+                        }
+                        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().clickable(enabled = !automationSaveInProgress) { selectProject() }) {
+                            RadioButton(selected = locked == p.id, enabled = !automationSaveInProgress, onClick = { selectProject() })
                             Text(p.title, maxLines = 1)
                         }
                     }
@@ -895,12 +970,57 @@ fun AgentScreen(
             },
             confirmButton = {
                 TextButton(onClick = {
-                    agent.lockProject(locked)
-                    agent.setAutoApprove(auto && hasValidSelection)
-                    showLockAuto = false
-                }, enabled = !running) { Text(tx(lang, "保存", "Save")) }
+                    if (automationSaveInProgress) return@TextButton
+                    val expectedSessionId = automationSessionId
+                    val expectedDialogRevision = automationDialogRevision
+                    val selectedProjectId = locked
+                    val selectedAutoApprove = auto && hasValidSelection
+                    val selectedSkipReview = skipReview && hasValidSelection
+                    automationSaveInProgress = true
+                    automationSaveError = null
+                    screenScope.launch {
+                        val outcome: Result<Boolean> = try {
+                            Result.success(withContext(Dispatchers.IO) {
+                                agent.setSessionAutomation(
+                                    expectedSessionId = expectedSessionId,
+                                    projectId = selectedProjectId,
+                                    autoApprove = selectedAutoApprove,
+                                    skipManualReview = selectedSkipReview,
+                                )
+                            })
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (error: Exception) {
+                            Result.failure(error)
+                        }
+                        // Never let a previous dialog/session publish into a newly opened one.
+                        if (!showLockAuto || automationSessionId != expectedSessionId ||
+                            agent.currentSessionId.value != expectedSessionId ||
+                            automationDialogRevision != expectedDialogRevision) return@launch
+                        automationSaveInProgress = false
+                        outcome.onSuccess { saved ->
+                            if (saved) showLockAuto = false else automationSaveError = tx(
+                                lang,
+                                "会话或任务状态已变化，未保存。请等待任务停止后重试。",
+                                "The session or task state changed; nothing was saved. Retry after the task stops.",
+                            )
+                        }.onFailure {
+                            automationSaveError = tx(
+                                lang,
+                                "未能持久化设置，请重试。当前草稿已保留。",
+                                "Could not persist the settings. Your draft is retained; please retry.",
+                            )
+                        }
+                    }
+                }, enabled = !running && !automationSaveInProgress) {
+                    Text(if (automationSaveInProgress) tx(lang, "保存中…", "Saving…") else tx(lang, "保存", "Save"))
+                }
             },
-            dismissButton = { TextButton(onClick = { showLockAuto = false }) { Text(tx(lang, "取消", "Cancel")) } },
+            dismissButton = {
+                TextButton(onClick = { if (!automationSaveInProgress) showLockAuto = false }, enabled = !automationSaveInProgress) {
+                    Text(tx(lang, "取消", "Cancel"))
+                }
+            },
         )
     }
 
